@@ -9,7 +9,7 @@ The `--from` flag accepts four kinds of input:
 | Input | Example | Behavior |
 |-------|---------|----------|
 | **Community sandbox name** | `--from openclaw` | Resolves to `ghcr.io/nvidia/openshell-community/sandboxes/openclaw:latest` |
-| **Dockerfile path** | `--from ./Dockerfile` | Builds the image, pushes it into the cluster, then creates the sandbox |
+| **Dockerfile path** | `--from ./Dockerfile` | Builds the image, publishes it to a registry reachable by the compute backend, then creates the sandbox |
 | **Directory with Dockerfile** | `--from ./my-sandbox/` | Uses the directory as the build context |
 | **Full image reference** | `--from myregistry.com/img:tag` | Uses the image directly |
 
@@ -33,39 +33,39 @@ The community registry prefix defaults to `ghcr.io/nvidia/openshell-community/sa
 When `--from` points to a Dockerfile or directory, the CLI:
 
 1. Builds the image locally via the Docker daemon (respecting `.dockerignore`).
-2. Pushes it into the cluster's containerd runtime using `docker save` / `ctr import`.
+2. Publishes it to a registry reachable by the compute backend.
 3. Creates the sandbox with the resulting image tag.
 
 ## How It Works
 
-The supervisor binary (`openshell-sandbox`) is **always side-loaded** from the k3s node filesystem via a read-only `hostPath` volume. It is never baked into sandbox images. This applies to all sandbox pods — whether using the default community base image, a custom image, or a user-built Dockerfile.
+The supervisor binary (`openshell-sandbox`) must be delivered by the selected compute driver. The target architecture does not depend on a k3s node hostPath or a cluster image.
 
 ```mermaid
 flowchart TB
-    subgraph node["K3s Node"]
-        bin["/opt/openshell/bin/openshell-sandbox
-        (built into cluster image, updatable via docker cp)"]
+    subgraph delivery["Supervisor delivery"]
+        bin["openshell-sandbox
+        (image, image volume, local binary, or VM rootfs)"]
     end
 
-    node -- "hostPath (readOnly)" --> agent
+    delivery --> agent
 
     subgraph pod["Pod"]
         subgraph agent["Agent Container"]
             agent_desc["Image: community base or custom image
             Command: /opt/openshell/bin/openshell-sandbox
-            Volume: /opt/openshell/bin (ro hostPath)
+            Supervisor path configured by compute driver
             Env: OPENSHELL_SANDBOX_ID, OPENSHELL_ENDPOINT, ...
             Caps: SYS_ADMIN, NET_ADMIN, SYS_PTRACE"]
         end
     end
 ```
 
-The server applies these transforms to every sandbox pod template (`sandbox/mod.rs`):
+For Kubernetes-backed sandboxes, the driver must ensure every pod template has:
 
-1. Adds a `hostPath` volume named `openshell-supervisor-bin` pointing to `/opt/openshell/bin` on the node.
-2. Mounts it read-only at `/opt/openshell/bin` in the agent container.
-3. Overrides the agent container's `command` to `/opt/openshell/bin/openshell-sandbox`.
-4. Sets `runAsUser: 0` so the supervisor has root privileges for namespace creation, proxy setup, and Landlock/seccomp.
+1. A resolvable `openshell-sandbox` entrypoint.
+2. Gateway callback environment variables such as `OPENSHELL_SANDBOX_ID`, `OPENSHELL_ENDPOINT`, and `OPENSHELL_SSH_SOCKET_PATH`.
+3. TLS and SSH handshake materials when the gateway requires them.
+4. The capabilities needed for namespace creation, proxy setup, and Landlock/seccomp.
 
 These transforms apply to every generated pod template.
 
@@ -109,16 +109,16 @@ The `openshell-sandbox` supervisor adapts to arbitrary environments:
 | Community name resolution | Bare names like `openclaw` expand to the GHCR community registry, making the common case simple |
 | Auto build+push for Dockerfiles | Eliminates the two-step `image push` + `create` workflow for local development |
 | `OPENSHELL_COMMUNITY_REGISTRY` env var | Allows organizations to host their own community sandbox registry |
-| hostPath side-load | Supervisor binary lives on the node filesystem — no init container, no emptyDir, no extra image pull. Faster pod startup. |
-| Read-only mount in agent | The supervisor binary is mounted read-only, and the startup seccomp prelude blocks the remount syscalls that would otherwise reopen it for writes once privileged bootstrap has completed. |
+| Driver-owned supervisor delivery | Each compute driver decides how to deliver `openshell-sandbox` without depending on a k3s cluster image. |
+| Read-only supervisor delivery | The supervisor should be mounted or packaged read-only where the driver supports it, and the startup seccomp prelude blocks remount syscalls that would otherwise reopen it for writes once privileged bootstrap has completed. |
 | Command override | Ensures `openshell-sandbox` is the entrypoint regardless of the image's default CMD |
 | Clear `run_as_user/group` for custom images | Prevents startup failure when the image lacks the default `sandbox` user |
 | Non-fatal log file init | `/var/log/openshell.log` may be unwritable in arbitrary images; falls back to stdout |
-| `docker save` / `ctr import` for push | Avoids requiring a registry for local dev; images land directly in the k3s containerd store |
+| Registry publication for built images | Kubernetes and remote compute backends need image references that their runtime can pull. |
 | Optional `iptables` for bypass detection | Core network isolation works via routing alone (`iproute2`); `iptables` only adds fast-fail (`ECONNREFUSED`) and diagnostic LOG entries. Making it optional avoids hard failures in minimal images that lack `iptables` while giving better UX when it is available. |
 
 ## Limitations
 
 - Distroless / `FROM scratch` images are not supported (the supervisor needs glibc and `/proc`)
 - Missing `iproute2` (or required capabilities) blocks startup in proxy mode because namespace isolation is mandatory
-- The supervisor binary must be present on the k3s node at `/opt/openshell/bin/openshell-sandbox` (embedded in the cluster image at build time)
+- The selected compute driver must provide an `openshell-sandbox` binary compatible with the sandbox image and host architecture.

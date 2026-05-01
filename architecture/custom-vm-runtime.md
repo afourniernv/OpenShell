@@ -78,9 +78,9 @@ The rootfs tarball the driver embeds starts from the same minimal Ubuntu base
 used across the project, and is **rewritten into a supervisor-only sandbox
 guest** during extraction:
 
-- k3s state and Kubernetes manifests are stripped out
+- Kubernetes state and manifests are stripped out
 - `/srv/openshell-vm-sandbox-init.sh` is installed as the guest entrypoint
-- the guest boots directly into `openshell-sandbox` — no k3s, no kube-proxy,
+- the guest boots directly into `openshell-sandbox` -- no Kubernetes control plane, no kube-proxy,
   no CNI plugins
 
 See `crates/openshell-driver-vm/src/rootfs.rs` for the rewrite logic and
