@@ -51,6 +51,17 @@ Sandbox supervisor RPCs authenticate with gateway-minted sandbox JWTs when that
 authenticator is configured; mTLS does not grant sandbox identity. User-facing
 mutations are authorized by role policy when OIDC or edge identity is enabled.
 
+Gateway transport certificate material can come from several deployment models:
+
+- OpenShell-generated bootstrap PKI
+- operator-provided files or pre-created Secrets
+- cert-manager-managed Secrets
+- externally managed enterprise CA workflows
+
+These transport certificate sources do not change sandbox identity semantics in
+current releases. Supervisors still authenticate as sandboxes with
+gateway-minted JWTs after the transport channel is established.
+
 Sandbox secrets are gateway-signed JWTs bound to a single sandbox ID. Docker,
 Podman, and VM drivers deliver the initial token through supervisor-only
 runtime material; Kubernetes supervisors exchange a projected ServiceAccount

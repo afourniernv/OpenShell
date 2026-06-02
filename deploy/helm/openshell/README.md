@@ -155,7 +155,7 @@ cert-manager alternative.
 | nameOverride | string | `"openshell"` | Override the chart name used in generated resource names. |
 | networkPolicy.enabled | bool | `true` | Create a NetworkPolicy restricting SSH ingress on sandbox pods to the gateway. |
 | nodeSelector | object | `{}` | Node selector for the gateway pod. |
-| pkiInitJob.enabled | bool | `true` | Run a pre-install/pre-upgrade Job that creates gateway and client mTLS Secrets. |
+| pkiInitJob.enabled | bool | `true` | Run a pre-install/pre-upgrade Job that bootstraps self-generated gateway and sandbox transport mTLS Secrets. Disable this when using cert-manager or externally managed certificate Secrets. |
 | pkiInitJob.serverDnsNames | list | `[]` | Extra DNS SANs to append to the server certificate. |
 | pkiInitJob.serverIpAddresses | list | `[]` | Extra IP SANs to append to the server certificate. |
 | podAnnotations | object | `{}` | Extra annotations to add to the gateway pod. |
@@ -214,9 +214,9 @@ cert-manager alternative.
 | server.sandboxJwt.signingSecretName | string | `""` | Name of the Opaque Secret holding the signing key material. Empty falls back to the chart fullname with "-jwt-keys" appended. |
 | server.sandboxJwt.ttlSecs | int | `3600` | Token TTL in seconds. Defaults to 3600 (1h). |
 | server.sandboxNamespace | string | `""` | Namespace where sandbox pods are created. Defaults to the Helm release namespace (.Release.Namespace) when left empty. |
-| server.tls.certSecretName | string | `"openshell-server-tls"` | K8s secret (type kubernetes.io/tls) with tls.crt and tls.key for the server. |
-| server.tls.clientCaSecretName | string | `"openshell-server-client-ca"` | K8s secret with ca.crt for client certificate verification (mTLS). Set to "" to disable mTLS and run HTTPS-only (use OIDC for auth instead). |
-| server.tls.clientTlsSecretName | string | `"openshell-client-tls"` | K8s secret mounted into sandbox pods for mTLS to the server. |
+| server.tls.certSecretName | string | `"openshell-server-tls"` | K8s secret (type kubernetes.io/tls) with tls.crt and tls.key for the gateway server listener. The secret may be created by the built-in pkiInitJob, by cert-manager, or by an external enterprise CA workflow. |
+| server.tls.clientCaSecretName | string | `"openshell-server-client-ca"` | K8s secret with ca.crt for gateway-side client certificate verification (mTLS). Set to "" to disable mTLS and run HTTPS-only (use OIDC for auth instead). When cert-manager or another issuer writes ca.crt into the server secret, this may be sourced from that material instead of a dedicated Secret. |
+| server.tls.clientTlsSecretName | string | `"openshell-client-tls"` | K8s secret mounted into sandbox pods for supervisor callback transport mTLS to the gateway. This is distinct from the gateway server listener certificate and may be supplied by the same or a different certificate-management workflow. |
 | server.workspaceDefaultStorageSize | string | `""` | Default storage size for the workspace PVC in sandbox pods. Uses Kubernetes quantity syntax (e.g. "2Gi", "10Gi", "500Mi"). Empty = built-in default (2Gi). |
 | service.healthPort | int | `8081` | Gateway health service port. |
 | service.metricsPort | int | `9090` | Gateway metrics service port. |

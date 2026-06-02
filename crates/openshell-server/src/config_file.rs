@@ -580,6 +580,52 @@ version = 2
     }
 
     #[test]
+    fn gateway_listener_tls_and_sandbox_transport_tls_remain_distinct() {
+        let toml = r#"
+[openshell.gateway]
+client_tls_secret_name = "openshell-sandbox-tls"
+guest_tls_ca = "/etc/openshell/certs/ca.pem"
+guest_tls_cert = "/etc/openshell/certs/client.pem"
+guest_tls_key = "/etc/openshell/certs/client-key.pem"
+
+[openshell.gateway.tls]
+cert_path = "/etc/openshell/certs/gateway.pem"
+key_path = "/etc/openshell/certs/gateway-key.pem"
+client_ca_path = "/etc/openshell/certs/client-ca.pem"
+"#;
+        let tmp = write_tmp(toml);
+        let file = load(tmp.path()).expect("valid tls split config parses");
+        let gw = &file.openshell.gateway;
+
+        let tls = gw.tls.as_ref().expect("gateway listener tls config");
+        assert_eq!(
+            tls.cert_path,
+            PathBuf::from("/etc/openshell/certs/gateway.pem")
+        );
+        assert_eq!(
+            tls.client_ca_path.as_deref(),
+            Some(Path::new("/etc/openshell/certs/client-ca.pem"))
+        );
+
+        assert_eq!(
+            gw.client_tls_secret_name.as_deref(),
+            Some("openshell-sandbox-tls")
+        );
+        assert_eq!(
+            gw.guest_tls_ca.as_deref(),
+            Some(Path::new("/etc/openshell/certs/ca.pem"))
+        );
+        assert_eq!(
+            gw.guest_tls_cert.as_deref(),
+            Some(Path::new("/etc/openshell/certs/client.pem"))
+        );
+        assert_eq!(
+            gw.guest_tls_key.as_deref(),
+            Some(Path::new("/etc/openshell/certs/client-key.pem"))
+        );
+    }
+
+    #[test]
     fn missing_path_is_io_error() {
         let err = load(Path::new("/nonexistent/openshell-gateway.toml"))
             .expect_err("missing file must be io error");

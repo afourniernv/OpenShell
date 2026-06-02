@@ -18,6 +18,30 @@ Gateway CLI flag  >  gateway OPENSHELL_* env var  >  TOML file  >  built-in defa
 
 `database_url` is env-only. The loader rejects it when it appears in the file. When `OPENSHELL_DB_URL` is unset, the gateway stores its SQLite database under `$XDG_STATE_HOME/openshell/gateway/openshell.db`.
 
+## Certificate Roles
+
+OpenShell uses two distinct certificate paths in gateway configuration:
+
+- Gateway listener TLS
+  - configured under `[openshell.gateway.tls]`
+  - supplies the server certificate and optional client CA trust for the
+    gateway listener itself
+- Sandbox transport client TLS
+  - configured in driver-specific settings such as `guest_tls_ca`,
+    `guest_tls_cert`, `guest_tls_key`, or `client_tls_secret_name`
+  - supplies the client certificate bundle supervisors use when they call back
+    into the gateway over HTTPS
+
+The certificate material for either path may come from:
+
+- OpenShell-generated bootstrap PKI
+- operator-provided files or Kubernetes Secrets
+- cert-manager-managed Secrets
+- externally managed enterprise CA workflows
+
+This page documents how the gateway consumes those inputs. It does not require
+OpenShell to own certificate issuance.
+
 ## Package-Managed Locations
 
 Package-managed gateways do not require a TOML file. Create one at the package's optional config location when you need to override built-in defaults. Set `OPENSHELL_GATEWAY_CONFIG` in the launch environment to use a different file.
@@ -98,7 +122,8 @@ guest_tls_ca            = "/etc/openshell/certs/ca.pem"
 guest_tls_cert          = "/etc/openshell/certs/client.pem"
 guest_tls_key           = "/etc/openshell/certs/client-key.pem"
 
-# Gateway listener TLS (distinct from the per-driver guest_tls_*).
+# Gateway listener TLS (distinct from the per-driver guest_tls_* sandbox
+# transport client bundle).
 [openshell.gateway.tls]
 cert_path             = "/etc/openshell/certs/gateway.pem"
 key_path              = "/etc/openshell/certs/gateway-key.pem"

@@ -256,7 +256,7 @@ pub struct ServiceRoutingConfig {
     pub enable_loopback_service_http: bool,
 }
 
-/// TLS configuration.
+/// TLS configuration for the gateway listener.
 ///
 /// Two modes are supported:
 /// - **HTTPS with optional mTLS** (`client_ca_path = Some`):
@@ -267,6 +267,17 @@ pub struct ServiceRoutingConfig {
 ///
 /// In both modes, authentication is handled at the application layer
 /// (e.g. OIDC bearer tokens).  mTLS is an additional mechanism.
+///
+/// The configured certificate material may come from several deployment
+/// models:
+/// - OpenShell-generated local or Helm bootstrap PKI
+/// - operator-provided files or Secrets
+/// - controller-managed material such as cert-manager
+/// - externally managed enterprise CA workflows
+///
+/// This listener TLS config is distinct from driver-level sandbox transport
+/// client bundles such as `guest_tls_ca/cert/key` or
+/// `client_tls_secret_name`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TlsConfig {

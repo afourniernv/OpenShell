@@ -3,23 +3,56 @@
 # SPDX-License-Identifier: Apache-2.0
 title: "Managing Certificates"
 sidebar-title: "Managing Certificates"
-description: "Configure the OpenShell Helm chart to use cert-manager for mTLS certificate issuance and automatic renewal."
-keywords: "Generative AI, Cybersecurity, Kubernetes, cert-manager, PKI, TLS, mTLS, Certificates"
+description: "Configure the OpenShell Helm chart to use self-generated PKI, cert-manager, or externally managed certificate Secrets for transport TLS."
+keywords: "Generative AI, Cybersecurity, Kubernetes, cert-manager, PKI, TLS, mTLS, Certificates, External CA"
 position: 2
 ---
 
-The OpenShell gateway uses mTLS certificates for transport between the gateway and sandbox supervisors. These certificates are not Kubernetes user authentication; configure OIDC or a trusted access proxy for user access. The Helm chart supports two ways to provision and manage the certificate bundle:
+The OpenShell gateway uses mTLS certificates for transport between the gateway and sandbox supervisors. These certificates are not Kubernetes user authentication; configure OIDC or a trusted access proxy for user access.
+
+The Helm chart supports three certificate operating modes:
 
 | Mode | When to use |
 |---|---|
-| Built-in `pkiInitJob` (default) | The default path. A pre-install Kubernetes Job generates a self-signed CA and certificates during installation. No additional dependencies. |
-| cert-manager | Production deployments that need automatic certificate rotation managed by a running controller. |
+| Built-in `pkiInitJob` (default) | Local or simple cluster installs. A pre-install Kubernetes Job generates a self-signed CA and the Secrets consumed by the gateway and sandbox transport path. |
+| cert-manager | Cluster deployments that want controller-managed issuance and renewal. |
+| Externally managed Secrets | Enterprise PKI environments where another system issues and rotates the certificate material and OpenShell only consumes the resulting Secrets. |
 
-The rest of this page covers switching to cert-manager. The built-in mode requires no configuration.
+The built-in mode requires no additional configuration. The rest of this page covers the two managed alternatives.
 
 <Note>
 cert-manager and `pkiInitJob` are mutually exclusive. The chart fails if both are enabled at the same time.
 </Note>
+
+## Use externally managed certificate Secrets
+
+Choose this mode when another system such as an enterprise CA workflow, a
+platform operator, or an adjacent controller creates the Secrets that OpenShell
+consumes.
+
+Provide these Secrets:
+
+- `server.tls.certSecretName`
+  - the gateway listener certificate Secret containing `tls.crt` and `tls.key`
+- `server.tls.clientCaSecretName`
+  - the Secret containing `ca.crt` used by the gateway to verify incoming
+    client certificates
+- `server.tls.clientTlsSecretName`
+  - the Secret mounted into sandbox pods for supervisor callback transport mTLS
+
+Disable the built-in PKI bootstrap job:
+
+```shell
+helm upgrade --install openshell \
+  oci://ghcr.io/nvidia/openshell/helm-chart \
+  --version <version> \
+  --namespace openshell \
+  --set pkiInitJob.enabled=false \
+  --set certManager.enabled=false
+```
+
+This mode keeps certificate issuance and rotation outside OpenShell. OpenShell
+only consumes the resulting Secrets.
 
 ## Install cert-manager
 
@@ -55,6 +88,10 @@ helm upgrade --install openshell \
 ```
 
 The chart creates a self-signed CA, issues server and client certificates from it, and cert-manager handles renewal before expiry.
+
+The generated Secrets are still consumed through the same OpenShell certificate
+surfaces as the externally managed Secret mode. cert-manager changes who issues
+and rotates the material, not how the gateway and supervisors load it.
 
 ## Next Steps
 

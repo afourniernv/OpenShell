@@ -189,12 +189,20 @@ server:
     # fully trusted fronting proxy. Leave false for shared or production clusters.
     allowUnauthenticatedUsers: false
   tls:
-    # -- K8s secret (type kubernetes.io/tls) with tls.crt and tls.key for the server.
+    # -- K8s secret (type kubernetes.io/tls) with tls.crt and tls.key for the
+    # gateway server listener. The secret may be created by the built-in
+    # pkiInitJob, by cert-manager, or by an external enterprise CA workflow.
     certSecretName: openshell-server-tls
-    # -- K8s secret with ca.crt for client certificate verification (mTLS).
-    # Set to "" to disable mTLS and run HTTPS-only (use OIDC for auth instead).
+    # -- K8s secret with ca.crt for gateway-side client certificate
+    # verification (mTLS). Set to "" to disable mTLS and run HTTPS-only (use
+    # OIDC for auth instead). When cert-manager or another issuer writes ca.crt
+    # into the server secret, this may be sourced from that material instead of
+    # a dedicated Secret.
     clientCaSecretName: openshell-server-client-ca
-    # -- K8s secret mounted into sandbox pods for mTLS to the server.
+    # -- K8s secret mounted into sandbox pods for supervisor callback
+    # transport mTLS to the gateway. This is distinct from the gateway server
+    # listener certificate and may be supplied by the same or a different
+    # certificate-management workflow.
     clientTlsSecretName: openshell-client-tls
   # Gateway-minted sandbox JWT signing keys. The pre-install certgen hook
   # generates an Ed25519 keypair and writes it to a secret containing
@@ -271,11 +279,11 @@ networkPolicy:
   enabled: true
 
 # PKI bootstrap via a pre-install/pre-upgrade hook Job.
-# Runs `openshell-gateway generate-certs` to create the server and client TLS
-# Secrets in-cluster. Key material is written directly to K8s Secrets and
-# never appears in Helm release history. Idempotent: existing secrets are
-# left untouched on upgrade. Reuses the gateway image - no extra image to
-# mirror in air-gapped environments.
+# Runs `openshell-gateway generate-certs` to create the gateway server and
+# sandbox transport client TLS Secrets in-cluster. Key material is written
+# directly to K8s Secrets and never appears in Helm release history.
+# Idempotent: existing secrets are left untouched on upgrade. Reuses the
+# gateway image - no extra image to mirror in air-gapped environments.
 #
 # The server certificate already includes the built-in cluster SANs
 # (`openshell`, `openshell.openshell.svc`, the cluster.local FQDN, `localhost`,
@@ -285,15 +293,19 @@ networkPolicy:
 # that domain, for example `*.apps.example.com` enables
 # `<sandbox>--<service>.apps.example.com`.
 pkiInitJob:
-  # -- Run a pre-install/pre-upgrade Job that creates gateway and client mTLS Secrets.
+  # -- Run a pre-install/pre-upgrade Job that bootstraps self-generated
+  # gateway and sandbox transport mTLS Secrets. Disable this when using
+  # cert-manager or externally managed certificate Secrets.
   enabled: true
   # -- Extra DNS SANs to append to the server certificate.
   serverDnsNames: []
   # -- Extra IP SANs to append to the server certificate.
   serverIpAddresses: []
 
-# cert-manager Certificate/Issuer resources (requires cert-manager CRDs in-cluster).
-# Uses namespaced Issuers only (no ClusterIssuer). Does not install cert-manager itself.
+# cert-manager Certificate/Issuer resources (requires cert-manager CRDs
+# in-cluster). Uses namespaced Issuers only (no ClusterIssuer). Does not
+# install cert-manager itself. This is one supported way to supply the
+# certificate Secrets consumed by the gateway and sandbox transport path.
 certManager:
   # -- Create cert-manager Issuer and Certificate resources instead of using the PKI bootstrap Job.
   enabled: false

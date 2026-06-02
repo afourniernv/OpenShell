@@ -44,6 +44,8 @@ data:
     {{- if .Values.server.disableTls }}
     disable_tls            = true
     {{- else }}
+    # Secret supplying the sandbox transport client TLS bundle used by
+    # supervisors when they call back into the gateway over HTTPS.
     client_tls_secret_name = {{ .Values.server.tls.clientTlsSecretName | quote }}
     {{- end }}
     enable_loopback_service_http = {{ .Values.server.enableLoopbackServiceHttp }}
@@ -59,6 +61,8 @@ data:
 
     {{- if not .Values.server.disableTls }}
 
+    # Gateway listener TLS. The mounted files may come from the built-in
+    # PKI hook, cert-manager, or externally managed certificate Secrets.
     [openshell.gateway.tls]
     cert_path             = "/etc/openshell-tls/server/tls.crt"
     key_path              = "/etc/openshell-tls/server/tls.key"

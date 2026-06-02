@@ -147,6 +147,32 @@ tests:
           path: data["gateway.toml"]
           pattern: 'server_sans\s*=\s*\["openshell", "\*\.dev\.openshell\.localhost"\]'
 
+  - it: renders gateway listener TLS and sandbox transport client TLS when using externally managed Secrets
+    set:
+      pkiInitJob.enabled: false
+      certManager.enabled: false
+      server.tls.certSecretName: external-gateway-server
+      server.tls.clientCaSecretName: external-gateway-client-ca
+      server.tls.clientTlsSecretName: external-sandbox-client
+    template: templates/gateway-config.yaml
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '\[openshell\.gateway\.tls\]'
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: 'client_tls_secret_name\s*=\s*"external-sandbox-client"'
+
+  - it: keeps gateway listener TLS distinct from sandbox transport client TLS
+    template: templates/gateway-config.yaml
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?ms)\[openshell\.gateway\.tls\].*?cert_path\s*=\s*"/etc/openshell-tls/server/tls\.crt".*?client_ca_path\s*=\s*"/etc/openshell-tls/client-ca/ca\.crt"'
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: 'client_tls_secret_name\s*=\s*"openshell-client-tls"'
+
   - it: passes sqlite db-url via --db-url arg by default
     template: templates/statefulset.yaml
     asserts:
