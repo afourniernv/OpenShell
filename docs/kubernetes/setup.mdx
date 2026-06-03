@@ -24,7 +24,7 @@ Make sure the following are in place before you install.
 | Helm 3.x | Yes | No additional notes. |
 | Agent Sandbox controller and CRDs | Yes | Install before the OpenShell chart. Refer to [Install Agent Sandbox](#install-agent-sandbox). |
 | cert-manager | No | Refer to [Managing Certificates](/kubernetes/managing-certificates). Use cert-manager when you want controller-managed certificate issuance and renewal. |
-| Externally managed certificate Secrets | No | Refer to [Managing Certificates](/kubernetes/managing-certificates). Use this mode when an enterprise CA workflow or adjacent controller creates the Secrets and OpenShell only consumes them. |
+| Externally managed certificate Secrets | No | Refer to [Managing Certificates](/kubernetes/managing-certificates). Use this mode when another system or controller creates PEM/X.509-backed Secrets and OpenShell only consumes them. |
 | Kubernetes Gateway API | No | Refer to [Ingress](/kubernetes/ingress). Use it only for external access without port-forwarding. |
 
 ## Install Agent Sandbox

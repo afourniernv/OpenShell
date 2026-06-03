@@ -26,8 +26,8 @@ cert-manager and `pkiInitJob` are mutually exclusive. The chart fails if both ar
 
 ## Use externally managed certificate Secrets
 
-Choose this mode when another system such as an enterprise CA workflow, a
-platform operator, or an adjacent controller creates the Secrets that OpenShell
+Choose this mode when another system such as a platform operator or adjacent
+controller creates the Secrets that hold the PEM/X.509 material OpenShell
 consumes.
 
 Provide these Secrets:
