@@ -273,7 +273,7 @@ pub struct ServiceRoutingConfig {
 /// - OpenShell-generated local or Helm bootstrap PKI
 /// - operator-provided files or Secrets
 /// - controller-managed material such as cert-manager
-/// - externally managed enterprise CA workflows
+/// - externally managed PEM/X.509 certificate material
 ///
 /// This listener TLS config is distinct from driver-level sandbox transport
 /// client bundles such as `guest_tls_ca/cert/key` or

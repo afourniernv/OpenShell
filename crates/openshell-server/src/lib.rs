@@ -723,17 +723,27 @@ async fn build_compute_runtime(
             .await
             .map_err(|e| Error::execution(format!("failed to create compute runtime: {e}")))
         }
-        ComputeDriverKind::Docker => ComputeRuntime::new_docker(
-            config.clone(),
-            docker_config.clone(),
-            store,
-            sandbox_index,
-            sandbox_watch_bus,
-            tracing_log_bus,
-            supervisor_sessions,
-        )
-        .await
-        .map_err(|e| Error::execution(format!("failed to create compute runtime: {e}"))),
+        ComputeDriverKind::Docker => {
+            validate_local_callback_tls_autodetect(
+                "docker",
+                config.tls.is_some(),
+                &docker_config.grpc_endpoint,
+                docker_config.guest_tls_ca.is_some()
+                    && docker_config.guest_tls_cert.is_some()
+                    && docker_config.guest_tls_key.is_some(),
+            )?;
+            ComputeRuntime::new_docker(
+                config.clone(),
+                docker_config.clone(),
+                store,
+                sandbox_index,
+                sandbox_watch_bus,
+                tracing_log_bus,
+                supervisor_sessions,
+            )
+            .await
+            .map_err(|e| Error::execution(format!("failed to create compute runtime: {e}")))
+        }
         ComputeDriverKind::Vm => {
             let (channel, driver_process) = compute::vm::spawn(config, vm_config).await?;
             ComputeRuntime::new_remote_vm(
@@ -758,6 +768,12 @@ async fn build_compute_runtime(
                 podman.host_gateway_ip = ip;
             }
             apply_podman_local_tls_defaults(config, &mut podman)?;
+            validate_local_callback_tls_autodetect(
+                "podman",
+                config.tls.is_some(),
+                &podman.grpc_endpoint,
+                podman.tls_enabled(),
+            )?;
 
             ComputeRuntime::new_podman(
                 podman,
@@ -771,6 +787,21 @@ async fn build_compute_runtime(
             .map_err(|e| Error::execution(format!("failed to create compute runtime: {e}")))
         }
     }
+}
+
+fn validate_local_callback_tls_autodetect(
+    driver_name: &str,
+    gateway_tls_enabled: bool,
+    grpc_endpoint: &str,
+    guest_tls_configured: bool,
+) -> Result<()> {
+    if !gateway_tls_enabled || !grpc_endpoint.trim().is_empty() || guest_tls_configured {
+        return Ok(());
+    }
+
+    Err(Error::config(format!(
+        "{driver_name} compute driver cannot auto-detect a sandbox callback endpoint when gateway TLS is enabled without sandbox guest TLS materials; configure {driver_name}.grpc_endpoint explicitly or provide guest_tls_ca, guest_tls_cert, and guest_tls_key",
+    )))
 }
 
 /// Build a [`KubernetesComputeConfig`] from the file's
@@ -885,6 +916,7 @@ mod tests {
         allow_plaintext_service_http, classify_initial_bytes, configured_compute_driver,
         gateway_listener_addresses, is_benign_tls_handshake_failure,
         kubernetes_config_for_k8s_sa_bootstrap, serve_gateway_listener,
+        validate_local_callback_tls_autodetect,
     };
     use openshell_core::{
         ComputeDriverKind, Config,
@@ -1286,6 +1318,37 @@ mod tests {
             configured_compute_driver(&config).unwrap(),
             ComputeDriverKind::Docker
         );
+    }
+
+    #[test]
+    fn local_callback_tls_autodetect_allows_plaintext_gateway() {
+        validate_local_callback_tls_autodetect("docker", false, "", false)
+            .expect("plaintext gateways may auto-detect http callbacks");
+    }
+
+    #[test]
+    fn local_callback_tls_autodetect_allows_explicit_endpoint_without_guest_tls() {
+        validate_local_callback_tls_autodetect(
+            "docker",
+            true,
+            "http://gateway.internal:17670",
+            false,
+        )
+        .expect("explicit callback endpoints remain allowed");
+    }
+
+    #[test]
+    fn local_callback_tls_autodetect_allows_guest_tls_for_https_autodetect() {
+        validate_local_callback_tls_autodetect("podman", true, "", true)
+            .expect("full guest tls enables https auto-detect");
+    }
+
+    #[test]
+    fn local_callback_tls_autodetect_rejects_tls_gateway_without_endpoint_or_guest_tls() {
+        let err = validate_local_callback_tls_autodetect("docker", true, "", false)
+            .expect_err("tls gateway without callback tls should fail early");
+        assert!(err.to_string().contains("cannot auto-detect"));
+        assert!(err.to_string().contains("guest_tls_ca"));
     }
 
     #[test]

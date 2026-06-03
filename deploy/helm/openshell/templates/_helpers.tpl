@@ -167,3 +167,16 @@ init-container
 {{- printf "%s://%s.%s.svc.cluster.local:%d" $scheme (include "openshell.fullname" .) .Release.Namespace (int .Values.service.port) -}}
 {{- end -}}
 {{- end }}
+
+{{/*
+Whether the gateway listener should mount and reference a client CA bundle for
+incoming client-certificate verification. This stays aligned across the
+rendered gateway TOML and the StatefulSet volumes.
+*/}}
+{{- define "openshell.gatewayHasClientCa" -}}
+{{- if or .Values.server.tls.clientCaSecretName .Values.pkiInitJob.enabled (and .Values.certManager.enabled .Values.certManager.clientCaFromServerTlsSecret) -}}
+true
+{{- else -}}
+false
+{{- end -}}
+{{- end }}

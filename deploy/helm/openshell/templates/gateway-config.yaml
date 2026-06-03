@@ -12,6 +12,10 @@ One value is intentionally NOT rendered here:
                                  when postgres.enabled=true or server.externalDbSecret
                                  is set, otherwise --db-url arg for SQLite
 */}}
+{{- $grpcEndpoint := include "openshell.grpcEndpoint" . | trim -}}
+{{- if and (not .Values.server.disableTls) (hasPrefix "https://" $grpcEndpoint) (eq .Values.server.tls.clientTlsSecretName "") }}
+{{- fail "server.tls.clientTlsSecretName must be set when the sandbox callback endpoint uses https:// so supervisors can present TLS client credentials." }}
+{{- end }}
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -66,7 +70,9 @@ data:
     [openshell.gateway.tls]
     cert_path             = "/etc/openshell-tls/server/tls.crt"
     key_path              = "/etc/openshell-tls/server/tls.key"
+    {{- if eq (include "openshell.gatewayHasClientCa" .) "true" }}
     client_ca_path        = "/etc/openshell-tls/client-ca/ca.crt"
+    {{- end }}
     {{- end }}
 
     {{- if .Values.server.auth.allowUnauthenticatedUsers }}
@@ -103,7 +109,7 @@ data:
     {{- end }}
 
     [openshell.drivers.kubernetes]
-    grpc_endpoint                = {{ include "openshell.grpcEndpoint" . | quote }}
+    grpc_endpoint                = {{ $grpcEndpoint | quote }}
     service_account_name         = {{ include "openshell.sandboxServiceAccountName" . | quote }}
     supervisor_sideload_method   = {{ include "openshell.supervisorSideloadMethod" . | quote }}
     sa_token_ttl_secs            = {{ .Values.server.sandboxJwt.k8sSaTokenTtlSecs | default 3600 }}

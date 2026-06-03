@@ -56,7 +56,7 @@ Gateway transport certificate material can come from several deployment models:
 - OpenShell-generated bootstrap PKI
 - operator-provided files or pre-created Secrets
 - cert-manager-managed Secrets
-- externally managed enterprise CA workflows
+- externally managed PEM/X.509 certificate material
 
 These transport certificate sources do not change sandbox identity semantics in
 current releases. Supervisors still authenticate as sandboxes with

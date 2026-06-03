@@ -173,6 +173,95 @@ tests:
           path: data["gateway.toml"]
           pattern: 'client_tls_secret_name\s*=\s*"openshell-client-tls"'
 
+  - it: omits gateway client CA wiring when running HTTPS-only without client cert verification
+    set:
+      pkiInitJob.enabled: false
+      certManager.enabled: false
+      server.tls.clientCaSecretName: ""
+    asserts:
+      - notMatchRegex:
+          path: data["gateway.toml"]
+          pattern: 'client_ca_path\s*='
+    template: templates/gateway-config.yaml
+
+  - it: omits the gateway client CA Secret mount when HTTPS-only client verification is disabled
+    set:
+      pkiInitJob.enabled: false
+      certManager.enabled: false
+      server.tls.clientCaSecretName: ""
+    template: templates/statefulset.yaml
+    asserts:
+      - notContains:
+          path: spec.template.spec.containers[0].volumeMounts
+          content:
+            name: tls-client-ca
+      - notContains:
+          path: spec.template.spec.volumes
+          content:
+            name: tls-client-ca
+
+  - it: keeps gateway client CA wiring when cert-manager sources ca.crt from the server TLS Secret
+    set:
+      pkiInitJob.enabled: false
+      certManager.enabled: true
+      certManager.clientCaFromServerTlsSecret: true
+      server.tls.clientCaSecretName: ""
+    template: templates/statefulset.yaml
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].volumeMounts
+          content:
+            name: tls-client-ca
+            mountPath: /etc/openshell-tls/client-ca
+            readOnly: true
+      - contains:
+          path: spec.template.spec.volumes
+          content:
+            name: tls-client-ca
+            secret:
+              secretName: openshell-server-tls
+              items:
+                - key: ca.crt
+                  path: ca.crt
+
+  - it: uses the dedicated gateway client CA Secret when cert-manager server Secret is not the client CA source
+    set:
+      pkiInitJob.enabled: false
+      certManager.enabled: true
+      certManager.clientCaFromServerTlsSecret: false
+      server.tls.clientCaSecretName: external-gateway-client-ca
+    template: templates/statefulset.yaml
+    asserts:
+      - contains:
+          path: spec.template.spec.volumes
+          content:
+            name: tls-client-ca
+            secret:
+              secretName: external-gateway-client-ca
+
+  - it: keeps gateway client CA wiring when built-in PKI is enabled even if clientCaSecretName is empty
+    set:
+      pkiInitJob.enabled: true
+      certManager.enabled: false
+      server.tls.clientCaSecretName: ""
+    template: templates/gateway-config.yaml
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: 'client_ca_path\s*=\s*"/etc/openshell-tls/client-ca/ca\.crt"'
+
+  - it: allows an empty sandbox client TLS Secret when the sandbox callback endpoint is explicit http
+    set:
+      pkiInitJob.enabled: false
+      certManager.enabled: false
+      server.grpcEndpoint: http://openshell.openshell.svc.cluster.local:17670
+      server.tls.clientTlsSecretName: ""
+    template: templates/gateway-config.yaml
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: 'grpc_endpoint\s*=\s*"http://openshell\.openshell\.svc\.cluster\.local:17670"'
+
   - it: passes sqlite db-url via --db-url arg by default
     template: templates/statefulset.yaml
     asserts:

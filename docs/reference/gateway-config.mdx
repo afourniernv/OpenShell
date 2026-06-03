@@ -37,7 +37,7 @@ The certificate material for either path may come from:
 - OpenShell-generated bootstrap PKI
 - operator-provided files or Kubernetes Secrets
 - cert-manager-managed Secrets
-- externally managed enterprise CA workflows
+- externally managed PEM/X.509 certificate material
 
 This page documents how the gateway consumes those inputs. It does not require
 OpenShell to own certificate issuance.
@@ -237,6 +237,17 @@ ssh_socket_path    = "/run/openshell/ssh.sock"
 sandbox_pids_limit = 2048
 ```
 
+When the gateway listener uses externally managed TLS material, Docker cannot
+auto-detect a working HTTPS callback path on its own. In that mode, configure
+either:
+
+- an explicit `grpc_endpoint`, or
+- the full `guest_tls_ca`, `guest_tls_cert`, and `guest_tls_key` bundle so
+  Docker can auto-detect `https://host.openshell.internal:<gateway-port>`
+
+The self-generated local PKI path already provides this guest TLS bundle
+automatically.
+
 ### Podman
 
 Sandboxes run as Podman containers on a user-mode bridge network. The supervisor image is mounted read-only via Podman's `type=image` mount; guest mTLS material is supplied as host paths.
@@ -271,6 +282,16 @@ guest_tls_key           = "/etc/openshell/certs/client-key.pem"
 # Set to 0 to leave Podman's runtime default unchanged.
 sandbox_pids_limit      = 2048
 ```
+
+When the gateway listener uses externally managed TLS material, Podman also
+requires either:
+
+- an explicit `grpc_endpoint`, or
+- the full `guest_tls_ca`, `guest_tls_cert`, and `guest_tls_key` bundle so the
+  driver can auto-detect `https://host.containers.internal:<gateway-port>`
+
+The self-generated local PKI path already wires these guest TLS files by
+default.
 
 ### MicroVM
 

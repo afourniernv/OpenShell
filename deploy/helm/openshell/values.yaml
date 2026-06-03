@@ -191,7 +191,8 @@ server:
   tls:
     # -- K8s secret (type kubernetes.io/tls) with tls.crt and tls.key for the
     # gateway server listener. The secret may be created by the built-in
-    # pkiInitJob, by cert-manager, or by an external enterprise CA workflow.
+    # pkiInitJob, by cert-manager, or from externally managed PEM/X.509
+    # certificate material.
     certSecretName: openshell-server-tls
     # -- K8s secret with ca.crt for gateway-side client certificate
     # verification (mTLS). Set to "" to disable mTLS and run HTTPS-only (use
