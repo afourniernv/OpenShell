@@ -322,9 +322,7 @@ async fn reject_refresh_owned_credential_updates(
     for refresh_state in
         crate::provider_refresh::list_refresh_states_for_provider(store, provider_id).await?
     {
-        let strategy =
-            ProviderCredentialRefreshStrategy::try_from(refresh_state.strategy).unwrap_or_default();
-        if !crate::provider_refresh::is_gateway_mintable_strategy(strategy) {
+        if !crate::provider_refresh::is_gateway_managed_refresh_state(&refresh_state) {
             continue;
         }
 
@@ -1301,9 +1299,7 @@ fn refresh_authorization_epochs_by_key(
         {
             continue;
         }
-        if !crate::provider_refresh::is_gateway_mintable_strategy(
-            ProviderCredentialRefreshStrategy::try_from(state.strategy).unwrap_or_default(),
-        ) {
+        if !crate::provider_refresh::is_gateway_managed_refresh_state(state) {
             continue;
         }
         let epoch = crate::provider_refresh::effective_authorization_epoch(state)?.to_string();
@@ -2329,6 +2325,7 @@ async fn authorize_and_resolve_profile_workspace(
     if workspace.is_empty() {
         require_platform_admin(&state.admin_role, principal)?;
         Ok(super::workspace::ResolvedWorkspace {
+            id: String::new(),
             name: String::new(),
             terminating: false,
         })
@@ -4099,9 +4096,10 @@ pub(super) async fn handle_configure_provider_refresh(
         MinWorkspaceRole::Admin,
     )
     .await?;
-    let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &authz.workspace)
-        .await?
-        .name;
+    let resolved_workspace =
+        super::workspace::resolve_workspace(state.store.as_ref(), &authz.workspace).await?;
+    let workspace_id = resolved_workspace.id.clone();
+    let workspace = resolved_workspace.name;
     let provider_name = request.provider.trim();
     let credential_key = request.credential_key.trim();
     if provider_name.is_empty() {
@@ -4120,7 +4118,9 @@ pub(super) async fn handle_configure_provider_refresh(
     if strategy == ProviderCredentialRefreshStrategy::Unspecified {
         return Err(Status::invalid_argument("refresh strategy is required"));
     }
-    if !crate::provider_refresh::is_gateway_mintable_strategy(strategy) {
+    if strategy != ProviderCredentialRefreshStrategy::External
+        && !crate::provider_refresh::is_gateway_mintable_strategy(strategy)
+    {
         return Err(Status::invalid_argument(format!(
             "refresh strategy '{}' is not gateway-mintable; update current credentials with provider update instead",
             crate::provider_refresh::refresh_strategy_name(strategy as i32)
@@ -4170,6 +4170,36 @@ pub(super) async fn handle_configure_provider_refresh(
                 "secret_material_keys entry exceeds maximum length ({} > {MAX_MAP_KEY_LEN})",
                 key.len()
             )));
+        }
+    }
+    if strategy == ProviderCredentialRefreshStrategy::External {
+        crate::provider_refresh::validate_idira_external_material(strategy, &request.material)?;
+        let idira = state.idira.as_ref().ok_or_else(|| {
+            Status::failed_precondition(
+                "external IDIRA refresh requires [openshell.gateway.idira] configuration",
+            )
+        })?;
+        let reference = request
+            .material
+            .get("reference")
+            .expect("validated IDIRA material contains reference")
+            .trim();
+        idira
+            .scoped_reference(&workspace_id, reference)
+            .map_err(|_| {
+                Status::invalid_argument(
+                    "external IDIRA reference must be a relative path without empty or traversing components",
+                )
+            })?;
+        if !request.secret_material_keys.is_empty() {
+            return Err(Status::invalid_argument(
+                "external IDIRA refresh does not accept secret material; configure the gateway API key by file path",
+            ));
+        }
+        if request.expires_at_ms.is_some() {
+            return Err(Status::invalid_argument(
+                "external IDIRA refresh does not accept expires_at_ms; variables are fetched immediately and refreshed on the configured cadence",
+            ));
         }
     }
     if request
@@ -4306,6 +4336,11 @@ pub(super) async fn handle_configure_provider_refresh(
     );
     let mut secret_material_keys: Vec<_> = secret_material_keys.into_iter().collect();
     secret_material_keys.sort();
+    if strategy == ProviderCredentialRefreshStrategy::External && !secret_material_keys.is_empty() {
+        return Err(Status::invalid_argument(
+            "external IDIRA control material cannot be marked secret by the request or provider profile",
+        ));
+    }
     let material_scopes = crate::provider_refresh::material_scopes(&request.material);
     let token_url = refresh_defaults
         .as_ref()
@@ -4368,13 +4403,22 @@ pub(super) async fn handle_configure_provider_refresh(
             .as_ref()
             .map(|metadata| metadata.resource_version)
     });
-    let expires_at_ms = request.expires_at_ms.unwrap_or_else(|| {
-        existing_refresh_state
-            .as_ref()
-            .map(|state| state.expires_at_ms)
-            .unwrap_or_default()
-    });
+    let expires_at_ms = if strategy == ProviderCredentialRefreshStrategy::External {
+        0
+    } else {
+        request.expires_at_ms.unwrap_or_else(|| {
+            existing_refresh_state
+                .as_ref()
+                .map(|state| state.expires_at_ms)
+                .unwrap_or_default()
+        })
+    };
     let mut persisted_material = request.material;
+    crate::provider_refresh::pin_idira_workspace_id(
+        strategy,
+        &mut persisted_material,
+        &workspace_id,
+    )?;
     let secret_material: HashMap<_, _> = secret_material_keys
         .iter()
         .filter_map(|key| {
@@ -4519,11 +4563,12 @@ pub(super) async fn handle_rotate_provider_credential(
     if credential_key.is_empty() {
         return Err(Status::invalid_argument("credential_key is required"));
     }
-    let refresh_state = crate::provider_refresh::refresh_provider_credential(
+    let refresh_state = crate::provider_refresh::refresh_provider_credential_with_idira(
         state.store.as_ref(),
         &workspace,
         &state.credentials,
         Some(&state.compute),
+        state.idira.as_ref(),
         provider_name,
         credential_key,
     )
@@ -4759,7 +4804,7 @@ mod tests {
         ProviderCredentialTokenGrantAudienceOverride, ProviderProfile, ProviderProfileCategory,
         ProviderProfileCredential, ProviderProfileImportItem, RotateProviderCredentialRequest,
         Sandbox, SandboxPolicy, SandboxSpec, StoredProviderProfile, UpdateProviderProfilesRequest,
-        UpdateProviderRequest,
+        UpdateProviderRequest, Workspace,
     };
     use openshell_core::{ObjectId, ObjectName};
     use tonic::{Code, Request};
@@ -7595,36 +7640,320 @@ mod tests {
         .await
         .unwrap();
 
-        for strategy in [
-            ProviderCredentialRefreshStrategy::Static,
-            ProviderCredentialRefreshStrategy::External,
-        ] {
-            let err = handle_configure_provider_refresh(
-                &state,
-                authed_request(ConfigureProviderRefreshRequest {
-                    provider: "msgraph".to_string(),
-                    credential_key: "MS_GRAPH_ACCESS_TOKEN".to_string(),
-                    strategy: strategy as i32,
-                    material: HashMap::new(),
-                    secret_material_keys: Vec::new(),
-                    expires_at_ms: None,
-                    workspace: "default".to_string(),
-                }),
-            )
-            .await
-            .unwrap_err();
-            assert_eq!(err.code(), Code::InvalidArgument);
-            assert!(
-                err.message().contains("not gateway-mintable"),
-                "unexpected error: {}",
-                err.message()
-            );
-        }
+        let static_err = handle_configure_provider_refresh(
+            &state,
+            authed_request(ConfigureProviderRefreshRequest {
+                provider: "msgraph".to_string(),
+                credential_key: "MS_GRAPH_ACCESS_TOKEN".to_string(),
+                strategy: ProviderCredentialRefreshStrategy::Static as i32,
+                material: HashMap::new(),
+                secret_material_keys: Vec::new(),
+                expires_at_ms: None,
+                workspace: "default".to_string(),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(static_err.code(), Code::InvalidArgument);
+        assert!(static_err.message().contains("not gateway-mintable"));
+
+        let unsupported_external = handle_configure_provider_refresh(
+            &state,
+            authed_request(ConfigureProviderRefreshRequest {
+                provider: "msgraph".to_string(),
+                credential_key: "MS_GRAPH_ACCESS_TOKEN".to_string(),
+                strategy: ProviderCredentialRefreshStrategy::External as i32,
+                material: HashMap::from([("backend".to_string(), "other".to_string())]),
+                secret_material_keys: Vec::new(),
+                expires_at_ms: None,
+                workspace: "default".to_string(),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(unsupported_external.code(), Code::InvalidArgument);
+        assert!(unsupported_external.message().contains("backend=idira"));
+
+        let unconfigured_idira = handle_configure_provider_refresh(
+            &state,
+            authed_request(ConfigureProviderRefreshRequest {
+                provider: "msgraph".to_string(),
+                credential_key: "MS_GRAPH_ACCESS_TOKEN".to_string(),
+                strategy: ProviderCredentialRefreshStrategy::External as i32,
+                material: HashMap::from([
+                    ("backend".to_string(), "idira".to_string()),
+                    (
+                        "reference".to_string(),
+                        "providers/msgraph/token".to_string(),
+                    ),
+                ]),
+                secret_material_keys: Vec::new(),
+                expires_at_ms: None,
+                workspace: "default".to_string(),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(unconfigured_idira.code(), Code::FailedPrecondition);
+        assert!(unconfigured_idira.message().contains("gateway.idira"));
 
         let refresh_states = crate::provider_refresh::list_all_refresh_states(state.store.as_ref())
             .await
             .unwrap();
         assert!(refresh_states.is_empty());
+    }
+
+    #[tokio::test]
+    async fn configure_provider_refresh_accepts_configured_idira_external_backend() {
+        let api_key = tempfile::NamedTempFile::new().expect("IDIRA API key file");
+        std::fs::write(api_key.path(), "gateway-api-key").expect("write IDIRA API key");
+        let transport = openshell_idira::IdiraClient::new(openshell_idira::IdiraClientConfig {
+            base_url: "http://127.0.0.1:1".to_string(),
+            account: "poc-account".to_string(),
+            login: "host/openshell-gateway".to_string(),
+            api_key_path: api_key.path().to_path_buf(),
+            ca_cert_path: None,
+            timeout: std::time::Duration::from_secs(5),
+            auth_token_ttl: std::time::Duration::from_secs(300),
+        })
+        .expect("IDIRA client");
+        let idira = crate::provider_refresh::IdiraRefreshClient::new(transport, "openshell")
+            .expect("IDIRA scope");
+        let mut state = test_server_state().await;
+        Arc::get_mut(&mut state).expect("unique server state").idira = Some(idira);
+        let provider = create_provider_record(
+            state.store.as_ref(),
+            "default",
+            Provider {
+                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                    name: "github-idira".to_string(),
+                    workspace: "default".to_string(),
+                    ..Default::default()
+                }),
+                r#type: "private-idira-poc".to_string(),
+                credentials: HashMap::from([(
+                    "GITHUB_TOKEN".to_string(),
+                    "bootstrap-placeholder".to_string(),
+                )]),
+                profile_workspace: "default".to_string(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let traversal = handle_configure_provider_refresh(
+            &state,
+            authed_request(ConfigureProviderRefreshRequest {
+                provider: "github-idira".to_string(),
+                credential_key: "GITHUB_TOKEN".to_string(),
+                strategy: ProviderCredentialRefreshStrategy::External as i32,
+                material: HashMap::from([
+                    ("backend".to_string(), "idira".to_string()),
+                    ("reference".to_string(), "../other/secret".to_string()),
+                ]),
+                secret_material_keys: Vec::new(),
+                expires_at_ms: None,
+                workspace: "default".to_string(),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(traversal.code(), Code::InvalidArgument);
+        assert!(
+            crate::provider_refresh::get_refresh_state(
+                state.store.as_ref(),
+                "default",
+                provider.object_id(),
+                "GITHUB_TOKEN",
+            )
+            .await
+            .unwrap()
+            .is_none()
+        );
+
+        let expiry = handle_configure_provider_refresh(
+            &state,
+            authed_request(ConfigureProviderRefreshRequest {
+                provider: "github-idira".to_string(),
+                credential_key: "GITHUB_TOKEN".to_string(),
+                strategy: ProviderCredentialRefreshStrategy::External as i32,
+                material: HashMap::from([
+                    ("backend".to_string(), "idira".to_string()),
+                    (
+                        "reference".to_string(),
+                        "providers/github/api-key".to_string(),
+                    ),
+                ]),
+                secret_material_keys: Vec::new(),
+                expires_at_ms: Some(crate::persistence::current_time_ms() + 86_400_000),
+                workspace: "default".to_string(),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(expiry.code(), Code::InvalidArgument);
+        assert!(expiry.message().contains("does not accept expires_at_ms"));
+
+        let response = handle_configure_provider_refresh(
+            &state,
+            authed_request(ConfigureProviderRefreshRequest {
+                provider: "github-idira".to_string(),
+                credential_key: "GITHUB_TOKEN".to_string(),
+                strategy: ProviderCredentialRefreshStrategy::External as i32,
+                material: HashMap::from([
+                    ("backend".to_string(), "idira".to_string()),
+                    (
+                        "reference".to_string(),
+                        "providers/github/api-key".to_string(),
+                    ),
+                    ("refresh_interval_seconds".to_string(), "120".to_string()),
+                ]),
+                secret_material_keys: Vec::new(),
+                expires_at_ms: None,
+                workspace: "default".to_string(),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+
+        assert_eq!(response.status.expect("status").status, "configured");
+        let stored = crate::provider_refresh::get_refresh_state(
+            state.store.as_ref(),
+            "default",
+            provider.object_id(),
+            "GITHUB_TOKEN",
+        )
+        .await
+        .unwrap()
+        .expect("stored refresh");
+        assert_eq!(
+            stored.material.get("backend").map(String::as_str),
+            Some("idira")
+        );
+        let workspace = state
+            .store
+            .get_message_by_name::<Workspace>("", "default")
+            .await
+            .unwrap()
+            .expect("default workspace");
+        assert_eq!(
+            stored
+                .material
+                .get("_openshell_workspace_id")
+                .map(String::as_str),
+            Some(workspace.object_id())
+        );
+        assert_eq!(stored.expires_at_ms, 0);
+        assert_eq!(
+            stored.next_refresh_at_ms,
+            stored.metadata.as_ref().unwrap().created_at_ms
+        );
+        assert!(stored.secret_material_handles.is_empty());
+    }
+
+    #[tokio::test]
+    async fn configure_provider_refresh_rejects_profile_secret_idira_control_material() {
+        let api_key = tempfile::NamedTempFile::new().expect("IDIRA API key file");
+        std::fs::write(api_key.path(), "gateway-api-key").expect("write IDIRA API key");
+        let transport = openshell_idira::IdiraClient::new(openshell_idira::IdiraClientConfig {
+            base_url: "http://127.0.0.1:1".to_string(),
+            account: "poc-account".to_string(),
+            login: "host/openshell-gateway".to_string(),
+            api_key_path: api_key.path().to_path_buf(),
+            ca_cert_path: None,
+            timeout: std::time::Duration::from_secs(5),
+            auth_token_ttl: std::time::Duration::from_secs(300),
+        })
+        .expect("IDIRA client");
+        let idira = crate::provider_refresh::IdiraRefreshClient::new(transport, "openshell")
+            .expect("IDIRA scope");
+        let mut state = test_server_state().await;
+        Arc::get_mut(&mut state).expect("unique server state").idira = Some(idira);
+
+        let mut profile = custom_profile("idira-secret-control");
+        profile.credentials = vec![ProviderProfileCredential {
+            name: "api_key".to_string(),
+            env_vars: vec!["GITHUB_TOKEN".to_string()],
+            required: true,
+            auth_style: "bearer".to_string(),
+            header_name: "authorization".to_string(),
+            refresh: Some(ProviderCredentialRefresh {
+                strategy: ProviderCredentialRefreshStrategy::External as i32,
+                material: vec![
+                    ProviderCredentialRefreshMaterial {
+                        name: "backend".to_string(),
+                        required: true,
+                        secret: true,
+                        ..Default::default()
+                    },
+                    ProviderCredentialRefreshMaterial {
+                        name: "reference".to_string(),
+                        required: true,
+                        secret: false,
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            }),
+            ..Default::default()
+        }];
+        handle_import_provider_profiles(
+            &state,
+            authed_request(ImportProviderProfilesRequest {
+                profiles: vec![ProviderProfileImportItem {
+                    profile: Some(profile),
+                    source: "idira-secret-control.yaml".to_string(),
+                }],
+                workspace: "default".to_string(),
+            }),
+        )
+        .await
+        .unwrap();
+        create_provider_record(
+            state.store.as_ref(),
+            "default",
+            Provider {
+                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                    name: "github-idira-secret-profile".to_string(),
+                    workspace: "default".to_string(),
+                    ..Default::default()
+                }),
+                r#type: "idira-secret-control".to_string(),
+                credentials: HashMap::from([(
+                    "GITHUB_TOKEN".to_string(),
+                    "bootstrap-placeholder".to_string(),
+                )]),
+                profile_workspace: "default".to_string(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let error = handle_configure_provider_refresh(
+            &state,
+            authed_request(ConfigureProviderRefreshRequest {
+                provider: "github-idira-secret-profile".to_string(),
+                credential_key: "GITHUB_TOKEN".to_string(),
+                strategy: ProviderCredentialRefreshStrategy::External as i32,
+                material: HashMap::from([
+                    ("backend".to_string(), "idira".to_string()),
+                    (
+                        "reference".to_string(),
+                        "providers/github/api-key".to_string(),
+                    ),
+                ]),
+                secret_material_keys: Vec::new(),
+                expires_at_ms: None,
+                workspace: "default".to_string(),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code(), Code::InvalidArgument);
+        assert!(error.message().contains("cannot be marked secret"));
     }
 
     #[tokio::test]

@@ -185,6 +185,13 @@ pub struct GatewayFileSection {
     #[serde(default)]
     pub otlp: Option<OtlpConfig>,
 
+    /// Optional IDIRA/Conjur-compatible secret source used by provider
+    /// refresh entries with `strategy = "external"` and `backend = "idira"`.
+    /// Authentication material is read from `api_key_path`; it is never stored
+    /// inline in this file.
+    #[serde(default)]
+    pub idira: Option<IdiraFileConfig>,
+
     // ── Disallowed-in-file fields ────────────────────────────────────────
     //
     // Captured so we can produce a friendly "set this via env/CLI instead"
@@ -209,6 +216,40 @@ pub struct OtlpConfig {
     /// `service.name` resource attribute. Defaults to `openshell-gateway`.
     #[serde(default)]
     pub service_name: Option<String>,
+}
+
+/// `[openshell.gateway.idira]` connection settings for the private IDIRA `PoC`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IdiraFileConfig {
+    /// Base URL of the IDIRA/Conjur-compatible API.
+    pub base_url: String,
+    /// IDIRA account name used in authentication and secret paths.
+    pub account: String,
+    /// Gateway host identity, for example `host/openshell-gateway`.
+    pub login: String,
+    /// Operator-owned IDIRA path below which each `OpenShell` workspace gets a
+    /// separate child path: `<reference_prefix>/<workspace>/...`.
+    pub reference_prefix: String,
+    /// Gateway-local file containing the IDIRA API key.
+    pub api_key_path: PathBuf,
+    /// Optional PEM trust root for a private IDIRA endpoint.
+    #[serde(default)]
+    pub ca_cert_path: Option<PathBuf>,
+    /// Per-request timeout. Defaults to 30 seconds.
+    #[serde(default = "default_idira_timeout_seconds")]
+    pub timeout_seconds: u64,
+    /// In-memory authentication token cache lifetime. Defaults to 5 minutes.
+    #[serde(default = "default_idira_auth_token_ttl_seconds")]
+    pub auth_token_ttl_seconds: u64,
+}
+
+const fn default_idira_timeout_seconds() -> u64 {
+    30
+}
+
+const fn default_idira_auth_token_ttl_seconds() -> u64 {
+    300
 }
 
 /// `[openshell.supervisor]` section.
@@ -638,6 +679,51 @@ service_name = "openshell-gateway-dev"
             "http://otel-collector.observability.svc:4317"
         );
         assert_eq!(otlp.service_name.as_deref(), Some("openshell-gateway-dev"));
+    }
+
+    #[test]
+    fn parses_gateway_idira_config_without_inline_credentials() {
+        let tmp = write_tmp(
+            r#"
+[openshell.gateway.idira]
+base_url = "https://idira.example.com"
+account = "poc-account"
+login = "host/openshell-gateway"
+reference_prefix = "openshell"
+api_key_path = "/run/secrets/idira-api-key"
+ca_cert_path = "/etc/openshell/idira-ca.pem"
+timeout_seconds = 15
+auth_token_ttl_seconds = 120
+"#,
+        );
+        let file = load(tmp.path()).expect("valid IDIRA config parses");
+        let idira = file.openshell.gateway.idira.expect("IDIRA config");
+        assert_eq!(idira.base_url, "https://idira.example.com");
+        assert_eq!(idira.account, "poc-account");
+        assert_eq!(idira.login, "host/openshell-gateway");
+        assert_eq!(idira.reference_prefix, "openshell");
+        assert_eq!(
+            idira.api_key_path,
+            PathBuf::from("/run/secrets/idira-api-key")
+        );
+        assert_eq!(idira.timeout_seconds, 15);
+        assert_eq!(idira.auth_token_ttl_seconds, 120);
+    }
+
+    #[test]
+    fn idira_config_rejects_inline_api_key() {
+        let tmp = write_tmp(
+            r#"
+[openshell.gateway.idira]
+base_url = "https://idira.example.com"
+account = "poc-account"
+login = "host/openshell-gateway"
+reference_prefix = "openshell"
+api_key_path = "/run/secrets/idira-api-key"
+api_key = "must-not-be-inline"
+"#,
+        );
+        assert!(load(tmp.path()).is_err());
     }
 
     #[test]

@@ -7,7 +7,6 @@
 
 use std::sync::Arc;
 
-use openshell_core::ObjectName;
 use openshell_core::proto::datamodel::v1::{ObjectMeta, WorkspacePhase, WorkspaceStatus};
 use openshell_core::proto::{
     AddWorkspaceMemberRequest, AddWorkspaceMemberResponse, CreateWorkspaceRequest,
@@ -18,6 +17,7 @@ use openshell_core::proto::{
     SshSession, StoredProviderCredentialRefreshState, StoredProviderProfile, Workspace,
     WorkspaceMember, WorkspaceRole,
 };
+use openshell_core::{ObjectId, ObjectName};
 use prost::Message;
 use tonic::{Request, Response, Status};
 
@@ -87,6 +87,9 @@ fn validate_workspace_name(name: &str) -> Result<(), Status> {
 /// A resolved workspace name with its current lifecycle state.
 #[derive(Debug)]
 pub struct ResolvedWorkspace {
+    /// Immutable persistence identity. Unlike `name`, this value is not reused
+    /// when a deleted workspace name is created again.
+    pub id: String,
     pub name: String,
     pub terminating: bool,
 }
@@ -129,11 +132,16 @@ pub async fn resolve_workspace(
 
     match ws {
         Some(ws) => {
+            let id = ws.object_id().to_string();
             let terminating = ws
                 .metadata
                 .as_ref()
                 .is_some_and(|m| m.deletion_timestamp_ms != 0);
-            Ok(ResolvedWorkspace { name, terminating })
+            Ok(ResolvedWorkspace {
+                id,
+                name,
+                terminating,
+            })
         }
         None => Err(Status::not_found(format!("workspace '{name}' not found"))),
     }
@@ -1441,6 +1449,7 @@ mod tests {
     #[test]
     fn resolved_workspace_ensure_active_passes_for_active() {
         let rw = ResolvedWorkspace {
+            id: "test-id".to_string(),
             name: "test".to_string(),
             terminating: false,
         };
@@ -1450,6 +1459,7 @@ mod tests {
     #[test]
     fn resolved_workspace_ensure_active_rejects_terminating() {
         let rw = ResolvedWorkspace {
+            id: "doomed-id".to_string(),
             name: "doomed".to_string(),
             terminating: true,
         };

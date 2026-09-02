@@ -494,8 +494,9 @@ impl ProviderTypeProfile {
     ///
     /// Empty provider creation is allowed when at least one credential can be
     /// resolved at runtime, and every required credential can be resolved at
-    /// runtime. Runtime-resolvable credentials are either gateway-mintable
-    /// refresh credentials, sandbox-side dynamic token grants, or additional
+    /// runtime. Runtime-resolvable credentials are gateway-mintable refresh
+    /// credentials, external refresh credentials that declare the IDIRA
+    /// material contract, sandbox-side dynamic token grants, or additional
     /// outputs co-minted by another credential's gateway-mintable refresh.
     #[must_use]
     pub fn allows_empty_provider_credentials(&self) -> bool {
@@ -708,7 +709,7 @@ impl CredentialProfile {
             || self
                 .refresh
                 .as_ref()
-                .is_some_and(CredentialRefreshProfile::is_gateway_mintable)
+                .is_some_and(|refresh| refresh.is_gateway_mintable() || refresh.is_idira_external())
     }
 }
 
@@ -716,6 +717,20 @@ impl CredentialRefreshProfile {
     #[must_use]
     pub fn is_gateway_mintable(&self) -> bool {
         is_gateway_mintable_strategy(self.strategy)
+    }
+
+    /// Whether this refresh declares the narrow external contract implemented
+    /// by the gateway's IDIRA integration.
+    ///
+    /// `External` is otherwise an extensibility point whose credentials are
+    /// updated out of band. The profile cannot pin material values, so the
+    /// server still verifies `backend=idira` and a non-empty `reference` when
+    /// configuring a provider refresh.
+    fn is_idira_external(&self) -> bool {
+        self.strategy == ProviderCredentialRefreshStrategy::External
+            && ["backend", "reference"]
+                .iter()
+                .all(|key| self.material.iter().any(|material| material.name == *key))
     }
 }
 
@@ -3110,6 +3125,62 @@ credentials:
         )
         .expect("profile");
         assert!(token_grant_profile.allows_empty_provider_credentials());
+
+        let idira_external_refresh_profile = parse_profile_yaml(
+            r"
+id: idira-external-refresh
+display_name: IDIRA External Refresh
+credentials:
+  - name: api_key
+    required: true
+    refresh:
+      strategy: external
+      material:
+        - name: backend
+          required: true
+        - name: reference
+          required: true
+",
+        )
+        .expect("profile");
+        assert!(idira_external_refresh_profile.allows_empty_provider_credentials());
+
+        let generic_external_refresh_profile = parse_profile_yaml(
+            r"
+id: generic-external-refresh
+display_name: Generic External Refresh
+credentials:
+  - name: api_key
+    required: true
+    refresh:
+      strategy: external
+",
+        )
+        .expect("profile");
+        assert!(
+            !generic_external_refresh_profile.allows_empty_provider_credentials(),
+            "generic external refreshes are updated out of band"
+        );
+
+        let incomplete_idira_refresh_profile = parse_profile_yaml(
+            r"
+id: incomplete-idira-refresh
+display_name: Incomplete IDIRA Refresh
+credentials:
+  - name: api_key
+    required: true
+    refresh:
+      strategy: external
+      material:
+        - name: backend
+          required: true
+",
+        )
+        .expect("profile");
+        assert!(
+            !incomplete_idira_refresh_profile.allows_empty_provider_credentials(),
+            "an IDIRA-shaped refresh must declare both backend and reference material"
+        );
 
         let mixed_required_profile = parse_profile_yaml(
             r"

@@ -267,6 +267,11 @@ pub struct ServerState {
     /// Credential-driver selection and resolution runtime.
     pub credentials: credentials::CredentialRuntime,
 
+    /// Optional gateway-local IDIRA client used only by the private provider
+    /// refresh `PoC`. The API key remains in its configured file and IDIRA
+    /// authentication tokens remain in memory.
+    pub idira: Option<provider_refresh::IdiraRefreshClient>,
+
     /// In-memory sandbox correlation index.
     pub sandbox_index: SandboxIndex,
 
@@ -409,6 +414,7 @@ impl ServerState {
             store,
             compute,
             credentials,
+            idira: None,
             sandbox_index,
             sandbox_watch_bus,
             tracing_log_bus,
@@ -431,6 +437,34 @@ impl ServerState {
             admin_role,
         }
     }
+}
+
+fn build_idira_client(
+    config_file: Option<&config_file::ConfigFile>,
+) -> Result<Option<provider_refresh::IdiraRefreshClient>> {
+    let Some(config) = config_file.and_then(|file| file.openshell.gateway.idira.as_ref()) else {
+        return Ok(None);
+    };
+    let transport = openshell_idira::IdiraClient::new(openshell_idira::IdiraClientConfig {
+        base_url: config.base_url.clone(),
+        account: config.account.clone(),
+        login: config.login.clone(),
+        api_key_path: config.api_key_path.clone(),
+        ca_cert_path: config.ca_cert_path.clone(),
+        timeout: Duration::from_secs(config.timeout_seconds),
+        auth_token_ttl: Duration::from_secs(config.auth_token_ttl_seconds),
+    })
+    .map_err(|error| Error::config(format!("IDIRA initialization failed: {error}")))?;
+    let client = provider_refresh::IdiraRefreshClient::new(transport, &config.reference_prefix)
+        .map_err(|error| Error::config(format!("IDIRA initialization failed: {error}")))?;
+    info!(
+        base_url = %config.base_url,
+        account = %config.account,
+        login = %config.login,
+        reference_prefix = %config.reference_prefix,
+        "IDIRA external provider refresh enabled"
+    );
+    Ok(Some(client))
 }
 
 /// Run the `OpenShell` server.
@@ -568,6 +602,7 @@ pub(crate) async fn run_server(
         Arc::clone(&store),
     )
     .await?;
+    let idira = build_idira_client(config_file.as_ref())?;
 
     let oidc_cache = if let Some(ref oidc) = config.oidc {
         // Validate RBAC configuration before starting.
@@ -656,6 +691,7 @@ pub(crate) async fn run_server(
     state.middleware_registry = middleware_registry;
     state.gateway_interceptors = gateway_interceptors;
     state.provider_profile_sources = provider_profile_sources;
+    state.idira = idira;
     state.sandbox_jwt_issuer = sandbox_jwt_issuer.clone();
     state.sandbox_jwt_authenticator = sandbox_jwt_authenticator;
     if let Some(issuer) = sandbox_jwt_issuer {

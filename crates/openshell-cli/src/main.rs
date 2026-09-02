@@ -751,6 +751,7 @@ enum OutputFormat {
 
 #[derive(Clone, Debug, ValueEnum)]
 enum CliProviderRefreshStrategy {
+    External,
     Oauth2RefreshToken,
     Oauth2ClientCredentials,
     GoogleServiceAccountJwt,
@@ -760,6 +761,7 @@ enum CliProviderRefreshStrategy {
 impl CliProviderRefreshStrategy {
     fn as_str(&self) -> &'static str {
         match self {
+            Self::External => "external",
             Self::Oauth2RefreshToken => "oauth2_refresh_token",
             Self::Oauth2ClientCredentials => "oauth2_client_credentials",
             Self::GoogleServiceAccountJwt => "google_service_account_jwt",
@@ -4921,6 +4923,34 @@ mod tests {
                     credential_key
                 }))
             }) if name == "my-graph" && credential_key == "MS_GRAPH_ACCESS_TOKEN"
+        ));
+    }
+
+    #[test]
+    fn provider_refresh_config_accepts_external_strategy() {
+        let cli = Cli::try_parse_from([
+            "openshell",
+            "provider",
+            "refresh",
+            "configure",
+            "external-provider",
+            "--credential-key",
+            "ACCESS_TOKEN",
+            "--strategy",
+            "external",
+        ])
+        .expect("provider refresh configure should accept external strategy");
+
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Provider {
+                command: Some(ProviderCommands::Refresh(
+                    ProviderRefreshCommands::Configure {
+                        strategy: CliProviderRefreshStrategy::External,
+                        ..
+                    }
+                ))
+            })
         ));
     }
 

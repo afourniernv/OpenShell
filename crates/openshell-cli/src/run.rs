@@ -4609,6 +4609,7 @@ pub async fn provider_refresh_delete(
 
 fn provider_refresh_strategy(strategy: &str) -> Result<ProviderCredentialRefreshStrategy> {
     match strategy {
+        "external" => Ok(ProviderCredentialRefreshStrategy::External),
         "oauth2_refresh_token" => Ok(ProviderCredentialRefreshStrategy::Oauth2RefreshToken),
         "oauth2_client_credentials" => {
             Ok(ProviderCredentialRefreshStrategy::Oauth2ClientCredentials)
@@ -7541,10 +7542,10 @@ mod tests {
         inferred_provider_type, parse_cli_setting_value, parse_credential_expiry_cli_value,
         parse_credential_expiry_pairs, parse_credential_pairs, parse_driver_config_json,
         parse_secret_material_env_pairs, policy_revision_to_json,
-        provider_profile_allows_empty_credentials, provisioning_timeout_message,
-        ready_false_condition_message, refresh_status_header, refresh_status_row, resolve_from,
-        sandbox_should_persist, sandbox_upload_plan, service_expose_status_error,
-        service_url_for_gateway,
+        provider_profile_allows_empty_credentials, provider_refresh_strategy,
+        provisioning_timeout_message, ready_false_condition_message, refresh_status_header,
+        refresh_status_row, resolve_from, sandbox_should_persist, sandbox_upload_plan,
+        service_expose_status_error, service_url_for_gateway,
     };
     use crate::TEST_ENV_LOCK;
     use crate::commands::common::progress_step_from_metadata;
@@ -7835,6 +7836,14 @@ mod tests {
         assert!(row.contains("2026-01-01 00:00:00"));
         assert!(!row.contains("292278994"));
         assert!(row.contains("..."));
+    }
+
+    #[test]
+    fn external_provider_refresh_strategy_maps_to_proto() {
+        assert_eq!(
+            provider_refresh_strategy("external").expect("external strategy should be supported"),
+            ProviderCredentialRefreshStrategy::External
+        );
     }
 
     #[test]

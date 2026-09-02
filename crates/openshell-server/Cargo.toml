@@ -22,6 +22,7 @@ openshell-driver-kubernetes-secrets = { path = "../openshell-driver-kubernetes-s
 openshell-driver-vault = { path = "../openshell-driver-vault" }
 openshell-extension-core = { path = "../openshell-extension-core" }
 openshell-gateway-interceptors = { path = "../openshell-gateway-interceptors" }
+openshell-idira = { path = "../openshell-idira" }
 openshell-ocsf = { path = "../openshell-ocsf" }
 openshell-otel = { path = "../openshell-otel" }
 openshell-policy = { path = "../openshell-policy" }

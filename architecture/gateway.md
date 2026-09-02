@@ -362,6 +362,48 @@ Multi-replica deployments can use that default with a shared database and
 shared key-encryption key, or opt into an external backend such as Vault or
 Kubernetes Secrets.
 
+### Private IDIRA Provider Refresh PoC
+
+**Private PoC boundary.** The IDIRA integration is a gateway-local source for
+eager provider credential refresh, not a general secret-manager integration.
+The `openshell-idira` crate exposes only authentication and read access for one
+pre-provisioned IDIRA/Conjur-compatible variable. It does not expose list,
+create, update, or delete operations.
+
+The optional TOML table `[openshell.gateway.idira]` configures the remote base
+URL, account, login, request timeout, authentication-token cache lifetime, and
+optional private CA. The operator-owned `reference_prefix` confines each
+workspace to `<reference_prefix>/<workspace-id>/...`; the gateway pins the
+immutable workspace UUID when refresh is configured, so reusing a deleted
+workspace name cannot inherit its old variables. Provider administrators can
+only supply a non-traversing relative reference below that path.
+`api_key_path` points to a gateway-local file containing the API key; the
+configuration has no inline API-key field. The client caches the resulting
+IDIRA authentication token only in gateway memory.
+
+The gateway manages an `External` provider refresh state only when its material
+contains `backend=idira` and a non-empty `reference`. The only optional material
+field is `refresh_interval_seconds`, which must be between 60 and 86,400 seconds
+and defaults to 300 seconds. Other `External` refresh shapes remain outside the
+gateway refresh worker.
+
+New IDIRA refresh states are immediately due and the existing worker fetches
+them on its next 60-second sweep. After a successful fetch, it schedules the
+next eager read at the configured interval. The gateway stages the fetched
+value through the existing `CredentialRuntime`, updates the provider with the
+resulting handle through the normal CAS path, and advances the provider
+environment revision. **The fetched value is therefore cached at rest in
+OpenShell's configured credential store.** It then follows the normal
+endpoint-bound static credential and L7 injection path into attached sandboxes.
+IDIRA variables have no expiry in this path, so refresh failure leaves the last
+successfully fetched value active. The PoC has no maximum-staleness or
+fail-closed guarantee.
+
+This PoC has no just-in-time fetch path, middleware API, or IDIRA-backed
+`CredentialDriver` CRUD implementation. Sandboxes never authenticate to or
+read from IDIRA; they receive the gateway-cached value through the existing
+provider environment flow.
+
 OAuth refresh failures retain a gateway-owned recovery classification alongside
 the refresh state. The gateway reads only a bounded error response and maps
 recognized OAuth codes to retry, reauthorization, configuration repair, or

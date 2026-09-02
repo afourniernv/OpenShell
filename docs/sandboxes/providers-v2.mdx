@@ -461,13 +461,18 @@ Profile YAML can declare these refresh strategies:
 | Strategy | Behavior |
 |---|---|
 | `static` | Current credentials are updated through `openshell provider update`. The gateway does not mint a token. |
-| `external` | An external process updates current credentials through `openshell provider update`. The gateway does not mint a token. |
+| `external` | An external process normally updates current credentials through `openshell provider update`. The private IDIRA PoC also recognizes `backend=idira` and lets the gateway fetch an existing variable. |
 | `oauth2_refresh_token` | The gateway exchanges a refresh token for a short-lived access token. |
 | `oauth2_client_credentials` | The gateway mints a short-lived access token with OAuth2 client credentials. |
 | `google_service_account_jwt` | The gateway signs a Google service account JWT and exchanges it for an access token. |
 | `aws_sts_assume_role` | The gateway calls `sts:AssumeRole` and mints `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, and `AWS_SESSION_TOKEN` in one operation. Requires `providers_v2_enabled=true`. |
 
-`openshell provider refresh configure` accepts only gateway-mintable strategies: `oauth2-refresh-token`, `oauth2-client-credentials`, `google-service-account-jwt`, and `aws-sts-assume-role`. Use `openshell provider update` for `static` and `external` refresh patterns.
+`openshell provider refresh configure` accepts the gateway-mintable strategies
+`oauth2-refresh-token`, `oauth2-client-credentials`,
+`google-service-account-jwt`, and `aws-sts-assume-role`. The private IDIRA PoC
+also accepts `external` only with `backend=idira`, an existing variable
+`reference`, and an optional `refresh_interval_seconds`. Other `external`
+patterns still use `openshell provider update`.
 
 Gateway-managed refresh strategies use these material keys:
 
@@ -477,6 +482,7 @@ Gateway-managed refresh strategies use these material keys:
 | `oauth2_client_credentials` | `client_id`, `client_secret`, optional `tenant_id` for Microsoft Entra token URLs. |
 | `google_service_account_jwt` | `client_email`, `private_key`, optional `subject` or `sub`. |
 | `aws_sts_assume_role` | `role_arn`, optional `session_name`, `external_id`, `aws_region`, and optional long-lived `aws_access_key_id` / `aws_secret_access_key` for gateways without ambient AWS credentials. |
+| `external` with `backend=idira` (private PoC) | `backend=idira`, `reference`, and optional `refresh_interval_seconds` from `60` through `86400` (default `300`). |
 
 OpenShell keeps token endpoints profile-owned. Refresh material cannot override `token_url` or `token_uri` during refresh configuration.
 
@@ -705,6 +711,7 @@ The profile YAML strategy values use underscores, while the CLI `--strategy` val
 
 | Profile YAML | CLI |
 |---|---|
+| `external` | `external` |
 | `oauth2_refresh_token` | `oauth2-refresh-token` |
 | `oauth2_client_credentials` | `oauth2-client-credentials` |
 | `google_service_account_jwt` | `google-service-account-jwt` |
@@ -765,6 +772,34 @@ openshell provider refresh configure drive-work \
 ```
 
 This example assumes you imported a custom profile with `id: google-drive`.
+
+Configure eager IDIRA retrieval in the private PoC build after adding
+`[openshell.gateway.idira]` to the gateway configuration:
+
+```shell
+openshell provider refresh configure github-idira \
+  --credential-key GITHUB_TOKEN \
+  --strategy external \
+  --material backend=idira \
+  --material reference=providers/github/api-key \
+  --material refresh_interval_seconds=300
+
+openshell provider refresh rotate github-idira \
+  --credential-key GITHUB_TOKEN
+```
+
+The IDIRA reference is non-secret metadata and is relative to the provider's
+workspace. The gateway reads
+`<reference_prefix>/<workspace-id>/<reference>`, where the gateway operator owns
+`reference_prefix` and OpenShell pins the workspace's immutable UUID. Do not
+pass the gateway IDIRA API key as refresh material;
+mount it at the configured `api_key_path`. The fetched value is stored at rest
+through OpenShell's selected credential store, while the provider record
+retains only an opaque handle. Sandboxes never contact IDIRA. This path is
+eager, not JIT, and does not use supervisor middleware or an IDIRA
+`CredentialDriver`. An IDIRA refresh failure leaves the last successfully
+fetched value active because this PoC has no maximum-staleness or fail-closed
+guarantee.
 
 <Note>
 `--secret-material-key` takes the name of a `--material` key, not the secret value. For example, use `--material client_secret="$MS_CLIENT_SECRET"` with `--secret-material-key client_secret`. Prefer `--secret-material-env` so the value does not appear in shell history. The gateway combines caller markings with authoritative profile metadata and strategy-defined secret fields, then stores those values through the active credential driver. Only the `--credential-key` value, such as `MS_GRAPH_ACCESS_TOKEN`, becomes injectable. If an OAuth response rotates a refresh token, OpenShell stores the replacement through the credential driver automatically.

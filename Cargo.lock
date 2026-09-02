@@ -4134,6 +4134,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "openshell-idira"
+version = "0.0.0"
+dependencies = [
+ "reqwest 0.12.28",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "wiremock",
+]
+
+[[package]]
 name = "openshell-ocsf"
 version = "0.0.0"
 dependencies = [
@@ -4332,6 +4344,7 @@ dependencies = [
  "openshell-driver-vault",
  "openshell-extension-core",
  "openshell-gateway-interceptors",
+ "openshell-idira",
  "openshell-ocsf",
  "openshell-otel",
  "openshell-policy",

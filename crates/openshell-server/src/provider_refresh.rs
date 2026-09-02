@@ -11,7 +11,7 @@ use openshell_core::ObjectWorkspace;
 use openshell_core::proto::{
     CredentialHandle, Provider, ProviderCredentialRefreshRecoveryAction,
     ProviderCredentialRefreshStatus, ProviderCredentialRefreshStrategy,
-    StoredProviderCredentialRefreshState, StoredRefreshMaterialDeletion,
+    StoredProviderCredentialRefreshState, StoredRefreshMaterialDeletion, Workspace,
 };
 use openshell_core::{ObjectId, ObjectName, SetResourceVersion};
 use prost::Message;
@@ -27,6 +27,87 @@ const REFRESH_ERROR_RETRY_SECONDS: i64 = 60;
 const REFRESH_CONFIGURATION_RETRY_SECONDS: i64 = 60 * 60;
 const REFRESH_WORKER_PAGE_SIZE: u32 = 1000;
 const MAX_OAUTH_ERROR_RESPONSE_BYTES: usize = 8 * 1024;
+const IDIRA_BACKEND: &str = "idira";
+const IDIRA_DEFAULT_REFRESH_INTERVAL_SECONDS: i64 = 300;
+const IDIRA_MIN_REFRESH_INTERVAL_SECONDS: i64 = 60;
+const IDIRA_MAX_REFRESH_INTERVAL_SECONDS: i64 = 86_400;
+const IDIRA_WORKSPACE_ID_MATERIAL_KEY: &str = "_openshell_workspace_id";
+
+/// Server-owned IDIRA adapter that confines each `OpenShell` workspace to an
+/// operator-selected child path. The transport client itself remains unaware
+/// of `OpenShell` tenancy.
+#[derive(Clone, Debug)]
+pub struct IdiraRefreshClient {
+    client: openshell_idira::IdiraClient,
+    reference_prefix: String,
+}
+
+impl IdiraRefreshClient {
+    pub fn new(
+        client: openshell_idira::IdiraClient,
+        reference_prefix: &str,
+    ) -> Result<Self, openshell_idira::IdiraError> {
+        let reference_prefix = validate_idira_reference_path("reference_prefix", reference_prefix)?;
+        Ok(Self {
+            client,
+            reference_prefix,
+        })
+    }
+
+    /// Return the full backend identifier for a workspace-relative reference.
+    /// The immutable workspace ID prevents a newly created workspace that
+    /// reuses a deleted name from inheriting the old workspace's variables.
+    pub fn scoped_reference(
+        &self,
+        workspace_id: &str,
+        reference: &str,
+    ) -> Result<String, openshell_idira::IdiraError> {
+        validate_idira_workspace_id(workspace_id)?;
+        let reference = validate_idira_reference_path("secret reference", reference)?;
+        Ok(format!(
+            "{}/{workspace_id}/{reference}",
+            self.reference_prefix
+        ))
+    }
+
+    async fn fetch_secret(
+        &self,
+        workspace_id: &str,
+        reference: &str,
+    ) -> Result<String, openshell_idira::IdiraError> {
+        let reference = self.scoped_reference(workspace_id, reference)?;
+        self.client.fetch_secret(&reference).await
+    }
+}
+
+fn validate_idira_workspace_id(workspace_id: &str) -> Result<(), openshell_idira::IdiraError> {
+    uuid::Uuid::parse_str(workspace_id).map_err(|_| {
+        openshell_idira::IdiraError::InvalidConfig(
+            "workspace identity must be a valid UUID".to_string(),
+        )
+    })?;
+    Ok(())
+}
+
+fn validate_idira_reference_path(
+    name: &str,
+    value: &str,
+) -> Result<String, openshell_idira::IdiraError> {
+    if value.is_empty() || value.starts_with('/') || value.ends_with('/') {
+        return Err(openshell_idira::IdiraError::InvalidConfig(format!(
+            "{name} must be a non-empty relative path without leading or trailing slashes"
+        )));
+    }
+    if value
+        .split('/')
+        .any(|component| component.is_empty() || matches!(component, "." | ".."))
+    {
+        return Err(openshell_idira::IdiraError::InvalidConfig(format!(
+            "{name} must not contain empty or traversing path components"
+        )));
+    }
+    Ok(value.to_string())
+}
 
 pub fn refresh_material_scope(
     state: &StoredProviderCredentialRefreshState,
@@ -356,12 +437,24 @@ pub fn new_refresh_state(
     let provider_id = provider.object_id().to_string();
     let provider_name = provider.object_name().to_string();
     let now_ms = current_time_ms();
-    let next_refresh_at_ms = next_refresh_at_ms(
-        config.expires_at_ms,
-        config.refresh_before_seconds,
-        config.max_lifetime_seconds,
-        now_ms,
-    );
+    let is_idira = is_idira_external_material(config.strategy, &config.material);
+    if is_idira {
+        validate_persisted_idira_external_material(config.strategy, &config.material)?;
+    }
+    // External IDIRA variables do not carry expiry and must be fetched as soon
+    // as the refresh is configured. A caller-provided expiry must never defer
+    // the first broker read.
+    let expires_at_ms = if is_idira { 0 } else { config.expires_at_ms };
+    let next_refresh_at_ms = if is_idira {
+        now_ms
+    } else {
+        next_refresh_at_ms(
+            expires_at_ms,
+            config.refresh_before_seconds,
+            config.max_lifetime_seconds,
+            now_ms,
+        )
+    };
     Ok(StoredProviderCredentialRefreshState {
         metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
             id: uuid::Uuid::new_v4().to_string(),
@@ -379,7 +472,7 @@ pub fn new_refresh_state(
         strategy: config.strategy as i32,
         material: config.material,
         secret_material_keys: config.secret_material_keys,
-        expires_at_ms: config.expires_at_ms,
+        expires_at_ms,
         next_refresh_at_ms,
         last_refresh_at_ms: 0,
         status: "configured".to_string(),
@@ -589,6 +682,172 @@ pub fn refresh_strategy_name(strategy: i32) -> &'static str {
 
 pub use openshell_providers::is_gateway_mintable_strategy;
 
+/// Whether one stored refresh is owned by the gateway. `External` remains a
+/// generic non-gateway strategy except for the private IDIRA `PoC` shape.
+#[must_use]
+pub fn is_gateway_managed_refresh_state(state: &StoredProviderCredentialRefreshState) -> bool {
+    let strategy = ProviderCredentialRefreshStrategy::try_from(state.strategy)
+        .unwrap_or(ProviderCredentialRefreshStrategy::Unspecified);
+    is_gateway_mintable_strategy(strategy) || is_idira_external_material(strategy, &state.material)
+}
+
+/// Recognize the deliberately narrow external refresh contract supported by
+/// this `PoC`. Other external backends remain unsupported.
+#[must_use]
+pub fn is_idira_external_material(
+    strategy: ProviderCredentialRefreshStrategy,
+    material: &HashMap<String, String>,
+) -> bool {
+    strategy == ProviderCredentialRefreshStrategy::External
+        && material
+            .get("backend")
+            .is_some_and(|backend| backend.trim().eq_ignore_ascii_case(IDIRA_BACKEND))
+        && material
+            .get("reference")
+            .is_some_and(|reference| !reference.trim().is_empty())
+}
+
+pub fn validate_idira_external_material(
+    strategy: ProviderCredentialRefreshStrategy,
+    material: &HashMap<String, String>,
+) -> Result<(), Status> {
+    validate_idira_external_material_shape(strategy, material, false)
+}
+
+fn validate_persisted_idira_external_material(
+    strategy: ProviderCredentialRefreshStrategy,
+    material: &HashMap<String, String>,
+) -> Result<(), Status> {
+    validate_idira_external_material_shape(strategy, material, true)
+}
+
+fn validate_idira_external_material_shape(
+    strategy: ProviderCredentialRefreshStrategy,
+    material: &HashMap<String, String>,
+    require_workspace_id: bool,
+) -> Result<(), Status> {
+    if strategy != ProviderCredentialRefreshStrategy::External {
+        return Ok(());
+    }
+    if material
+        .get("backend")
+        .is_none_or(|backend| !backend.trim().eq_ignore_ascii_case(IDIRA_BACKEND))
+    {
+        return Err(Status::invalid_argument(
+            "external refresh requires material backend=idira",
+        ));
+    }
+    if material
+        .get("reference")
+        .is_none_or(|reference| reference.trim().is_empty())
+    {
+        return Err(Status::invalid_argument(
+            "external IDIRA refresh requires non-empty reference material",
+        ));
+    }
+    let mut unsupported: Vec<_> = material
+        .keys()
+        .filter(|key| {
+            !(matches!(
+                key.as_str(),
+                "backend" | "reference" | "refresh_interval_seconds"
+            ) || require_workspace_id && key.as_str() == IDIRA_WORKSPACE_ID_MATERIAL_KEY)
+        })
+        .cloned()
+        .collect();
+    if !unsupported.is_empty() {
+        unsupported.sort();
+        return Err(Status::invalid_argument(format!(
+            "external IDIRA refresh has unsupported material keys: {}",
+            unsupported.join(", ")
+        )));
+    }
+    if require_workspace_id {
+        let workspace_id = material
+            .get(IDIRA_WORKSPACE_ID_MATERIAL_KEY)
+            .ok_or_else(|| {
+                Status::failed_precondition(
+                    "stored external IDIRA refresh is missing its workspace identity binding",
+                )
+            })?;
+        validate_idira_workspace_id(workspace_id).map_err(|_| {
+            Status::failed_precondition(
+                "stored external IDIRA refresh has an invalid workspace identity binding",
+            )
+        })?;
+    }
+    idira_refresh_interval_seconds(material)?;
+    Ok(())
+}
+
+/// Add the server-owned, immutable workspace identity to validated IDIRA
+/// material before it is persisted. API callers cannot supply this field.
+pub fn pin_idira_workspace_id(
+    strategy: ProviderCredentialRefreshStrategy,
+    material: &mut HashMap<String, String>,
+    workspace_id: &str,
+) -> Result<(), Status> {
+    if strategy != ProviderCredentialRefreshStrategy::External {
+        return Ok(());
+    }
+    validate_idira_workspace_id(workspace_id)
+        .map_err(|_| Status::failed_precondition("workspace has an invalid immutable identity"))?;
+    if material.contains_key(IDIRA_WORKSPACE_ID_MATERIAL_KEY) {
+        return Err(Status::invalid_argument(
+            "external IDIRA workspace identity is server-managed",
+        ));
+    }
+    material.insert(
+        IDIRA_WORKSPACE_ID_MATERIAL_KEY.to_string(),
+        workspace_id.to_string(),
+    );
+    Ok(())
+}
+
+async fn validate_idira_workspace_binding(
+    store: &Store,
+    state: &StoredProviderCredentialRefreshState,
+) -> Result<String, Status> {
+    let expected_workspace_id = state
+        .material
+        .get(IDIRA_WORKSPACE_ID_MATERIAL_KEY)
+        .map(String::as_str)
+        .ok_or_else(|| {
+            Status::failed_precondition(
+                "stored external IDIRA refresh is missing its workspace identity binding",
+            )
+        })?;
+    validate_idira_workspace_id(expected_workspace_id).map_err(|_| {
+        Status::failed_precondition(
+            "stored external IDIRA refresh has an invalid workspace identity binding",
+        )
+    })?;
+    let workspace = store
+        .get_message_by_name::<Workspace>("", state.object_workspace())
+        .await
+        .map_err(|error| Status::internal(format!("workspace lookup failed: {error}")))?
+        .ok_or_else(|| Status::failed_precondition("refresh workspace no longer exists"))?;
+    if workspace.object_id() != expected_workspace_id {
+        return Err(Status::permission_denied(
+            "stored external IDIRA refresh does not belong to the current workspace identity",
+        ));
+    }
+    Ok(expected_workspace_id.to_string())
+}
+
+fn idira_refresh_interval_seconds(material: &HashMap<String, String>) -> Result<i64, Status> {
+    let interval = parse_material_i64(material, "refresh_interval_seconds")?
+        .unwrap_or(IDIRA_DEFAULT_REFRESH_INTERVAL_SECONDS);
+    if !(IDIRA_MIN_REFRESH_INTERVAL_SECONDS..=IDIRA_MAX_REFRESH_INTERVAL_SECONDS)
+        .contains(&interval)
+    {
+        return Err(Status::invalid_argument(format!(
+            "refresh_interval_seconds must be between {IDIRA_MIN_REFRESH_INTERVAL_SECONDS} and {IDIRA_MAX_REFRESH_INTERVAL_SECONDS}"
+        )));
+    }
+    Ok(interval)
+}
+
 /// Secret source-material fields that are security-sensitive by strategy even
 /// when a direct API caller omits `secret_material_keys`.
 pub fn strategy_secret_material_keys(
@@ -769,11 +1028,33 @@ fn validate_secret_material_references(
     )))
 }
 
+#[cfg(test)]
 pub async fn refresh_provider_credential(
     store: &Store,
     workspace: &str,
     credentials: &crate::credentials::CredentialRuntime,
     compute: Option<&crate::compute::ComputeRuntime>,
+    provider_name: &str,
+    credential_key: &str,
+) -> Result<StoredProviderCredentialRefreshState, Status> {
+    refresh_provider_credential_with_idira(
+        store,
+        workspace,
+        credentials,
+        compute,
+        None,
+        provider_name,
+        credential_key,
+    )
+    .await
+}
+
+pub async fn refresh_provider_credential_with_idira(
+    store: &Store,
+    workspace: &str,
+    credentials: &crate::credentials::CredentialRuntime,
+    compute: Option<&crate::compute::ComputeRuntime>,
+    idira: Option<&IdiraRefreshClient>,
     provider_name: &str,
     credential_key: &str,
 ) -> Result<StoredProviderCredentialRefreshState, Status> {
@@ -853,7 +1134,7 @@ pub async fn refresh_provider_credential(
     }
 
     let mint_result = match resolve_refresh_material(Some(credentials), &state).await {
-        Ok(transient_state) => mint_credential(&transient_state).await,
+        Ok(transient_state) => mint_credential(store, &transient_state, idira).await,
         Err(err) => Err(err.into()),
     };
     match mint_result {
@@ -932,12 +1213,34 @@ pub async fn refresh_provider_credential(
                 state.material.remove("refresh_token");
             }
             state.expires_at_ms = minted.expires_at_ms;
-            state.next_refresh_at_ms = next_refresh_at_ms(
-                minted.expires_at_ms,
-                state.refresh_before_seconds,
-                state.max_lifetime_seconds,
-                now_ms,
-            );
+            state.next_refresh_at_ms = if is_idira_external_material(
+                ProviderCredentialRefreshStrategy::try_from(state.strategy)
+                    .unwrap_or(ProviderCredentialRefreshStrategy::Unspecified),
+                &state.material,
+            ) {
+                let interval = match idira_refresh_interval_seconds(&state.material) {
+                    Ok(interval) => interval,
+                    Err(error) => {
+                        let failure = RefreshFailure::from_status(&error);
+                        persist_refresh_failure_state(
+                            store,
+                            &mut state,
+                            expected_version,
+                            &failure,
+                        )
+                        .await?;
+                        return Err(error);
+                    }
+                };
+                now_ms.saturating_add(interval.saturating_mul(1000))
+            } else {
+                next_refresh_at_ms(
+                    minted.expires_at_ms,
+                    state.refresh_before_seconds,
+                    state.max_lifetime_seconds,
+                    now_ms,
+                )
+            };
             state.last_refresh_at_ms = now_ms;
             state.status = "refreshed".to_string();
             state.last_error.clear();
@@ -1302,7 +1605,9 @@ async fn ensure_refresh_providers_v2_gate(
 }
 
 async fn mint_credential(
+    store: &Store,
     state: &StoredProviderCredentialRefreshState,
+    idira: Option<&IdiraRefreshClient>,
 ) -> Result<MintedCredential, RefreshFailure> {
     let strategy = ProviderCredentialRefreshStrategy::try_from(state.strategy)
         .unwrap_or(ProviderCredentialRefreshStrategy::Unspecified);
@@ -1320,11 +1625,95 @@ async fn mint_credential(
             mint_aws_sts_assume_role(state).await
         }
         ProviderCredentialRefreshStrategy::External
+            if is_idira_external_material(strategy, &state.material) =>
+        {
+            mint_idira_external(store, state, idira).await
+        }
+        ProviderCredentialRefreshStrategy::External
         | ProviderCredentialRefreshStrategy::Static
         | ProviderCredentialRefreshStrategy::Unspecified => Err(Status::failed_precondition(
             format!("refresh strategy '{strategy:?}' cannot be minted by the gateway"),
         )
         .into()),
+    }
+}
+
+async fn mint_idira_external(
+    store: &Store,
+    state: &StoredProviderCredentialRefreshState,
+    idira: Option<&IdiraRefreshClient>,
+) -> Result<MintedCredential, RefreshFailure> {
+    validate_persisted_idira_external_material(
+        ProviderCredentialRefreshStrategy::External,
+        &state.material,
+    )
+    .map_err(RefreshFailure::from)?;
+    let client = idira.ok_or_else(|| {
+        RefreshFailure::fix_configuration(
+            Status::failed_precondition(
+                "external IDIRA refresh requires [openshell.gateway.idira] configuration",
+            ),
+            "idira_not_configured",
+        )
+    })?;
+    let reference = state
+        .material
+        .get("reference")
+        .expect("validated IDIRA material contains reference")
+        .trim();
+    let workspace_id = validate_idira_workspace_binding(store, state)
+        .await
+        .map_err(|status| {
+            RefreshFailure::fix_configuration(status, "idira_workspace_binding_invalid")
+        })?;
+    let value = client
+        .fetch_secret(&workspace_id, reference)
+        .await
+        .map_err(idira_refresh_failure)?;
+    if value.is_empty() {
+        return Err(RefreshFailure::investigate(
+            Status::failed_precondition("IDIRA returned an empty secret value"),
+            "idira_empty_secret",
+        ));
+    }
+    Ok(MintedCredential {
+        access_token: value,
+        // IDIRA variables do not carry an expiry. The refresh worker schedules
+        // the next fetch separately from provider credential expiry.
+        expires_at_ms: 0,
+        refresh_token: None,
+        additional_credentials: HashMap::new(),
+    })
+}
+
+fn idira_refresh_failure(error: openshell_idira::IdiraError) -> RefreshFailure {
+    use openshell_idira::IdiraError;
+
+    match error {
+        IdiraError::InvalidConfig(_) | IdiraError::Io(_) => RefreshFailure::fix_configuration(
+            Status::failed_precondition("IDIRA client configuration is invalid"),
+            "idira_configuration_invalid",
+        ),
+        IdiraError::AuthenticationRejected => RefreshFailure::fix_configuration(
+            Status::unauthenticated("IDIRA rejected the gateway credential"),
+            "idira_authentication_rejected",
+        ),
+        IdiraError::Forbidden => RefreshFailure::fix_configuration(
+            Status::permission_denied("IDIRA denied access to the secret reference"),
+            "idira_secret_forbidden",
+        ),
+        IdiraError::NotFound => RefreshFailure::fix_configuration(
+            Status::not_found("IDIRA secret reference was not found"),
+            "idira_secret_not_found",
+        ),
+        IdiraError::Unavailable => RefreshFailure::retryable(
+            Status::unavailable("IDIRA is temporarily unavailable"),
+            "idira_unavailable",
+        ),
+        IdiraError::InvalidResponse(_) => RefreshFailure::investigate(
+            Status::failed_precondition("IDIRA returned an invalid response"),
+            "idira_invalid_response",
+        ),
     }
 }
 
@@ -1880,10 +2269,11 @@ pub fn spawn_refresh_worker(state: std::sync::Arc<crate::ServerState>, interval:
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             ticker.tick().await;
-            if let Err(err) = run_refresh_worker_tick(
+            if let Err(err) = run_refresh_worker_tick_with_idira(
                 state.store.as_ref(),
                 Some(&state.credentials),
                 Some(&state.compute),
+                state.idira.as_ref(),
             )
             .await
             {
@@ -1902,10 +2292,11 @@ pub fn spawn_refresh_worker(state: std::sync::Arc<crate::ServerState>, interval:
         due_count = tracing::field::Empty,
     )
 )]
-async fn run_refresh_worker_tick(
+async fn run_refresh_worker_tick_with_idira(
     store: &Store,
     credentials: Option<&crate::credentials::CredentialRuntime>,
     compute: Option<&crate::compute::ComputeRuntime>,
+    idira: Option<&IdiraRefreshClient>,
 ) -> Result<(), Status> {
     let now_ms = current_time_ms();
     let states = list_all_refresh_states(store).await.inspect_err(|_| {
@@ -1974,9 +2365,7 @@ async fn run_refresh_worker_tick(
                 "provider refresh material cleanup failed; continuing with live refresh"
             );
         }
-        let strategy = ProviderCredentialRefreshStrategy::try_from(state.strategy)
-            .unwrap_or(ProviderCredentialRefreshStrategy::Unspecified);
-        if !is_gateway_mintable_strategy(strategy) {
+        if !is_gateway_managed_refresh_state(&state) {
             warn!(
                 provider = %state.provider_name,
                 credential_key = %state.credential_key,
@@ -2020,11 +2409,12 @@ async fn run_refresh_worker_tick(
             status = %state.status,
             "refreshing provider credential"
         );
-        if let Err(err) = refresh_provider_credential(
+        if let Err(err) = refresh_provider_credential_with_idira(
             store,
             state.object_workspace(),
             credentials,
             compute,
+            idira,
             &state.provider_name,
             &state.credential_key,
         )
@@ -2045,16 +2435,26 @@ async fn run_refresh_worker_tick(
 }
 
 #[cfg(test)]
+async fn run_refresh_worker_tick(
+    store: &Store,
+    credentials: Option<&crate::credentials::CredentialRuntime>,
+    compute: Option<&crate::compute::ComputeRuntime>,
+) -> Result<(), Status> {
+    run_refresh_worker_tick_with_idira(store, credentials, compute, None).await
+}
+
+#[cfg(test)]
 mod tests {
     use super::{
-        MAX_OAUTH_ERROR_RESPONSE_BYTES, NewRefreshStateConfig, OAuthGrantKind, RefreshFailure,
-        RefreshRetrySchedule, Status, classify_oauth_token_error,
+        IdiraRefreshClient, MAX_OAUTH_ERROR_RESPONSE_BYTES, NewRefreshStateConfig, OAuthGrantKind,
+        RefreshFailure, RefreshRetrySchedule, Status, classify_oauth_token_error,
         delete_refresh_state_with_credentials, effective_authorization_epoch,
-        enqueue_pending_secret_deletion, get_refresh_state, list_all_refresh_states,
-        list_refresh_states_for_provider, new_refresh_state, put_refresh_state,
-        read_bounded_oauth_error_body, refresh_material_scope, refresh_provider_credential,
-        refresh_state_name, refresh_strategy_name, run_refresh_worker_tick, seconds_until_ms,
-        validate_secret_material_references,
+        enqueue_pending_secret_deletion, get_refresh_state, is_gateway_managed_refresh_state,
+        list_all_refresh_states, list_refresh_states_for_provider, new_refresh_state,
+        pin_idira_workspace_id, put_refresh_state, read_bounded_oauth_error_body,
+        refresh_material_scope, refresh_provider_credential,
+        refresh_provider_credential_with_idira, refresh_state_name, refresh_strategy_name,
+        run_refresh_worker_tick, seconds_until_ms, validate_secret_material_references,
     };
     use crate::credentials::CredentialRuntime;
     use crate::persistence::{current_time_ms, test_store};
@@ -2063,16 +2463,65 @@ mod tests {
     use openshell_core::proto::{
         CredentialHandle, Provider, ProviderCredentialRefreshRecoveryAction,
         ProviderCredentialRefreshStrategy, Sandbox, SandboxSpec,
-        StoredProviderCredentialRefreshState,
+        StoredProviderCredentialRefreshState, Workspace,
     };
     use openshell_core::{ObjectId, ObjectName, ObjectWorkspace};
     use std::collections::HashMap;
-    use wiremock::matchers::{body_string_contains, method, path};
+    use tempfile::NamedTempFile;
+    use wiremock::matchers::{body_string, body_string_contains, header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn test_credentials() -> CredentialRuntime {
         CredentialRuntime::from_config(&Config::new(None).with_credential_drivers(["test-static"]))
             .expect("test credential runtime")
+    }
+
+    fn idira_client(server: &MockServer) -> (IdiraRefreshClient, NamedTempFile) {
+        let api_key = NamedTempFile::new().expect("create IDIRA API key file");
+        std::fs::write(api_key.path(), "gateway-api-key\n").expect("write IDIRA API key");
+        let transport = openshell_idira::IdiraClient::new(openshell_idira::IdiraClientConfig {
+            base_url: server.uri(),
+            account: "poc-account".to_string(),
+            login: "host/openshell-gateway".to_string(),
+            api_key_path: api_key.path().to_path_buf(),
+            ca_cert_path: None,
+            timeout: std::time::Duration::from_secs(5),
+            auth_token_ttl: std::time::Duration::from_secs(300),
+        })
+        .expect("IDIRA client");
+        let client = IdiraRefreshClient::new(transport, "openshell").expect("IDIRA scope");
+        (client, api_key)
+    }
+
+    #[tokio::test]
+    async fn idira_references_are_confined_to_the_refresh_workspace() {
+        let server = MockServer::start().await;
+        let (client, _api_key) = idira_client(&server);
+        let workspace_a = "11111111-1111-4111-8111-111111111111";
+        let workspace_b = "22222222-2222-4222-8222-222222222222";
+
+        assert_eq!(
+            client
+                .scoped_reference(workspace_a, "providers/github/api-key")
+                .expect("scoped reference"),
+            "openshell/11111111-1111-4111-8111-111111111111/providers/github/api-key"
+        );
+        assert_eq!(
+            client
+                .scoped_reference(workspace_b, "providers/github/api-key")
+                .expect("scoped reference"),
+            "openshell/22222222-2222-4222-8222-222222222222/providers/github/api-key"
+        );
+        for invalid in ["../team-b/secret", "/team-b/secret", "team-b//secret"] {
+            assert!(matches!(
+                client.scoped_reference(workspace_a, invalid),
+                Err(openshell_idira::IdiraError::InvalidConfig(_))
+            ));
+        }
+        assert!(matches!(
+            client.scoped_reference("not-a-workspace-uuid", "secret"),
+            Err(openshell_idira::IdiraError::InvalidConfig(_))
+        ));
     }
 
     #[test]
@@ -3349,6 +3798,167 @@ mod tests {
             resolved.values.get("GOOGLE_DRIVE_ACCESS_TOKEN"),
             Some(&"minted-drive-token".to_string())
         );
+    }
+
+    #[tokio::test]
+    async fn idira_external_refresh_fetches_into_credential_storage() {
+        let mock_server = MockServer::start().await;
+        let store = test_store().await;
+        crate::ensure_default_workspace(&store).await.unwrap();
+        let workspace = store
+            .get_message_by_name::<Workspace>("", "default")
+            .await
+            .unwrap()
+            .expect("default workspace");
+        let workspace_id = workspace.object_id().to_string();
+        Mock::given(method("POST"))
+            .and(path(
+                "/authn/poc-account/host%2Fopenshell-gateway/authenticate",
+            ))
+            .and(body_string("gateway-api-key"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("IDIRA-TOKEN"))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!(
+                "/secrets/poc-account/variable/openshell%2F{workspace_id}%2Fproviders%2Fgithub%2Fapi-key"
+            )))
+            .and(header("authorization", "Token token=\"IDIRA-TOKEN\""))
+            .respond_with(ResponseTemplate::new(200).set_body_string("resolved-api-key"))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let provider = provider("github-idira", "github");
+        store.put_message(&provider).await.unwrap();
+        let mut material = HashMap::from([
+            ("backend".to_string(), "idira".to_string()),
+            (
+                "reference".to_string(),
+                "providers/github/api-key".to_string(),
+            ),
+            ("refresh_interval_seconds".to_string(), "120".to_string()),
+        ]);
+        pin_idira_workspace_id(
+            ProviderCredentialRefreshStrategy::External,
+            &mut material,
+            &workspace_id,
+        )
+        .unwrap();
+        let state = new_refresh_state(
+            &provider,
+            "default",
+            "GITHUB_TOKEN",
+            NewRefreshStateConfig {
+                additional_output_keys: HashMap::new(),
+                strategy: ProviderCredentialRefreshStrategy::External,
+                material,
+                secret_material_keys: Vec::new(),
+                expires_at_ms: 0,
+                token_url: String::new(),
+                scopes: Vec::new(),
+                refresh_before_seconds: 0,
+                max_lifetime_seconds: 0,
+            },
+        )
+        .unwrap();
+        assert!(is_gateway_managed_refresh_state(&state));
+        assert_eq!(
+            state.next_refresh_at_ms,
+            state.metadata.as_ref().unwrap().created_at_ms
+        );
+        put_refresh_state(&store, &state).await.unwrap();
+        let credentials = test_credentials();
+        let (idira, _api_key) = idira_client(&mock_server);
+        let before = current_time_ms();
+
+        let refreshed = refresh_provider_credential_with_idira(
+            &store,
+            "default",
+            &credentials,
+            None,
+            Some(&idira),
+            "github-idira",
+            "GITHUB_TOKEN",
+        )
+        .await
+        .unwrap();
+        assert_eq!(refreshed.status, "refreshed");
+        assert_eq!(refreshed.expires_at_ms, 0);
+        assert!(refreshed.next_refresh_at_ms >= before + 120_000);
+
+        let stored = store
+            .get_message_by_name::<Provider>("default", "github-idira")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(stored.credentials.is_empty());
+        assert!(stored.credential_handles.contains_key("GITHUB_TOKEN"));
+        let resolved = credentials
+            .resolve_provider_handles(&stored, current_time_ms())
+            .await
+            .unwrap();
+        assert_eq!(
+            resolved.values.get("GITHUB_TOKEN"),
+            Some(&"resolved-api-key".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn idira_external_refresh_rejects_a_different_workspace_identity() {
+        let mock_server = MockServer::start().await;
+        let store = test_store().await;
+        crate::ensure_default_workspace(&store).await.unwrap();
+        let provider = provider("github-idira-mismatch", "github");
+        store.put_message(&provider).await.unwrap();
+        let mut material = HashMap::from([
+            ("backend".to_string(), "idira".to_string()),
+            (
+                "reference".to_string(),
+                "providers/github/api-key".to_string(),
+            ),
+        ]);
+        pin_idira_workspace_id(
+            ProviderCredentialRefreshStrategy::External,
+            &mut material,
+            "33333333-3333-4333-8333-333333333333",
+        )
+        .unwrap();
+        let state = new_refresh_state(
+            &provider,
+            "default",
+            "GITHUB_TOKEN",
+            NewRefreshStateConfig {
+                strategy: ProviderCredentialRefreshStrategy::External,
+                material,
+                secret_material_keys: Vec::new(),
+                expires_at_ms: 0,
+                token_url: String::new(),
+                scopes: Vec::new(),
+                refresh_before_seconds: 0,
+                max_lifetime_seconds: 0,
+                additional_output_keys: HashMap::new(),
+            },
+        )
+        .unwrap();
+        put_refresh_state(&store, &state).await.unwrap();
+        let credentials = test_credentials();
+        let (idira, _api_key) = idira_client(&mock_server);
+
+        let error = refresh_provider_credential_with_idira(
+            &store,
+            "default",
+            &credentials,
+            None,
+            Some(&idira),
+            "github-idira-mismatch",
+            "GITHUB_TOKEN",
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::PermissionDenied);
+        assert!(error.message().contains("current workspace identity"));
     }
 
     #[tokio::test]
