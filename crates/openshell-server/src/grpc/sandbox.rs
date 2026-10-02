@@ -782,28 +782,41 @@ fn validate_create_sandbox_request_pre_io(
     Ok(())
 }
 
-/// Set `OTEL_EXPORTER_OTLP_ENDPOINT` and `OTEL_EXPORTER_OTLP_PROTOCOL` to the
-/// supervisor relay when `otel_relay_enabled`, unless the caller already chose
-/// an endpoint. A caller-supplied endpoint is left untouched together with its
-/// protocol, since both describe their collector rather than ours. Returns
-/// whether anything was injected.
+/// Set the traces-specific OTLP endpoint and protocol to the supervisor relay
+/// when `otel_relay_enabled`, unless the caller already chose an endpoint or
+/// an incompatible traces-specific protocol.
+///
+/// A traces-specific endpoint takes precedence over the generic endpoint under
+/// the OpenTelemetry environment contract. Either caller-supplied endpoint, or
+/// an incompatible caller-supplied traces protocol, leaves the environment
+/// untouched. A preselected `http/protobuf` traces protocol is compatible.
+/// Returns whether anything was injected.
 fn inject_otel_relay_environment(
     environment: &mut HashMap<String, String>,
     otel_relay_enabled: bool,
 ) -> bool {
     use openshell_core::sandbox_env::{
-        OTEL_EXPORTER_OTLP_ENDPOINT, OTEL_EXPORTER_OTLP_PROTOCOL, OTLP_RELAY_ENDPOINT,
+        OTEL_EXPORTER_OTLP_ENDPOINT, OTEL_EXPORTER_OTLP_TRACES_ENDPOINT,
+        OTEL_EXPORTER_OTLP_TRACES_PROTOCOL, OTLP_RELAY_TRACES_ENDPOINT,
     };
-    if !otel_relay_enabled || environment.contains_key(OTEL_EXPORTER_OTLP_ENDPOINT) {
+    let traces_protocol_is_incompatible = environment
+        .get(OTEL_EXPORTER_OTLP_TRACES_PROTOCOL)
+        .is_some_and(|protocol| !protocol.trim().eq_ignore_ascii_case("http/protobuf"));
+    if !otel_relay_enabled
+        || environment.contains_key(OTEL_EXPORTER_OTLP_TRACES_ENDPOINT)
+        || environment.contains_key(OTEL_EXPORTER_OTLP_ENDPOINT)
+        || traces_protocol_is_incompatible
+    {
         return false;
     }
     environment.insert(
-        OTEL_EXPORTER_OTLP_ENDPOINT.to_string(),
-        OTLP_RELAY_ENDPOINT.to_string(),
+        OTEL_EXPORTER_OTLP_TRACES_ENDPOINT.to_string(),
+        OTLP_RELAY_TRACES_ENDPOINT.to_string(),
     );
-    environment
-        .entry(OTEL_EXPORTER_OTLP_PROTOCOL.to_string())
-        .or_insert_with(|| "http/protobuf".to_string());
+    environment.insert(
+        OTEL_EXPORTER_OTLP_TRACES_PROTOCOL.to_string(),
+        "http/protobuf".to_string(),
+    );
     true
 }
 
@@ -3966,6 +3979,11 @@ mod tests {
     use openshell_core::proto::{
         GpuResourceRequirements, SandboxServiceExposure, ServiceAuthorizationMode, ServiceEndpoint,
     };
+    use openshell_core::sandbox_env::{
+        OTEL_EXPORTER_OTLP_ENDPOINT, OTEL_EXPORTER_OTLP_PROTOCOL,
+        OTEL_EXPORTER_OTLP_TRACES_ENDPOINT, OTEL_EXPORTER_OTLP_TRACES_PROTOCOL,
+        OTLP_RELAY_TRACES_ENDPOINT,
+    };
 
     // ---- OTLP relay environment ----
 
@@ -4004,13 +4022,17 @@ mod tests {
         let mut env = HashMap::from([("HOME".to_string(), "/home/user".to_string())]);
         assert!(inject_otel_relay_environment(&mut env, true));
         assert_eq!(
-            env.get("OTEL_EXPORTER_OTLP_ENDPOINT").map(String::as_str),
-            Some(openshell_core::sandbox_env::OTLP_RELAY_ENDPOINT)
+            env.get(OTEL_EXPORTER_OTLP_TRACES_ENDPOINT)
+                .map(String::as_str),
+            Some(OTLP_RELAY_TRACES_ENDPOINT)
         );
         assert_eq!(
-            env.get("OTEL_EXPORTER_OTLP_PROTOCOL").map(String::as_str),
+            env.get(OTEL_EXPORTER_OTLP_TRACES_PROTOCOL)
+                .map(String::as_str),
             Some("http/protobuf")
         );
+        assert!(!env.contains_key(OTEL_EXPORTER_OTLP_ENDPOINT));
+        assert!(!env.contains_key(OTEL_EXPORTER_OTLP_PROTOCOL));
         assert_eq!(env.get("HOME").map(String::as_str), Some("/home/user"));
     }
 
@@ -4022,19 +4044,73 @@ mod tests {
     }
 
     #[test]
-    fn inject_otel_relay_environment_keeps_a_caller_supplied_endpoint() {
+    fn inject_otel_relay_environment_keeps_a_caller_supplied_traces_endpoint() {
         let mut env = HashMap::from([(
-            "OTEL_EXPORTER_OTLP_ENDPOINT".to_string(),
-            "https://collector.example:4317".to_string(),
+            OTEL_EXPORTER_OTLP_TRACES_ENDPOINT.to_string(),
+            "https://traces.example/v1/traces".to_string(),
         )]);
+        let original = env.clone();
         assert!(!inject_otel_relay_environment(&mut env, true));
+        assert_eq!(env, original);
+    }
+
+    #[test]
+    fn inject_otel_relay_environment_keeps_a_caller_supplied_generic_endpoint() {
+        let mut env = HashMap::from([
+            (
+                OTEL_EXPORTER_OTLP_ENDPOINT.to_string(),
+                "https://collector.example:4317".to_string(),
+            ),
+            (OTEL_EXPORTER_OTLP_PROTOCOL.to_string(), "grpc".to_string()),
+        ]);
+        let original = env.clone();
+        assert!(!inject_otel_relay_environment(&mut env, true));
+        assert_eq!(env, original);
+    }
+
+    #[test]
+    fn inject_otel_relay_environment_keeps_an_incompatible_traces_protocol() {
+        let mut env = HashMap::from([(
+            OTEL_EXPORTER_OTLP_TRACES_PROTOCOL.to_string(),
+            "grpc".to_string(),
+        )]);
+        let original = env.clone();
+        assert!(!inject_otel_relay_environment(&mut env, true));
+        assert_eq!(env, original);
+    }
+
+    #[test]
+    fn inject_otel_relay_environment_accepts_a_compatible_traces_protocol() {
+        let mut env = HashMap::from([(
+            OTEL_EXPORTER_OTLP_TRACES_PROTOCOL.to_string(),
+            " HTTP/PROTOBUF ".to_string(),
+        )]);
+        assert!(inject_otel_relay_environment(&mut env, true));
         assert_eq!(
-            env.get("OTEL_EXPORTER_OTLP_ENDPOINT").map(String::as_str),
-            Some("https://collector.example:4317")
+            env.get(OTEL_EXPORTER_OTLP_TRACES_ENDPOINT)
+                .map(String::as_str),
+            Some(OTLP_RELAY_TRACES_ENDPOINT)
         );
-        assert!(
-            !env.contains_key("OTEL_EXPORTER_OTLP_PROTOCOL"),
-            "the caller's collector keeps the caller's protocol choice"
+        assert_eq!(
+            env.get(OTEL_EXPORTER_OTLP_TRACES_PROTOCOL)
+                .map(String::as_str),
+            Some("http/protobuf")
+        );
+    }
+
+    #[test]
+    fn inject_otel_relay_environment_preserves_a_generic_protocol_for_other_signals() {
+        let mut env =
+            HashMap::from([(OTEL_EXPORTER_OTLP_PROTOCOL.to_string(), "grpc".to_string())]);
+        assert!(inject_otel_relay_environment(&mut env, true));
+        assert_eq!(
+            env.get(OTEL_EXPORTER_OTLP_PROTOCOL).map(String::as_str),
+            Some("grpc")
+        );
+        assert_eq!(
+            env.get(OTEL_EXPORTER_OTLP_TRACES_PROTOCOL)
+                .map(String::as_str),
+            Some("http/protobuf")
         );
     }
 
@@ -4053,13 +4129,17 @@ mod tests {
 
         let env = created.spec.expect("resolved sandbox spec").environment;
         assert_eq!(
-            env.get("OTEL_EXPORTER_OTLP_ENDPOINT").map(String::as_str),
-            Some(openshell_core::sandbox_env::OTLP_RELAY_ENDPOINT)
+            env.get(OTEL_EXPORTER_OTLP_TRACES_ENDPOINT)
+                .map(String::as_str),
+            Some(OTLP_RELAY_TRACES_ENDPOINT)
         );
         assert_eq!(
-            env.get("OTEL_EXPORTER_OTLP_PROTOCOL").map(String::as_str),
+            env.get(OTEL_EXPORTER_OTLP_TRACES_PROTOCOL)
+                .map(String::as_str),
             Some("http/protobuf")
         );
+        assert!(!env.contains_key(OTEL_EXPORTER_OTLP_ENDPOINT));
+        assert!(!env.contains_key(OTEL_EXPORTER_OTLP_PROTOCOL));
     }
 
     #[tokio::test]
@@ -4080,8 +4160,10 @@ mod tests {
 
         let env = created.spec.expect("resolved sandbox spec").environment;
         assert_eq!(env.get("HOME").map(String::as_str), Some("/home/user"));
-        assert!(!env.contains_key("OTEL_EXPORTER_OTLP_ENDPOINT"));
-        assert!(!env.contains_key("OTEL_EXPORTER_OTLP_PROTOCOL"));
+        assert!(!env.contains_key(OTEL_EXPORTER_OTLP_ENDPOINT));
+        assert!(!env.contains_key(OTEL_EXPORTER_OTLP_PROTOCOL));
+        assert!(!env.contains_key(OTEL_EXPORTER_OTLP_TRACES_ENDPOINT));
+        assert!(!env.contains_key(OTEL_EXPORTER_OTLP_TRACES_PROTOCOL));
     }
 
     // ---- shell_escape ----

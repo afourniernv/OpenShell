@@ -11,10 +11,11 @@ gateway over the session stream, so OTel-instrumented agents reach an
 external collector without any sandbox egress.
 
 The relay is opt-in on the gateway. When `[openshell.gateway.otlp]` is
-configured, `CreateSandbox` sets `OTEL_EXPORTER_OTLP_ENDPOINT` to
-`http://192.0.0.8:4318` and `OTEL_EXPORTER_OTLP_PROTOCOL` to `http/protobuf`
-in the sandbox environment unless the caller already set an endpoint. The
-values persist in the stored spec, so restarts inherit them.
+configured, `CreateSandbox` sets `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` to
+`http://192.0.0.8:4318/v1/traces` and
+`OTEL_EXPORTER_OTLP_TRACES_PROTOCOL` to `http/protobuf` in the sandbox
+environment unless the caller already selected a generic or trace-specific
+endpoint. The values persist in the stored spec, so restarts inherit them.
 
 `192.0.0.8` is the RFC 7600 dummy address and is never routed. A workload
 connect to any non-loopback address is intercepted by the sandbox seccomp
