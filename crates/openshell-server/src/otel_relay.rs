@@ -11,15 +11,23 @@ use std::sync::Arc;
 
 use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
 use prost::Message;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tonic::transport::Channel;
 use tracing::{debug, info};
 
 use opentelemetry_proto::tonic::collector::trace::v1::trace_service_client::TraceServiceClient;
 
+/// Gateway-wide cap on trace batches waiting for an external collector.
+/// Admission happens before spawning so an outage cannot accumulate an
+/// unbounded number of tasks retaining payloads. This is availability
+/// hardening; normal Hermes/Relay delivery does not depend on reaching it.
+pub const MAX_IN_FLIGHT_OTEL_EXPORTS: usize = 32;
+
 /// Exporter that forwards raw protobuf-encoded trace data to an OTLP collector.
 #[derive(Debug, Clone)]
 pub struct OtelRelayExporter {
     client: TraceServiceClient<Channel>,
+    export_permits: Arc<Semaphore>,
 }
 
 impl OtelRelayExporter {
@@ -32,7 +40,13 @@ impl OtelRelayExporter {
             .map_err(ConnectError::Transport)?;
         Ok(Self {
             client: TraceServiceClient::new(channel),
+            export_permits: Arc::new(Semaphore::new(MAX_IN_FLIGHT_OTEL_EXPORTS)),
         })
+    }
+
+    /// Reserve one in-flight export slot without waiting.
+    pub fn try_reserve_export(&self) -> Option<OwnedSemaphorePermit> {
+        Arc::clone(&self.export_permits).try_acquire_owned().ok()
     }
 
     /// An exporter over a lazy channel that performs no I/O until the first
@@ -43,6 +57,7 @@ impl OtelRelayExporter {
             client: TraceServiceClient::new(
                 Channel::from_static("http://127.0.0.1:1").connect_lazy(),
             ),
+            export_permits: Arc::new(Semaphore::new(MAX_IN_FLIGHT_OTEL_EXPORTS)),
         }
     }
 
@@ -151,5 +166,27 @@ mod tests {
             .await
             .expect_err("garbage bytes must not decode as ExportTraceServiceRequest");
         assert!(matches!(err, ExportError::Decode(_)), "{err}");
+    }
+
+    #[tokio::test]
+    async fn risk_control_bounds_export_admission_and_recovers() {
+        let exporter = OtelRelayExporter::lazy_for_test();
+        let mut permits: Vec<_> = (0..MAX_IN_FLIGHT_OTEL_EXPORTS)
+            .map(|index| {
+                exporter
+                    .try_reserve_export()
+                    .unwrap_or_else(|| panic!("missing permit {index}"))
+            })
+            .collect();
+
+        assert!(
+            exporter.try_reserve_export().is_none(),
+            "the exporter must shed work once the in-flight limit is reached"
+        );
+        drop(permits.pop());
+        assert!(
+            exporter.try_reserve_export().is_some(),
+            "releasing an export restores admission"
+        );
     }
 }

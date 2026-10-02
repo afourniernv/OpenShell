@@ -4,7 +4,7 @@
 //! Span enrichment: injects sandbox resource attributes into OTLP trace data.
 
 use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
-use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue};
+use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue, any_value};
 use opentelemetry_proto::tonic::resource::v1::Resource;
 use prost::Message;
 
@@ -33,6 +33,13 @@ pub enum ContentType {
     Json,
 }
 
+// Enrichment clones the trusted attributes once per ResourceSpans entry.
+// Normal SDK batches contain very few entries; cap them to bound that actual
+// amplification without duplicating OTLP's nested schema validation here.
+// This check runs after protobuf/JSON decode, so it does not bound allocations
+// performed by the decoder itself.
+pub const MAX_RESOURCE_SPANS: usize = 64;
+
 /// Enrich spans with sandbox resource attributes. Input can be protobuf or
 /// JSON-encoded `ExportTraceServiceRequest`. Output is always protobuf.
 ///
@@ -51,6 +58,14 @@ pub fn enrich_spans(
         ContentType::Json => serde_json::from_slice::<ExportTraceServiceRequest>(raw)
             .map_err(EnrichmentError::JsonDecode)?,
     };
+
+    if request.resource_spans.len() > MAX_RESOURCE_SPANS {
+        return Err(EnrichmentError::StructuralLimit {
+            structure: "resource spans",
+            limit: MAX_RESOURCE_SPANS,
+            actual: request.resource_spans.len(),
+        });
+    }
 
     let extra_attrs = build_attributes(attrs, enrichment_enabled);
 
@@ -115,11 +130,7 @@ fn kv(key: &str, value: &str) -> KeyValue {
     KeyValue {
         key: key.to_string(),
         value: Some(AnyValue {
-            value: Some(
-                opentelemetry_proto::tonic::common::v1::any_value::Value::StringValue(
-                    value.to_string(),
-                ),
-            ),
+            value: Some(any_value::Value::StringValue(value.to_string())),
         }),
         key_strindex: 0,
     }
@@ -131,6 +142,12 @@ pub enum EnrichmentError {
     ProtobufDecode(prost::DecodeError),
     #[error("JSON decode failed: {0}")]
     JsonDecode(serde_json::Error),
+    #[error("OTLP request has {actual} {structure}; limit is {limit}")]
+    StructuralLimit {
+        structure: &'static str,
+        limit: usize,
+        actual: usize,
+    },
 }
 
 #[cfg(test)]
@@ -434,5 +451,27 @@ mod tests {
             matches!(result, Err(EnrichmentError::ProtobufDecode(_))),
             "should return ProtobufDecode error"
         );
+    }
+
+    #[test]
+    fn enrichment_rejects_excessive_resource_spans() {
+        let request = ExportTraceServiceRequest {
+            resource_spans: vec![ResourceSpans::default(); MAX_RESOURCE_SPANS + 1],
+        };
+
+        let result = enrich_spans(
+            &request.encode_to_vec(),
+            ContentType::Protobuf,
+            &test_metadata(),
+            true,
+        );
+
+        assert!(matches!(
+            result,
+            Err(EnrichmentError::StructuralLimit {
+                structure: "resource spans",
+                ..
+            })
+        ));
     }
 }

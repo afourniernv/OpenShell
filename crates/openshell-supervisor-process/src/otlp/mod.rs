@@ -21,6 +21,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+use prost::Message;
 use tokio::sync::mpsc;
 use tracing::info;
 
@@ -32,6 +33,21 @@ pub use receiver::{ConnectionPermit, OtlpConnectionServer, ReceiverHandle};
 
 /// Bounded time the receiver gets to finish in-flight requests on shutdown.
 pub const RECEIVER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// The gateway's tonic decoder accepts messages up to 1 MiB. Keep 4 KiB free
+/// for future envelope fields and for the sandbox ID used when a buffered
+/// item is wrapped for the session stream.
+const GATEWAY_GRPC_MESSAGE_LIMIT: usize = 1_048_576;
+const SUPERVISOR_MESSAGE_HEADROOM: usize = 4 * 1024;
+pub const MAX_ENCODED_SUPERVISOR_MESSAGE_BYTES: usize =
+    GATEWAY_GRPC_MESSAGE_LIMIT - SUPERVISOR_MESSAGE_HEADROOM;
+
+/// Per-item payload budget before the final session envelope is constructed.
+pub(crate) const MAX_TELEMETRY_ITEM_BYTES: usize =
+    MAX_ENCODED_SUPERVISOR_MESSAGE_BYTES - SUPERVISOR_MESSAGE_HEADROOM;
+
+/// Default aggregate heap budget for queued telemetry payloads.
+pub const DEFAULT_BUFFER_BYTE_CAPACITY: usize = 16 * 1024 * 1024;
 
 /// Rate-limited OCSF relay sink that implements token bucket rate limiting
 /// and sends accepted events through the OTEL buffer as OCSF bytes.
@@ -100,7 +116,7 @@ impl RateLimitedOcsfSink {
 impl openshell_ocsf::OcsfRelaySink for RateLimitedOcsfSink {
     fn send(&self, json_bytes: Vec<u8>) {
         if self.try_acquire() {
-            self.buf_tx.send_ocsf(json_bytes);
+            let _ = self.buf_tx.send_ocsf(json_bytes);
         } else {
             self.drop_count.fetch_add(1, Ordering::Relaxed);
         }
@@ -111,6 +127,7 @@ impl openshell_ocsf::OcsfRelaySink for RateLimitedOcsfSink {
 #[derive(Debug, Clone)]
 pub struct RelayConfig {
     pub buffer_capacity: usize,
+    pub buffer_byte_capacity: usize,
     pub enrichment_enabled: bool,
     pub ocsf_rate_limit: u32,
 }
@@ -119,6 +136,7 @@ impl Default for RelayConfig {
     fn default() -> Self {
         Self {
             buffer_capacity: 4096,
+            buffer_byte_capacity: DEFAULT_BUFFER_BYTE_CAPACITY,
             enrichment_enabled: true,
             ocsf_rate_limit: 100,
         }
@@ -155,6 +173,23 @@ pub fn export_message(sandbox_id: &str, item: TelemetryItem) -> SupervisorMessag
     }
 }
 
+/// Verify the exact encoded session envelope without cloning trace bytes.
+pub(crate) fn admit_trace_message(sandbox_id: &str, trace_data: Vec<u8>) -> Result<Vec<u8>, usize> {
+    let mut message = export_message(sandbox_id, TelemetryItem::Trace(trace_data));
+    let encoded_len = message.encoded_len();
+    if encoded_len > MAX_ENCODED_SUPERVISOR_MESSAGE_BYTES {
+        return Err(encoded_len);
+    }
+
+    let Some(supervisor_message::Payload::OtelExport(mut export)) = message.payload.take() else {
+        unreachable!("export_message always constructs an OTEL export")
+    };
+    let Some(otel_export_data::Signal::TraceData(trace_data)) = export.signal.take() else {
+        unreachable!("trace export always contains trace data")
+    };
+    Ok(trace_data)
+}
+
 /// Start the relay: build the bounded buffer and the connection server.
 ///
 /// Called before networking starts so the server is ready for the first
@@ -164,11 +199,13 @@ pub fn start(
     config: &RelayConfig,
     metadata: SandboxMetadata,
 ) -> (Arc<OtlpConnectionServer>, RelayLifecycle) {
-    let (buf_tx, buffer) = buffer::new_telemetry_buffer(config.buffer_capacity);
+    let (buf_tx, buffer) =
+        buffer::new_telemetry_buffer(config.buffer_capacity, config.buffer_byte_capacity);
     let (server, receiver) = OtlpConnectionServer::new(buf_tx, metadata, config.enrichment_enabled);
     info!(
         relay = openshell_core::sandbox_env::OTLP_RELAY_ADDR,
         buffer_capacity = config.buffer_capacity,
+        buffer_byte_capacity = config.buffer_byte_capacity,
         enrichment = config.enrichment_enabled,
         "OTEL relay started"
     );
@@ -276,7 +313,7 @@ mod tests {
 
     #[test]
     fn rate_limiter_acquires_initial_tokens() {
-        let (buf_tx, _rx) = buffer::new_telemetry_buffer(64);
+        let (buf_tx, _rx) = buffer::new_telemetry_buffer(64, 1024);
         let sink = RateLimitedOcsfSink::new(buf_tx, 10);
 
         for i in 0..10 {
@@ -287,7 +324,7 @@ mod tests {
 
     #[test]
     fn rate_limiter_drops_when_exhausted() {
-        let (buf_tx, mut rx) = buffer::new_telemetry_buffer(64);
+        let (buf_tx, mut rx) = buffer::new_telemetry_buffer(64, 1024);
         let sink = RateLimitedOcsfSink::new(buf_tx, 2);
 
         sink.send(vec![1]);
@@ -301,7 +338,7 @@ mod tests {
 
     #[test]
     fn rate_limiter_refills_after_time() {
-        let (buf_tx, _rx) = buffer::new_telemetry_buffer(64);
+        let (buf_tx, _rx) = buffer::new_telemetry_buffer(64, 1024);
         let sink = RateLimitedOcsfSink::new(buf_tx, 100);
 
         for _ in 0..100 {
@@ -332,6 +369,42 @@ mod tests {
         };
         assert_eq!(export.signal, None);
         assert_eq!(export.ocsf_events, vec![vec![9]]);
+    }
+
+    #[test]
+    fn exact_supervisor_message_budget_accepts_boundary_and_rejects_next_byte() {
+        let sandbox_id = "sb-test";
+        let mut payload_len = MAX_ENCODED_SUPERVISOR_MESSAGE_BYTES;
+        while export_message(sandbox_id, TelemetryItem::Trace(vec![0; payload_len])).encoded_len()
+            > MAX_ENCODED_SUPERVISOR_MESSAGE_BYTES
+        {
+            payload_len -= 1;
+        }
+
+        let accepted = export_message(sandbox_id, TelemetryItem::Trace(vec![0; payload_len]));
+        assert_eq!(accepted.encoded_len(), MAX_ENCODED_SUPERVISOR_MESSAGE_BYTES);
+        assert!(admit_trace_message(sandbox_id, vec![0; payload_len]).is_ok());
+
+        let rejected = export_message(sandbox_id, TelemetryItem::Trace(vec![0; payload_len + 1]));
+        assert_eq!(
+            rejected.encoded_len(),
+            MAX_ENCODED_SUPERVISOR_MESSAGE_BYTES + 1
+        );
+        assert_eq!(
+            admit_trace_message(sandbox_id, vec![0; payload_len + 1]),
+            Err(MAX_ENCODED_SUPERVISOR_MESSAGE_BYTES + 1)
+        );
+    }
+
+    #[test]
+    fn maximum_non_trace_item_stays_within_supervisor_message_budget() {
+        let sandbox_id = "s".repeat(128);
+        let message = export_message(
+            &sandbox_id,
+            TelemetryItem::Ocsf(vec![0; MAX_TELEMETRY_ITEM_BYTES]),
+        );
+
+        assert!(message.encoded_len() <= MAX_ENCODED_SUPERVISOR_MESSAGE_BYTES);
     }
 
     #[tokio::test]

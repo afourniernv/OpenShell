@@ -2469,26 +2469,34 @@ fn handle_otel_export(
     {
         let exporter = relay_exporter.clone();
         let sandbox_id = sandbox_id.to_string();
-        tokio::spawn(async move {
-            match tokio::time::timeout(Duration::from_secs(10), exporter.export_raw(trace_data))
-                .await
-            {
-                Ok(Err(e)) => {
-                    debug!(
-                        sandbox_id = %sandbox_id,
-                        error = %e,
-                        "OTEL relay: failed to export trace data"
-                    );
+        if let Some(export_permit) = exporter.try_reserve_export() {
+            tokio::spawn(async move {
+                let _export_permit = export_permit;
+                match tokio::time::timeout(Duration::from_secs(10), exporter.export_raw(trace_data))
+                    .await
+                {
+                    Ok(Err(e)) => {
+                        debug!(
+                            sandbox_id = %sandbox_id,
+                            error = %e,
+                            "OTEL relay: failed to export trace data"
+                        );
+                    }
+                    Err(_) => {
+                        debug!(
+                            sandbox_id = %sandbox_id,
+                            "OTEL relay: export timed out"
+                        );
+                    }
+                    Ok(Ok(())) => {}
                 }
-                Err(_) => {
-                    debug!(
-                        sandbox_id = %sandbox_id,
-                        "OTEL relay: export timed out"
-                    );
-                }
-                Ok(Ok(())) => {}
-            }
-        });
+            });
+        } else {
+            debug!(
+                sandbox_id = %sandbox_id,
+                "OTEL relay: in-flight export limit reached, dropping trace batch"
+            );
+        }
     }
 
     for ocsf_event in &otel_data.ocsf_events {

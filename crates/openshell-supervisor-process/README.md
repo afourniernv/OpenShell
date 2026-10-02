@@ -33,7 +33,7 @@ completes loopback connects locally without mediation.
 Agent process --> connect(192.0.0.8:4318) --> seccomp broker stages the open
   --> supervisor proxy, reserved destination --> OTLP receiver
   --> enrichment (openshell.sandbox.* resource attributes)
-  --> bounded buffer (4096 items, newest dropped when full)
+  --> bounded buffer (4096 items / 16 MiB, newest rejected when full)
   --> supervisor session (OtelExportData) --> gateway
   --> dedicated OtelRelayExporter --> external OTLP collector
 ```
@@ -45,6 +45,16 @@ per session on that confirmation. Items received before a confirming session,
 or while a session declines, wait in the bounded buffer. The receiver serves
 at most 64 concurrent connections and refuses further opens before the
 sandbox commits the socket, which the agent observes as `EAGAIN`.
+
+Each request has a body deadline and a conservative size budget derived from
+the gateway's gRPC message limit. The receiver admits at most four concurrent
+body/decode/enrichment jobs. It limits resource-block amplification after
+decode, then measures the exact session envelope before queueing it; the
+post-decode check does not prevent allocations already performed by the
+protobuf or JSON decoder. Queue overload is reported to the OTLP client rather
+than acknowledged as delivered. The gateway independently caps collector
+exports in flight so a collector outage cannot grow export tasks without
+bound.
 
 Forwarded spans gain `openshell.sandbox.id`, `openshell.workspace.id`,
 `openshell.sandbox.policy`, `openshell.sandbox.user`,
