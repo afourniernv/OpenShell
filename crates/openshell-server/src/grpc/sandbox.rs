@@ -789,7 +789,8 @@ fn validate_create_sandbox_request_pre_io(
 /// A traces-specific endpoint takes precedence over the generic endpoint under
 /// the OpenTelemetry environment contract. Either caller-supplied endpoint, or
 /// an incompatible caller-supplied traces protocol, leaves the environment
-/// untouched. A preselected `http/protobuf` traces protocol is compatible.
+/// untouched. The relay supports both OTLP HTTP protocols, so a preselected
+/// `http/protobuf` or `http/json` protocol is normalized and preserved.
 /// Returns whether anything was injected.
 fn inject_otel_relay_environment(
     environment: &mut HashMap<String, String>,
@@ -799,9 +800,12 @@ fn inject_otel_relay_environment(
         OTEL_EXPORTER_OTLP_ENDPOINT, OTEL_EXPORTER_OTLP_TRACES_ENDPOINT,
         OTEL_EXPORTER_OTLP_TRACES_PROTOCOL, OTLP_RELAY_TRACES_ENDPOINT,
     };
-    let traces_protocol_is_incompatible = environment
+    let traces_protocol = environment
         .get(OTEL_EXPORTER_OTLP_TRACES_PROTOCOL)
-        .is_some_and(|protocol| !protocol.trim().eq_ignore_ascii_case("http/protobuf"));
+        .map(|protocol| protocol.trim().to_ascii_lowercase());
+    let traces_protocol_is_incompatible = traces_protocol
+        .as_deref()
+        .is_some_and(|protocol| !matches!(protocol, "http/protobuf" | "http/json"));
     if !otel_relay_enabled
         || environment.contains_key(OTEL_EXPORTER_OTLP_TRACES_ENDPOINT)
         || environment.contains_key(OTEL_EXPORTER_OTLP_ENDPOINT)
@@ -815,7 +819,7 @@ fn inject_otel_relay_environment(
     );
     environment.insert(
         OTEL_EXPORTER_OTLP_TRACES_PROTOCOL.to_string(),
-        "http/protobuf".to_string(),
+        traces_protocol.unwrap_or_else(|| "http/protobuf".to_string()),
     );
     true
 }
@@ -4095,6 +4099,25 @@ mod tests {
             env.get(OTEL_EXPORTER_OTLP_TRACES_PROTOCOL)
                 .map(String::as_str),
             Some("http/protobuf")
+        );
+    }
+
+    #[test]
+    fn inject_otel_relay_environment_preserves_http_json() {
+        let mut env = HashMap::from([(
+            OTEL_EXPORTER_OTLP_TRACES_PROTOCOL.to_string(),
+            " HTTP/JSON ".to_string(),
+        )]);
+        assert!(inject_otel_relay_environment(&mut env, true));
+        assert_eq!(
+            env.get(OTEL_EXPORTER_OTLP_TRACES_ENDPOINT)
+                .map(String::as_str),
+            Some(OTLP_RELAY_TRACES_ENDPOINT)
+        );
+        assert_eq!(
+            env.get(OTEL_EXPORTER_OTLP_TRACES_PROTOCOL)
+                .map(String::as_str),
+            Some("http/json")
         );
     }
 
