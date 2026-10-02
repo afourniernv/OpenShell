@@ -704,7 +704,7 @@ pub(crate) async fn run_server(
     state.gateway_interceptors = gateway_interceptors;
     state.provider_profile_sources = provider_profile_sources;
     state.extension_jwt_issuer = extension_jwt_issuer.clone();
-    state.otel_relay_exporter = otel_relay::try_create_exporter(config_file.as_ref()).await;
+    state.otel_relay_exporter = otel_relay::try_create_exporter(config_file.as_ref());
     state.sandbox_session_jwt_authority = sandbox_session_jwt_authority;
     if let Some(issuer) = extension_jwt_issuer {
         spawn_gateway_extension_token_refresh(issuer, gateway_extension_credentials);

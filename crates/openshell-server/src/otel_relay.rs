@@ -31,13 +31,15 @@ pub struct OtelRelayExporter {
 }
 
 impl OtelRelayExporter {
-    /// Connect to the OTLP collector at the given gRPC endpoint.
-    pub async fn connect(endpoint: &str) -> Result<Self, ConnectError> {
+    /// Configure a lazy channel to the OTLP collector at the given gRPC endpoint.
+    ///
+    /// The channel connects on the first export and reconnects after collector
+    /// outages, so collector availability does not determine whether the
+    /// gateway enables its relay capability at startup.
+    pub fn connect(endpoint: &str) -> Result<Self, ConnectError> {
         let channel = Channel::from_shared(endpoint.to_string())
             .map_err(|e| ConnectError::InvalidUri(e.to_string()))?
-            .connect()
-            .await
-            .map_err(ConnectError::Transport)?;
+            .connect_lazy();
         Ok(Self {
             client: TraceServiceClient::new(channel),
             export_permits: Arc::new(Semaphore::new(MAX_IN_FLIGHT_OTEL_EXPORTS)),
@@ -88,12 +90,10 @@ pub enum ExportError {
 pub enum ConnectError {
     #[error("invalid OTLP endpoint URI: {0}")]
     InvalidUri(String),
-    #[error("transport error: {0}")]
-    Transport(tonic::transport::Error),
 }
 
 /// Create a relay exporter from the gateway's OTLP config, if configured.
-pub async fn try_create_exporter(
+pub fn try_create_exporter(
     config_file: Option<&crate::config_file::ConfigFile>,
 ) -> Option<Arc<OtelRelayExporter>> {
     let Some(cf) = config_file else {
@@ -111,12 +111,12 @@ pub async fn try_create_exporter(
     // Agent traces ride their own lane: `agent_endpoint` when the operator
     // split the collectors, otherwise the shared infrastructure endpoint.
     let endpoint = otlp.agent_lane_endpoint();
-    match OtelRelayExporter::connect(endpoint).await {
+    match OtelRelayExporter::connect(endpoint) {
         Ok(exporter) => {
             info!(
                 endpoint,
                 dedicated_lane = otlp.agent_endpoint.is_some(),
-                "OTEL relay exporter connected"
+                "OTEL relay exporter configured"
             );
             Some(Arc::new(exporter))
         }
@@ -134,6 +134,29 @@ pub async fn try_create_exporter(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use opentelemetry_proto::tonic::collector::trace::v1::{
+        ExportTraceServiceResponse,
+        trace_service_server::{TraceService, TraceServiceServer},
+    };
+    use tokio_stream::wrappers::TcpListenerStream;
+
+    #[derive(Clone, Default)]
+    struct CountingCollector {
+        exports: Arc<AtomicUsize>,
+    }
+
+    #[tonic::async_trait]
+    impl TraceService for CountingCollector {
+        async fn export(
+            &self,
+            _request: tonic::Request<ExportTraceServiceRequest>,
+        ) -> Result<tonic::Response<ExportTraceServiceResponse>, tonic::Status> {
+            self.exports.fetch_add(1, Ordering::Relaxed);
+            Ok(tonic::Response::new(ExportTraceServiceResponse::default()))
+        }
+    }
 
     #[tokio::test]
     async fn gateway_otlp_does_not_enable_sandbox_relay_implicitly() {
@@ -151,9 +174,58 @@ mod tests {
     #[tokio::test]
     async fn connect_rejects_invalid_endpoint_uri() {
         let err = OtelRelayExporter::connect("not a valid uri")
-            .await
             .expect_err("an unparsable endpoint must not connect");
         assert!(matches!(err, ConnectError::InvalidUri(_)), "{err}");
+    }
+
+    #[tokio::test]
+    async fn exporter_survives_collector_starting_after_configuration() {
+        let reservation = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = reservation.local_addr().unwrap();
+        drop(reservation);
+
+        let exporter = OtelRelayExporter::connect(&format!("http://{addr}"))
+            .expect("a valid collector URI should configure while the collector is down");
+
+        let request = ExportTraceServiceRequest::default().encode_to_vec();
+        let first_error = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            exporter.export_raw(request.clone()),
+        )
+        .await
+        .expect("the first connection attempt should fail promptly")
+        .expect_err("an export cannot succeed before the collector starts");
+        assert!(matches!(first_error, ExportError::Grpc(_)), "{first_error}");
+
+        let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+        let collector = CountingCollector::default();
+        let exports = Arc::clone(&collector.exports);
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .add_service(TraceServiceServer::new(collector))
+                .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async {
+                    let _ = shutdown_rx.await;
+                })
+                .await
+        });
+
+        let mut delivered = false;
+        for _ in 0..20 {
+            if exporter.export_raw(request.clone()).await.is_ok() {
+                delivered = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(
+            delivered,
+            "the channel should reconnect after the collector starts"
+        );
+        assert_eq!(exports.load(Ordering::Relaxed), 1);
+
+        shutdown_tx.send(()).unwrap();
+        server.await.unwrap().unwrap();
     }
 
     #[tokio::test]
