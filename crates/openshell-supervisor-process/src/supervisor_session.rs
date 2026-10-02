@@ -501,7 +501,8 @@ async fn run_single_session(
     // Forwarding is gated per session on the negotiated capability. The
     // receiver keeps serving either way; a declining session just leaves
     // items in the bounded buffer until a later session confirms.
-    let mut otel_active = otel_forwarding_active(relay.is_running(), &accepted);
+    let otel_export_confirmed = otel_forwarding_active(relay.is_running(), &accepted);
+    let mut otel_active = otel_export_confirmed;
     if otel_active {
         info!("gateway confirmed otel_export capability; OTLP forwarding active");
     } else if relay.is_running() {
@@ -554,7 +555,9 @@ async fn run_single_session(
                 *drain_rx = None;
                 otel_active = false;
                 if let Ok(done_tx) = request {
-                    relay.stop_and_drain(&config.sandbox_id, &tx).await;
+                    relay
+                        .stop_and_drain(&config.sandbox_id, &tx, otel_export_confirmed)
+                        .await;
                     let _ = done_tx.send(());
                 }
                 // Keep the session up: heartbeats and relays must continue

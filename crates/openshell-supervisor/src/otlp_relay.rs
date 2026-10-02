@@ -127,7 +127,7 @@ mod tests {
             openshell_supervisor_process::otlp::start(&RelayConfig::default(), metadata());
         let reserved = reserved_destination(server);
         let (tx, _rx) = tokio::sync::mpsc::channel(4);
-        relay.stop_and_drain("sb-test", &tx).await;
+        relay.stop_and_drain("sb-test", &tx, true).await;
 
         let (_client, boundary) = tokio::io::duplex(1024);
         assert!(

@@ -123,8 +123,9 @@ append_local_otlp_config_if_available() {
 
 [openshell.gateway.otlp]
 endpoint = "http://127.0.0.1:4317"
+sandbox_relay_enabled = true
 EOF
-  echo "OTLP trace export enabled for http://127.0.0.1:4317."
+  echo "OTLP trace export and sandbox trace relay enabled for http://127.0.0.1:4317."
 }
 
 register_gateway_metadata() {

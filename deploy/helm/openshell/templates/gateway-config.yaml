@@ -14,6 +14,9 @@ One value is intentionally NOT rendered here:
 */}}
 {{- $credentialDrivers := list -}}
 {{- $otlp := .Values.server.otlp | default dict -}}
+{{- if and $otlp.sandboxRelayEnabled (not $otlp.endpoint) }}
+{{- fail "server.otlp.sandboxRelayEnabled requires server.otlp.endpoint" }}
+{{- end }}
 {{- $ocsfLog := .Values.server.ocsfLog | default dict -}}
 {{- if .Values.server.credentialDrivers.kubernetesSecrets.enabled -}}
 {{- $credentialDrivers = append $credentialDrivers "kubernetes-secrets" -}}
@@ -84,6 +87,7 @@ data:
 
     [openshell.gateway.otlp]
     endpoint = {{ $otlp.endpoint | quote }}
+    sandbox_relay_enabled = {{ $otlp.sandboxRelayEnabled | default false }}
     {{- if $otlp.serviceName }}
     service_name = {{ $otlp.serviceName | quote }}
     {{- end }}
