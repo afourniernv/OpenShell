@@ -124,7 +124,7 @@ pub fn try_create_exporter(
             tracing::warn!(
                 endpoint,
                 error = %e,
-                "failed to connect OTEL relay exporter; relay disabled"
+                "failed to configure OTEL relay exporter; relay disabled"
             );
             None
         }
@@ -210,14 +210,22 @@ mod tests {
                 .await
         });
 
-        let mut delivered = false;
-        for _ in 0..20 {
-            if exporter.export_raw(request.clone()).await.is_ok() {
-                delivered = true;
-                break;
+        let delivered = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            for _ in 0..20 {
+                let attempt = tokio::time::timeout(
+                    std::time::Duration::from_millis(250),
+                    exporter.export_raw(request.clone()),
+                )
+                .await;
+                if matches!(attempt, Ok(Ok(()))) {
+                    return true;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             }
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        }
+            false
+        })
+        .await
+        .expect("collector recovery probe must have a total deadline");
         assert!(
             delivered,
             "the channel should reconnect after the collector starts"
