@@ -787,10 +787,11 @@ fn validate_create_sandbox_request_pre_io(
 /// an incompatible traces-specific protocol.
 ///
 /// A traces-specific endpoint takes precedence over the generic endpoint under
-/// the OpenTelemetry environment contract. Either caller-supplied endpoint, or
-/// an incompatible caller-supplied traces protocol, leaves the environment
-/// untouched. The relay supports both OTLP HTTP protocols, so a preselected
-/// `http/protobuf` or `http/json` protocol is normalized and preserved.
+/// the OpenTelemetry environment contract. Either non-empty caller-supplied
+/// endpoint, or the valid but incompatible `grpc` traces protocol, leaves the
+/// environment untouched. Empty and unknown values behave as unset. The relay
+/// supports both OTLP HTTP protocols, so a preselected `http/protobuf` or
+/// `http/json` protocol is normalized and preserved.
 /// Returns whether anything was injected.
 fn inject_otel_relay_environment(
     environment: &mut HashMap<String, String>,
@@ -800,16 +801,22 @@ fn inject_otel_relay_environment(
         OTEL_EXPORTER_OTLP_ENDPOINT, OTEL_EXPORTER_OTLP_TRACES_ENDPOINT,
         OTEL_EXPORTER_OTLP_TRACES_PROTOCOL, OTLP_RELAY_TRACES_ENDPOINT,
     };
-    let traces_protocol = environment
+    let has_nonempty_endpoint = |key: &str| {
+        environment
+            .get(key)
+            .is_some_and(|endpoint| !endpoint.trim().is_empty())
+    };
+    let configured_traces_protocol = environment
         .get(OTEL_EXPORTER_OTLP_TRACES_PROTOCOL)
         .map(|protocol| protocol.trim().to_ascii_lowercase());
-    let traces_protocol_is_incompatible = traces_protocol
-        .as_deref()
-        .is_some_and(|protocol| !matches!(protocol, "http/protobuf" | "http/json"));
+    let traces_protocol = match configured_traces_protocol.as_deref() {
+        Some("grpc") => return false,
+        Some(protocol @ ("http/protobuf" | "http/json")) => protocol.to_string(),
+        _ => "http/protobuf".to_string(),
+    };
     if !otel_relay_enabled
-        || environment.contains_key(OTEL_EXPORTER_OTLP_TRACES_ENDPOINT)
-        || environment.contains_key(OTEL_EXPORTER_OTLP_ENDPOINT)
-        || traces_protocol_is_incompatible
+        || has_nonempty_endpoint(OTEL_EXPORTER_OTLP_TRACES_ENDPOINT)
+        || has_nonempty_endpoint(OTEL_EXPORTER_OTLP_ENDPOINT)
     {
         return false;
     }
@@ -819,7 +826,7 @@ fn inject_otel_relay_environment(
     );
     environment.insert(
         OTEL_EXPORTER_OTLP_TRACES_PROTOCOL.to_string(),
-        traces_protocol.unwrap_or_else(|| "http/protobuf".to_string()),
+        traces_protocol,
     );
     true
 }
@@ -4073,6 +4080,27 @@ mod tests {
     }
 
     #[test]
+    fn inject_otel_relay_environment_treats_blank_endpoints_as_unset() {
+        for endpoint_key in [
+            OTEL_EXPORTER_OTLP_TRACES_ENDPOINT,
+            OTEL_EXPORTER_OTLP_ENDPOINT,
+        ] {
+            let mut env = HashMap::from([(endpoint_key.to_string(), " \t".to_string())]);
+            assert!(inject_otel_relay_environment(&mut env, true));
+            assert_eq!(
+                env.get(OTEL_EXPORTER_OTLP_TRACES_ENDPOINT)
+                    .map(String::as_str),
+                Some(OTLP_RELAY_TRACES_ENDPOINT)
+            );
+            assert_eq!(
+                env.get(OTEL_EXPORTER_OTLP_TRACES_PROTOCOL)
+                    .map(String::as_str),
+                Some("http/protobuf")
+            );
+        }
+    }
+
+    #[test]
     fn inject_otel_relay_environment_keeps_an_incompatible_traces_protocol() {
         let mut env = HashMap::from([(
             OTEL_EXPORTER_OTLP_TRACES_PROTOCOL.to_string(),
@@ -4100,6 +4128,23 @@ mod tests {
                 .map(String::as_str),
             Some("http/protobuf")
         );
+    }
+
+    #[test]
+    fn inject_otel_relay_environment_defaults_blank_or_unknown_protocols() {
+        for protocol in ["", " \t", "http/xml", "not-a-protocol"] {
+            let mut env = HashMap::from([(
+                OTEL_EXPORTER_OTLP_TRACES_PROTOCOL.to_string(),
+                protocol.to_string(),
+            )]);
+            assert!(inject_otel_relay_environment(&mut env, true));
+            assert_eq!(
+                env.get(OTEL_EXPORTER_OTLP_TRACES_PROTOCOL)
+                    .map(String::as_str),
+                Some("http/protobuf"),
+                "protocol {protocol:?} should behave as unset"
+            );
+        }
     }
 
     #[test]

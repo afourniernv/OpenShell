@@ -225,10 +225,14 @@ async fn handle_request(
     match enrichment::enrich_spans(&body, content_type, metadata, enrichment_enabled) {
         Ok(enriched) => {
             buf_tx.send_trace(enriched);
+            let (response_content_type, response_body) = match content_type {
+                ContentType::Protobuf => ("application/x-protobuf", Bytes::new()),
+                ContentType::Json => ("application/json", Bytes::from_static(b"{}")),
+            };
             Ok(Response::builder()
                 .status(StatusCode::OK)
-                .header("content-type", "application/x-protobuf")
-                .body(Full::new(Bytes::new()))
+                .header("content-type", response_content_type)
+                .body(Full::new(response_body))
                 .unwrap())
         }
         Err(EnrichmentError::ProtobufDecode(e)) => {
@@ -292,6 +296,15 @@ pub(crate) mod test_util {
 
     /// A minimal but non-empty protobuf `ExportTraceServiceRequest`.
     pub fn sample_trace_body() -> Vec<u8> {
+        sample_trace_request().encode_to_vec()
+    }
+
+    /// The same minimal request encoded with OTLP/HTTP JSON mapping.
+    pub fn sample_trace_json_body() -> Vec<u8> {
+        serde_json::to_vec(&sample_trace_request()).expect("serialize trace request")
+    }
+
+    fn sample_trace_request() -> ExportTraceServiceRequest {
         ExportTraceServiceRequest {
             resource_spans: vec![ResourceSpans {
                 scope_spans: vec![ScopeSpans {
@@ -304,7 +317,6 @@ pub(crate) mod test_util {
                 ..Default::default()
             }],
         }
-        .encode_to_vec()
     }
 
     pub fn request(method: &str, path: &str, content_type: &str, body: &[u8]) -> Vec<u8> {
@@ -327,9 +339,11 @@ pub(crate) mod test_util {
         client
     }
 
-    /// Write `req` and read until the response head is complete. Returns the
-    /// status line; the stream stays open.
-    pub async fn send<S: AsyncRead + AsyncWrite + Unpin>(stream: &mut S, req: &[u8]) -> String {
+    /// Write `req` and read one complete response, including its declared body.
+    pub async fn send_response<S: AsyncRead + AsyncWrite + Unpin>(
+        stream: &mut S,
+        req: &[u8],
+    ) -> Vec<u8> {
         stream.write_all(req).await.expect("write request");
         let mut buf = Vec::new();
         let mut chunk = [0u8; 1024];
@@ -340,11 +354,29 @@ pub(crate) mod test_util {
                 .expect("read response");
             assert!(n > 0, "connection closed before response head");
             buf.extend_from_slice(&chunk[..n]);
-            if buf.windows(4).any(|w| w == b"\r\n\r\n") {
-                break;
+            if let Some(head_end) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                let head_end = head_end + 4;
+                let head = String::from_utf8_lossy(&buf[..head_end]);
+                let content_length = head
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().ok())
+                            .flatten()
+                    })
+                    .unwrap_or(0);
+                if buf.len() >= head_end + content_length {
+                    return buf;
+                }
             }
         }
-        let head = String::from_utf8_lossy(&buf);
+    }
+
+    /// Write `req` and return the response status line; the stream stays open.
+    pub async fn send<S: AsyncRead + AsyncWrite + Unpin>(stream: &mut S, req: &[u8]) -> String {
+        let response = send_response(stream, req).await;
+        let head = String::from_utf8_lossy(&response);
         head.lines().next().unwrap_or_default().to_string()
     }
 }
@@ -355,7 +387,9 @@ mod tests {
 
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    use super::test_util::{connect, metadata, request, sample_trace_body, send};
+    use super::test_util::{
+        connect, metadata, request, sample_trace_body, sample_trace_json_body, send, send_response,
+    };
     use super::*;
     use crate::otlp::buffer::{TelemetryReceiver, new_telemetry_buffer};
 
@@ -454,6 +488,38 @@ mod tests {
             status.contains("200"),
             "valid protobuf should be 200, got {status}"
         );
+        assert_eq!(buf_rx.metrics().depth(), 1);
+
+        handle.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn json_request_gets_a_json_otlp_response() {
+        let (server, handle, buf_rx) = start();
+
+        let mut client = connect(&server);
+        let response = send_response(
+            &mut client,
+            &request(
+                "POST",
+                "/v1/traces",
+                "application/json",
+                &sample_trace_json_body(),
+            ),
+        )
+        .await;
+        let response_text = String::from_utf8(response).expect("ASCII HTTP response");
+        assert!(
+            response_text.starts_with("HTTP/1.1 200"),
+            "unexpected response: {response_text}"
+        );
+        assert!(
+            response_text
+                .to_ascii_lowercase()
+                .contains("content-type: application/json"),
+            "unexpected response: {response_text}"
+        );
+        assert!(response_text.ends_with("{}"));
         assert_eq!(buf_rx.metrics().depth(), 1);
 
         handle.shutdown().await;

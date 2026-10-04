@@ -287,7 +287,8 @@ pub const OTEL_EXPORTER_OTLP_TRACES_ENDPOINT: &str = "OTEL_EXPORTER_OTLP_TRACES_
 
 /// Standard OpenTelemetry environment variable for the traces OTLP protocol.
 ///
-/// Set to `http/protobuf` alongside [`OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`].
+/// Defaults to `http/protobuf` alongside [`OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`].
+/// A caller-selected `http/protobuf` or `http/json` value is retained.
 pub const OTEL_EXPORTER_OTLP_TRACES_PROTOCOL: &str = "OTEL_EXPORTER_OTLP_TRACES_PROTOCOL";
 
 /// Reserved destination agent processes export OTLP to.
