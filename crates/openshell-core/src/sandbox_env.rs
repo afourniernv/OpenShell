@@ -267,46 +267,27 @@ pub const DEFAULT_SANDBOX_GID: u32 = 1000;
 pub const OCI_IMAGE_USER: &str = "OPENSHELL_OCI_IMAGE_USER";
 
 /// Generic OpenTelemetry OTLP exporter endpoint.
-///
-/// A caller-declared value applies to traces when
-/// [`OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`] is absent, so it prevents gateway
-/// trace-relay injection.
 pub const OTEL_EXPORTER_OTLP_ENDPOINT: &str = "OTEL_EXPORTER_OTLP_ENDPOINT";
 
-/// Standard OpenTelemetry environment variable for the generic OTLP exporter
-/// protocol.
+/// Generic OpenTelemetry OTLP exporter protocol.
 pub const OTEL_EXPORTER_OTLP_PROTOCOL: &str = "OTEL_EXPORTER_OTLP_PROTOCOL";
 
-/// Standard OpenTelemetry environment variable for the traces OTLP endpoint.
-///
-/// The gateway sets this in newly created sandbox environments when the
-/// sandbox trace relay is available. A caller-declared traces endpoint wins,
-/// as does the generic [`OTEL_EXPORTER_OTLP_ENDPOINT`] fallback when no
-/// traces-specific endpoint is present.
+/// Trace-specific OpenTelemetry OTLP exporter endpoint.
 pub const OTEL_EXPORTER_OTLP_TRACES_ENDPOINT: &str = "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT";
 
-/// Standard OpenTelemetry environment variable for the traces OTLP protocol.
-///
-/// Defaults to `http/protobuf` alongside [`OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`].
-/// A caller-selected `http/protobuf` or `http/json` value is retained.
+/// Trace-specific OpenTelemetry OTLP exporter protocol.
 pub const OTEL_EXPORTER_OTLP_TRACES_PROTOCOL: &str = "OTEL_EXPORTER_OTLP_TRACES_PROTOCOL";
 
-/// Standard OpenTelemetry environment variable for the logs OTLP endpoint.
+/// Log-specific OpenTelemetry OTLP exporter endpoint.
 pub const OTEL_EXPORTER_OTLP_LOGS_ENDPOINT: &str = "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT";
 
-/// Standard OpenTelemetry environment variable for the logs OTLP protocol.
-///
-/// Defaults to `http/protobuf` alongside [`OTEL_EXPORTER_OTLP_LOGS_ENDPOINT`].
-/// A caller-selected `http/protobuf` or `http/json` value is retained.
+/// Log-specific OpenTelemetry OTLP exporter protocol.
 pub const OTEL_EXPORTER_OTLP_LOGS_PROTOCOL: &str = "OTEL_EXPORTER_OTLP_LOGS_PROTOCOL";
 
-/// Standard OpenTelemetry environment variable for the metrics OTLP endpoint.
+/// Metric-specific OpenTelemetry OTLP exporter endpoint.
 pub const OTEL_EXPORTER_OTLP_METRICS_ENDPOINT: &str = "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT";
 
-/// Standard OpenTelemetry environment variable for the metrics OTLP protocol.
-///
-/// Defaults to `http/protobuf` alongside [`OTEL_EXPORTER_OTLP_METRICS_ENDPOINT`].
-/// A caller-selected `http/protobuf` or `http/json` value is retained.
+/// Metric-specific OpenTelemetry OTLP exporter protocol.
 pub const OTEL_EXPORTER_OTLP_METRICS_PROTOCOL: &str = "OTEL_EXPORTER_OTLP_METRICS_PROTOCOL";
 
 /// Reserved destination agent processes export OTLP to.
@@ -325,17 +306,13 @@ pub const OTLP_RELAY_ADDR: &str = "192.0.0.8:4318";
 /// [`OTLP_RELAY_ADDR`] as an OTLP HTTP base URL.
 pub const OTLP_RELAY_ENDPOINT: &str = "http://192.0.0.8:4318";
 
-/// Trace ingestion URL injected through
-/// [`OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`].
-///
-/// Signal-specific HTTP endpoints are used verbatim by OpenTelemetry SDKs and
-/// therefore include `/v1/traces`.
+/// Trace-specific HTTP ingestion URL for the sandbox relay.
 pub const OTLP_RELAY_TRACES_ENDPOINT: &str = "http://192.0.0.8:4318/v1/traces";
 
-/// Log ingestion URL injected through [`OTEL_EXPORTER_OTLP_LOGS_ENDPOINT`].
+/// Log-specific HTTP ingestion URL for the sandbox relay.
 pub const OTLP_RELAY_LOGS_ENDPOINT: &str = "http://192.0.0.8:4318/v1/logs";
 
-/// Metric ingestion URL injected through [`OTEL_EXPORTER_OTLP_METRICS_ENDPOINT`].
+/// Metric-specific HTTP ingestion URL for the sandbox relay.
 pub const OTLP_RELAY_METRICS_ENDPOINT: &str = "http://192.0.0.8:4318/v1/metrics";
 
 // The corporate upstream-proxy configuration deliberately has no reserved

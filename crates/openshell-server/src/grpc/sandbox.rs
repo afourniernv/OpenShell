@@ -790,18 +790,8 @@ fn validate_create_sandbox_request_pre_io(
     Ok(())
 }
 
-/// Set signal-specific OTLP endpoints and protocols to the supervisor relay
-/// when `otel_relay_enabled`, unless the caller already chose an endpoint or
-/// an incompatible signal-specific protocol.
-///
-/// A non-empty generic endpoint takes precedence over all signal endpoints.
-/// Otherwise, each signal is considered independently: a non-empty endpoint
-/// or the valid but incompatible `grpc` protocol suppresses relay injection
-/// only for that signal. Empty endpoints and unknown protocols behave as
-/// unset. Compatible `http/protobuf` and `http/json` values are normalized and
-/// preserved. This permits an intentional split destination without silently
-/// disabling relay delivery for the remaining signals.
-/// Returns whether anything was injected.
+/// Inject enabled signal-specific relay settings unless the caller selected a
+/// generic endpoint, signal endpoint, or gRPC for that signal.
 fn inject_otel_relay_environment(
     environment: &mut HashMap<String, String>,
     relay_signals: impl Into<crate::otel_relay::RelaySignals>,
@@ -4156,7 +4146,7 @@ mod tests {
     }
 
     #[test]
-    fn inject_otel_relay_environment_keeps_a_caller_supplied_generic_endpoint() {
+    fn inject_otel_relay_environment_keeps_caller_supplied_generic_endpoint() {
         let mut env = HashMap::from([
             (
                 OTEL_EXPORTER_OTLP_ENDPOINT.to_string(),
@@ -4198,101 +4188,47 @@ mod tests {
     }
 
     #[test]
-    fn inject_otel_relay_environment_keeps_one_incompatible_signal_protocol() {
-        let mut env = HashMap::from([(
-            OTEL_EXPORTER_OTLP_LOGS_PROTOCOL.to_string(),
-            "grpc".to_string(),
-        )]);
-        assert!(inject_otel_relay_environment(&mut env, true));
-        assert!(!env.contains_key(OTEL_EXPORTER_OTLP_LOGS_ENDPOINT));
-        assert_eq!(
-            env.get(OTEL_EXPORTER_OTLP_LOGS_PROTOCOL)
-                .map(String::as_str),
-            Some("grpc")
-        );
-        assert_eq!(
-            env.get(OTEL_EXPORTER_OTLP_TRACES_ENDPOINT)
-                .map(String::as_str),
-            Some(OTLP_RELAY_TRACES_ENDPOINT)
-        );
-        assert_eq!(
-            env.get(OTEL_EXPORTER_OTLP_METRICS_ENDPOINT)
-                .map(String::as_str),
-            Some(OTLP_RELAY_METRICS_ENDPOINT)
-        );
-    }
-
-    #[test]
-    fn inject_otel_relay_environment_accepts_a_compatible_traces_protocol() {
-        let mut env = HashMap::from([(
-            OTEL_EXPORTER_OTLP_TRACES_PROTOCOL.to_string(),
-            " HTTP/PROTOBUF ".to_string(),
-        )]);
-        assert!(inject_otel_relay_environment(&mut env, true));
-        assert_eq!(
-            env.get(OTEL_EXPORTER_OTLP_TRACES_ENDPOINT)
-                .map(String::as_str),
-            Some(OTLP_RELAY_TRACES_ENDPOINT)
-        );
-        assert_eq!(
-            env.get(OTEL_EXPORTER_OTLP_TRACES_PROTOCOL)
-                .map(String::as_str),
-            Some("http/protobuf")
-        );
-    }
-
-    #[test]
-    fn inject_otel_relay_environment_defaults_blank_or_unknown_protocols() {
-        for protocol_key in [
-            OTEL_EXPORTER_OTLP_TRACES_PROTOCOL,
-            OTEL_EXPORTER_OTLP_LOGS_PROTOCOL,
-            OTEL_EXPORTER_OTLP_METRICS_PROTOCOL,
+    fn inject_otel_relay_environment_honors_signal_protocols() {
+        for (protocol_key, endpoint_key, relay_endpoint) in [
+            (
+                OTEL_EXPORTER_OTLP_TRACES_PROTOCOL,
+                OTEL_EXPORTER_OTLP_TRACES_ENDPOINT,
+                OTLP_RELAY_TRACES_ENDPOINT,
+            ),
+            (
+                OTEL_EXPORTER_OTLP_LOGS_PROTOCOL,
+                OTEL_EXPORTER_OTLP_LOGS_ENDPOINT,
+                OTLP_RELAY_LOGS_ENDPOINT,
+            ),
+            (
+                OTEL_EXPORTER_OTLP_METRICS_PROTOCOL,
+                OTEL_EXPORTER_OTLP_METRICS_ENDPOINT,
+                OTLP_RELAY_METRICS_ENDPOINT,
+            ),
         ] {
-            for protocol in ["", " \t", "http/xml", "not-a-protocol"] {
+            for (protocol, should_inject, expected_protocol) in [
+                ("grpc", false, "grpc"),
+                (" HTTP/PROTOBUF ", true, "http/protobuf"),
+                (" HTTP/JSON ", true, "http/json"),
+                ("", true, "http/protobuf"),
+                (" \t", true, "http/protobuf"),
+                ("http/xml", true, "http/protobuf"),
+                ("not-a-protocol", true, "http/protobuf"),
+            ] {
                 let mut env = HashMap::from([(protocol_key.to_string(), protocol.to_string())]);
                 assert!(inject_otel_relay_environment(&mut env, true));
                 assert_eq!(
                     env.get(protocol_key).map(String::as_str),
-                    Some("http/protobuf"),
-                    "protocol {protocol:?} for {protocol_key} should behave as unset"
+                    Some(expected_protocol),
+                    "unexpected normalized protocol for {protocol_key}={protocol:?}"
+                );
+                assert_eq!(
+                    env.get(endpoint_key).map(String::as_str),
+                    should_inject.then_some(relay_endpoint),
+                    "unexpected relay decision for {protocol_key}={protocol:?}"
                 );
             }
         }
-    }
-
-    #[test]
-    fn inject_otel_relay_environment_preserves_http_json() {
-        let mut env = HashMap::from([
-            (
-                OTEL_EXPORTER_OTLP_TRACES_PROTOCOL.to_string(),
-                " HTTP/JSON ".to_string(),
-            ),
-            (
-                OTEL_EXPORTER_OTLP_LOGS_PROTOCOL.to_string(),
-                "http/json".to_string(),
-            ),
-        ]);
-        assert!(inject_otel_relay_environment(&mut env, true));
-        assert_eq!(
-            env.get(OTEL_EXPORTER_OTLP_TRACES_ENDPOINT)
-                .map(String::as_str),
-            Some(OTLP_RELAY_TRACES_ENDPOINT)
-        );
-        assert_eq!(
-            env.get(OTEL_EXPORTER_OTLP_TRACES_PROTOCOL)
-                .map(String::as_str),
-            Some("http/json")
-        );
-        assert_eq!(
-            env.get(OTEL_EXPORTER_OTLP_LOGS_PROTOCOL)
-                .map(String::as_str),
-            Some("http/json")
-        );
-        assert_eq!(
-            env.get(OTEL_EXPORTER_OTLP_METRICS_PROTOCOL)
-                .map(String::as_str),
-            Some("http/protobuf")
-        );
     }
 
     #[test]
