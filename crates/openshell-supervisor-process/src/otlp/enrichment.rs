@@ -10,6 +10,22 @@ use prost::Message;
 
 use super::SandboxMetadata;
 
+/// Attribute names whose values are derived by trusted `OpenShell` components.
+///
+/// Keep this as an explicit allowlist instead of reserving the entire
+/// `openshell.*` namespace. That prevents a workload from contradicting the
+/// identity attached by the supervisor without deleting unrelated application
+/// attributes merely because they share a vendor prefix.
+const AUTHORITATIVE_ATTRIBUTE_KEYS: [&str; 7] = [
+    "openshell.telemetry.source",
+    "openshell.sandbox.id",
+    "openshell.workspace.id",
+    "openshell.sandbox.policy",
+    "openshell.sandbox.user",
+    "openshell.sandbox.image",
+    "openshell.sandbox.driver",
+];
+
 /// Content type of the incoming OTLP request body.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ContentType {
@@ -38,26 +54,43 @@ pub fn enrich_spans(
 
     let extra_attrs = build_attributes(attrs, enrichment_enabled);
 
-    let trusted_keys: Vec<&str> = extra_attrs
-        .iter()
-        .filter_map(|a| a.key.as_str().into())
-        .collect();
-
     for resource_spans in &mut request.resource_spans {
         let resource = resource_spans
             .resource
             .get_or_insert_with(Resource::default);
 
-        resource
-            .attributes
-            .retain(|a| !trusted_keys.contains(&a.key.as_str()));
+        strip_authoritative_attributes(&mut resource.attributes);
 
         for attr in &extra_attrs {
             resource.attributes.push(attr.clone());
         }
+
+        // OTLP keeps resource, instrumentation-scope, span, event, and link
+        // attributes in separate collections. Backends often make all of
+        // them queryable together, so stripping only resource attributes
+        // still lets an untrusted workload publish a contradictory OpenShell
+        // identity at a narrower scope.
+        for scope_spans in &mut resource_spans.scope_spans {
+            if let Some(scope) = &mut scope_spans.scope {
+                strip_authoritative_attributes(&mut scope.attributes);
+            }
+            for span in &mut scope_spans.spans {
+                strip_authoritative_attributes(&mut span.attributes);
+                for event in &mut span.events {
+                    strip_authoritative_attributes(&mut event.attributes);
+                }
+                for link in &mut span.links {
+                    strip_authoritative_attributes(&mut link.attributes);
+                }
+            }
+        }
     }
 
     Ok(request.encode_to_vec())
+}
+
+fn strip_authoritative_attributes(attributes: &mut Vec<KeyValue>) {
+    attributes.retain(|attribute| !AUTHORITATIVE_ATTRIBUTE_KEYS.contains(&attribute.key.as_str()));
 }
 
 fn build_attributes(meta: &SandboxMetadata, enrichment_enabled: bool) -> Vec<KeyValue> {
@@ -265,6 +298,102 @@ mod tests {
             attrs.iter().any(|a| a.key == "openshell.sandbox.id"),
             "enrichment attributes should also be present"
         );
+    }
+
+    #[test]
+    fn enrichment_strips_authoritative_keys_from_every_attribute_owner() {
+        use opentelemetry_proto::tonic::common::v1::{
+            AnyValue, InstrumentationScope, KeyValue, any_value,
+        };
+        use opentelemetry_proto::tonic::resource::v1::Resource;
+        use opentelemetry_proto::tonic::trace::v1::span;
+
+        fn spoofed(key: &str) -> KeyValue {
+            KeyValue {
+                key: key.into(),
+                value: Some(AnyValue {
+                    value: Some(any_value::Value::StringValue("workload-controlled".into())),
+                }),
+                key_strindex: 0,
+            }
+        }
+
+        let request = ExportTraceServiceRequest {
+            resource_spans: vec![ResourceSpans {
+                resource: Some(Resource {
+                    attributes: vec![
+                        spoofed("openshell.sandbox.id"),
+                        spoofed("openshell.application.phase"),
+                    ],
+                    ..Default::default()
+                }),
+                scope_spans: vec![ScopeSpans {
+                    scope: Some(InstrumentationScope {
+                        attributes: vec![spoofed("openshell.workspace.id")],
+                        ..Default::default()
+                    }),
+                    spans: vec![Span {
+                        attributes: vec![spoofed("openshell.sandbox.policy")],
+                        events: vec![span::Event {
+                            attributes: vec![spoofed("openshell.sandbox.user")],
+                            ..Default::default()
+                        }],
+                        links: vec![span::Link {
+                            attributes: vec![spoofed("openshell.sandbox.driver")],
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+        };
+
+        let encoded = enrich_spans(
+            &request.encode_to_vec(),
+            ContentType::Protobuf,
+            &test_metadata(),
+            true,
+        )
+        .unwrap();
+        let decoded = ExportTraceServiceRequest::decode(encoded.as_slice()).unwrap();
+        let resource_spans = &decoded.resource_spans[0];
+        let resource = resource_spans.resource.as_ref().unwrap();
+        let scope_spans = &resource_spans.scope_spans[0];
+        let span = &scope_spans.spans[0];
+
+        assert_eq!(
+            resource
+                .attributes
+                .iter()
+                .find(|attribute| attribute.key == "openshell.sandbox.id")
+                .and_then(|attribute| attribute.value.as_ref())
+                .and_then(|value| value.value.as_ref()),
+            Some(&any_value::Value::StringValue("sb-123".into())),
+            "resource identity must come from the supervisor"
+        );
+        assert!(
+            resource
+                .attributes
+                .iter()
+                .any(|attribute| attribute.key == "openshell.application.phase"),
+            "unreserved OpenShell application attributes must be preserved"
+        );
+
+        for attributes in [
+            scope_spans.scope.as_ref().unwrap().attributes.as_slice(),
+            span.attributes.as_slice(),
+            span.events[0].attributes.as_slice(),
+            span.links[0].attributes.as_slice(),
+        ] {
+            assert!(
+                attributes
+                    .iter()
+                    .all(|attribute| !attribute.key.starts_with("openshell.")),
+                "workload-controlled owners must not retain authoritative keys"
+            );
+        }
     }
 
     #[test]
