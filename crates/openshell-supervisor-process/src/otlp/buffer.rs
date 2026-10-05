@@ -15,13 +15,16 @@ use super::MAX_TELEMETRY_ITEM_BYTES;
 pub enum TelemetryItem {
     Trace(Vec<u8>),
     Logs(Vec<u8>),
+    Metrics(Vec<u8>),
     Ocsf(Vec<u8>),
 }
 
 impl TelemetryItem {
     fn len(&self) -> usize {
         match self {
-            Self::Trace(data) | Self::Logs(data) | Self::Ocsf(data) => data.len(),
+            Self::Trace(data) | Self::Logs(data) | Self::Metrics(data) | Self::Ocsf(data) => {
+                data.len()
+            }
         }
     }
 
@@ -30,7 +33,9 @@ impl TelemetryItem {
     /// bypassing the aggregate memory budget.
     fn allocated_bytes(&self) -> usize {
         match self {
-            Self::Trace(data) | Self::Logs(data) | Self::Ocsf(data) => data.capacity(),
+            Self::Trace(data) | Self::Logs(data) | Self::Metrics(data) | Self::Ocsf(data) => {
+                data.capacity()
+            }
         }
     }
 }
@@ -149,6 +154,10 @@ impl TelemetrySender {
 
     pub fn send_logs(&self, data: Vec<u8>) -> Result<(), TelemetrySendError> {
         self.send(TelemetryItem::Logs(data))
+    }
+
+    pub fn send_metrics(&self, data: Vec<u8>) -> Result<(), TelemetrySendError> {
+        self.send(TelemetryItem::Metrics(data))
     }
 
     pub fn send_ocsf(&self, data: Vec<u8>) -> Result<(), TelemetrySendError> {

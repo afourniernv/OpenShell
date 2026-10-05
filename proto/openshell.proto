@@ -2980,7 +2980,7 @@ message OtelExportData {
   // sandbox resource attributes.
   oneof signal {
     bytes trace_data = 2;
-    // bytes metrics_data = 4;  // future
+    bytes metrics_data = 4;
     bytes logs_data = 5;
   }
 

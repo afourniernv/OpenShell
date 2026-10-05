@@ -445,10 +445,10 @@ discovery endpoint or its TLS CA.
 | server.oidc.rolesClaim | string | `""` | Dot-separated path to the roles array in the JWT claims. Keycloak: "realm_access.roles", Entra ID: "roles", Okta: "groups". |
 | server.oidc.scopesClaim | string | `""` | Dot-separated path to the scopes array in the JWT claims. |
 | server.oidc.userRole | string | `""` | Role name for standard user access. |
-| server.otlp.agentEndpoint | string | `""` | Separate OTLP/gRPC collector endpoint for relayed agent traces. Empty sends agent traces to `endpoint`. |
-| server.otlp.agentSignals | list | `["traces"]` | Sandbox OTLP signals exposed through the relay. Logs require a gateway and supervisor that support `otel_export_logs_v1`. |
+| server.otlp.agentEndpoint | string | `""` | Separate OTLP/gRPC collector endpoint for relayed agent telemetry. Empty sends agent signals to `endpoint`. |
+| server.otlp.agentSignals | list | `["traces"]` | Sandbox OTLP signals exposed through the relay. Logs and metrics require their versioned gateway/supervisor capabilities. |
 | server.otlp.endpoint | string | `""` | OTLP/gRPC collector endpoint, conventionally using port 4317. |
-| server.otlp.sandboxRelayEnabled | bool | `false` | Allow sandbox traces to use the supervisor/gateway relay. This is a separate, default-off trust boundary from gateway self-observability. |
+| server.otlp.sandboxRelayEnabled | bool | `false` | Allow sandbox telemetry to use the supervisor/gateway relay. This is a separate, default-off trust boundary from gateway self-observability. |
 | server.otlp.serviceName | string | `""` | Gateway OpenTelemetry service name. Empty uses openshell-gateway. |
 | server.policyValidationFailureMode | string | `"fail_closed"` | Posture when a candidate sandbox policy fails validation. `fail_closed` deactivates the previous policy; `retain_last_valid` keeps it active. |
 | server.providerTokenGrants.spiffe.enabled | bool | `false` | Mount the SPIFFE Workload API socket into gateway and sandbox pods for dynamic provider token grants. |

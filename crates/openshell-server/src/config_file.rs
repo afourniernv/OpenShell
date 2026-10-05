@@ -293,13 +293,13 @@ pub struct OtlpConfig {
     #[serde(default)]
     pub service_name: Option<String>,
 
-    /// OTLP/gRPC collector endpoint for relayed agent traces. When absent,
-    /// agent traces go to `endpoint`, so one collector serves both lanes
+    /// OTLP/gRPC collector endpoint for relayed agent telemetry. When absent,
+    /// agent signals go to `endpoint`, so one collector serves both lanes
     /// unless the operator splits them.
     #[serde(default)]
     pub agent_endpoint: Option<String>,
 
-    /// Allow sandboxes to send traces through the supervisor and gateway to
+    /// Allow sandboxes to send telemetry through the supervisor and gateway to
     /// the agent collector lane. Defaults to false so gateway
     /// self-observability does not implicitly authorize workload telemetry.
     #[serde(default)]
@@ -315,6 +315,7 @@ pub struct OtlpConfig {
 pub enum OtlpAgentSignal {
     Traces,
     Logs,
+    Metrics,
 }
 
 fn default_agent_signals() -> Vec<OtlpAgentSignal> {
@@ -322,7 +323,7 @@ fn default_agent_signals() -> Vec<OtlpAgentSignal> {
 }
 
 impl OtlpConfig {
-    /// The collector endpoint for the agent-trace lane.
+    /// The collector endpoint for the agent-telemetry lane.
     pub fn agent_lane_endpoint(&self) -> &str {
         self.agent_endpoint.as_deref().unwrap_or(&self.endpoint)
     }
@@ -998,13 +999,17 @@ sandbox_relay_enabled = true
 [openshell.gateway.otlp]
 endpoint = "http://infra-collector:4317"
 sandbox_relay_enabled = true
-agent_signals = ["traces", "logs"]
+agent_signals = ["traces", "logs", "metrics"]
 "#;
         let tmp = write_tmp(toml);
         let file = load(tmp.path()).expect("valid otlp config parses");
         assert_eq!(
             file.openshell.gateway.otlp.unwrap().agent_signals,
-            vec![OtlpAgentSignal::Traces, OtlpAgentSignal::Logs]
+            vec![
+                OtlpAgentSignal::Traces,
+                OtlpAgentSignal::Logs,
+                OtlpAgentSignal::Metrics,
+            ]
         );
     }
 

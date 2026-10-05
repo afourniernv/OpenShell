@@ -90,8 +90,8 @@ data:
     sandbox_relay_enabled = {{ $otlp.sandboxRelayEnabled | default false }}
     {{- $agentSignals := $otlp.agentSignals | default (list "traces") }}
     {{- range $signal := $agentSignals }}
-    {{- if not (has $signal (list "traces" "logs")) }}
-    {{- fail "server.otlp.agentSignals entries must be traces or logs" }}
+    {{- if not (has $signal (list "traces" "logs" "metrics")) }}
+    {{- fail "server.otlp.agentSignals entries must be traces, logs, or metrics" }}
     {{- end }}
     {{- end }}
     agent_signals = [{{- range $index, $signal := $agentSignals }}{{ if $index }}, {{ end }}{{ $signal | quote }}{{- end }}]

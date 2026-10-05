@@ -4,8 +4,13 @@
 //! Enrichment for OTLP data emitted by sandbox workloads.
 
 use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
+use opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest;
 use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
 use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue, any_value};
+use opentelemetry_proto::tonic::metrics::v1::{
+    Exemplar, ExponentialHistogramDataPoint, HistogramDataPoint, NumberDataPoint, SummaryDataPoint,
+    metric,
+};
 use opentelemetry_proto::tonic::resource::v1::Resource;
 use prost::Message;
 
@@ -41,6 +46,7 @@ pub enum ContentType {
 // performed by the decoder itself.
 pub const MAX_RESOURCE_SPANS: usize = 64;
 pub const MAX_RESOURCE_LOGS: usize = 64;
+pub const MAX_RESOURCE_METRICS: usize = 64;
 
 /// Enrich spans with sandbox resource attributes. Input can be protobuf or
 /// JSON-encoded `ExportTraceServiceRequest`. Output is always protobuf.
@@ -148,6 +154,101 @@ pub fn enrich_logs(
     Ok(request.encode_to_vec())
 }
 
+/// Enrich metrics with trusted sandbox resource attributes.
+pub fn enrich_metrics(
+    raw: &[u8],
+    content_type: ContentType,
+    attrs: &SandboxMetadata,
+    enrichment_enabled: bool,
+) -> Result<Vec<u8>, EnrichmentError> {
+    let mut request = match content_type {
+        ContentType::Protobuf => {
+            ExportMetricsServiceRequest::decode(raw).map_err(EnrichmentError::ProtobufDecode)?
+        }
+        ContentType::Json => serde_json::from_slice::<ExportMetricsServiceRequest>(raw)
+            .map_err(EnrichmentError::JsonDecode)?,
+    };
+
+    if request.resource_metrics.len() > MAX_RESOURCE_METRICS {
+        return Err(EnrichmentError::StructuralLimit {
+            structure: "resource metrics",
+            limit: MAX_RESOURCE_METRICS,
+            actual: request.resource_metrics.len(),
+        });
+    }
+
+    let extra_attrs = build_attributes(attrs, enrichment_enabled);
+    for resource_metrics in &mut request.resource_metrics {
+        let resource = resource_metrics
+            .resource
+            .get_or_insert_with(Resource::default);
+        strip_authoritative_attributes(&mut resource.attributes);
+        resource.attributes.extend(extra_attrs.iter().cloned());
+
+        for scope_metrics in &mut resource_metrics.scope_metrics {
+            if let Some(scope) = &mut scope_metrics.scope {
+                strip_authoritative_attributes(&mut scope.attributes);
+            }
+            for metric in &mut scope_metrics.metrics {
+                strip_authoritative_attributes(&mut metric.metadata);
+                match &mut metric.data {
+                    Some(metric::Data::Gauge(data)) => {
+                        strip_number_data_points(&mut data.data_points);
+                    }
+                    Some(metric::Data::Sum(data)) => {
+                        strip_number_data_points(&mut data.data_points);
+                    }
+                    Some(metric::Data::Histogram(data)) => {
+                        strip_histogram_data_points(&mut data.data_points);
+                    }
+                    Some(metric::Data::ExponentialHistogram(data)) => {
+                        strip_exponential_histogram_data_points(&mut data.data_points);
+                    }
+                    Some(metric::Data::Summary(data)) => {
+                        strip_summary_data_points(&mut data.data_points);
+                    }
+                    None => {}
+                }
+            }
+        }
+    }
+
+    Ok(request.encode_to_vec())
+}
+
+fn strip_number_data_points(points: &mut [NumberDataPoint]) {
+    for point in points {
+        strip_authoritative_attributes(&mut point.attributes);
+        strip_exemplars(&mut point.exemplars);
+    }
+}
+
+fn strip_histogram_data_points(points: &mut [HistogramDataPoint]) {
+    for point in points {
+        strip_authoritative_attributes(&mut point.attributes);
+        strip_exemplars(&mut point.exemplars);
+    }
+}
+
+fn strip_exponential_histogram_data_points(points: &mut [ExponentialHistogramDataPoint]) {
+    for point in points {
+        strip_authoritative_attributes(&mut point.attributes);
+        strip_exemplars(&mut point.exemplars);
+    }
+}
+
+fn strip_summary_data_points(points: &mut [SummaryDataPoint]) {
+    for point in points {
+        strip_authoritative_attributes(&mut point.attributes);
+    }
+}
+
+fn strip_exemplars(exemplars: &mut [Exemplar]) {
+    for exemplar in exemplars {
+        strip_authoritative_attributes(&mut exemplar.filtered_attributes);
+    }
+}
+
 fn strip_authoritative_attributes(attributes: &mut Vec<KeyValue>) {
     attributes.retain(|attribute| !AUTHORITATIVE_ATTRIBUTE_KEYS.contains(&attribute.key.as_str()));
 }
@@ -198,8 +299,12 @@ pub enum EnrichmentError {
 mod tests {
     use super::*;
     use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
+    use opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest;
     use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
     use opentelemetry_proto::tonic::logs::v1::{LogRecord, ResourceLogs, ScopeLogs};
+    use opentelemetry_proto::tonic::metrics::v1::{
+        Exemplar, Gauge, Metric, NumberDataPoint, ResourceMetrics, ScopeMetrics, metric,
+    };
     use opentelemetry_proto::tonic::trace::v1::{ResourceSpans, ScopeSpans, Span};
     use prost::Message;
 
@@ -278,6 +383,59 @@ mod tests {
                 .attributes
                 .iter()
                 .all(|attribute| attribute.key != "openshell.sandbox.id")
+        );
+    }
+
+    #[test]
+    fn metric_enrichment_adds_trusted_attributes_and_strips_spoofed_values() {
+        let spoofed = kv("openshell.sandbox.id", "spoofed");
+        let raw = ExportMetricsServiceRequest {
+            resource_metrics: vec![ResourceMetrics {
+                scope_metrics: vec![ScopeMetrics {
+                    metrics: vec![Metric {
+                        metadata: vec![spoofed.clone()],
+                        data: Some(metric::Data::Gauge(Gauge {
+                            data_points: vec![NumberDataPoint {
+                                attributes: vec![spoofed.clone()],
+                                exemplars: vec![Exemplar {
+                                    filtered_attributes: vec![spoofed],
+                                    ..Default::default()
+                                }],
+                                ..Default::default()
+                            }],
+                        })),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+        }
+        .encode_to_vec();
+
+        let result = enrich_metrics(&raw, ContentType::Protobuf, &test_metadata(), true).unwrap();
+        let decoded = ExportMetricsServiceRequest::decode(result.as_slice()).unwrap();
+        let resource_metrics = &decoded.resource_metrics[0];
+        let resource = resource_metrics.resource.as_ref().unwrap();
+        assert!(resource.attributes.iter().any(|attribute| {
+            attribute.key == "openshell.sandbox.id"
+                && attribute
+                    .value
+                    .as_ref()
+                    .and_then(|value| value.value.as_ref())
+                    == Some(&any_value::Value::StringValue("sb-123".to_string()))
+        }));
+
+        let metric = &resource_metrics.scope_metrics[0].metrics[0];
+        assert!(metric.metadata.is_empty());
+        let Some(metric::Data::Gauge(gauge)) = &metric.data else {
+            panic!("expected gauge")
+        };
+        assert!(gauge.data_points[0].attributes.is_empty());
+        assert!(
+            gauge.data_points[0].exemplars[0]
+                .filtered_attributes
+                .is_empty()
         );
     }
 
