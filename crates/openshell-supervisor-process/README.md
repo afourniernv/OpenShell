@@ -16,19 +16,18 @@ signal-specific endpoint to the reserved relay URL and its protocol to
 `http/protobuf` in the sandbox environment unless the caller already selected a generic or signal-specific
 endpoint. The values persist in the stored spec, so restarts inherit them.
 
-`192.0.0.8` is the RFC 7600 dummy address and is never routed. A workload
-connect to any non-loopback address is intercepted by the sandbox seccomp
-broker and staged for the supervisor as a `PendingTcpOpen`, so the address is
-a label the supervisor switches on. The proxy recognises it ahead of host
-mapping, policy, and SSRF validation and hands the staged stream to the OTLP
-receiver instead of dialing upstream. The receiver speaks HTTP/1.1 on that
-stream and accepts `POST /v1/traces`, `/v1/logs`, and `/v1/metrics` as protobuf or JSON. No socket is bound,
-the driver outer fence is untouched, and the isolation contract and boundary
-protocol are unchanged. Loopback cannot serve this purpose because the broker
-completes loopback connects locally without mediation.
+`127.0.0.8:4318` is reserved by the sandbox seccomp broker. A workload connect
+to that exact loopback address is staged for the supervisor as a
+`PendingTcpOpen` instead of completing locally, so the address is a label the
+supervisor switches on. The proxy recognises it ahead of host mapping, policy,
+and SSRF validation and hands the staged stream to the OTLP receiver instead of
+dialing upstream. The receiver speaks HTTP/1.1 on that stream and accepts
+`POST /v1/traces`, `/v1/logs`, and `/v1/metrics` as protobuf or JSON. No socket
+is bound, the driver outer fence is untouched, and the isolation contract and
+boundary protocol are unchanged.
 
 ```
-Agent process --> connect(192.0.0.8:4318) --> seccomp broker stages the open
+Agent process --> connect(127.0.0.8:4318) --> seccomp broker stages the open
   --> supervisor proxy, reserved destination --> OTLP receiver
   --> enrichment (openshell.sandbox.* resource attributes)
   --> bounded buffer (4096 items / 16 MiB, newest rejected when full)
