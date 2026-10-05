@@ -268,10 +268,28 @@ tests:
     set:
       server.otlp.endpoint: http://otel-collector.observability.svc:4317
       server.otlp.serviceName: production-gateway
+      server.otlp.sandboxRelayEnabled: true
     asserts:
       - matchRegex:
           path: data["gateway.toml"]
-          pattern: '(?ms)\[openshell\.gateway\.otlp\].*?endpoint\s*=\s*"http://otel-collector\.observability\.svc:4317".*?service_name\s*=\s*"production-gateway"'
+          pattern: '(?ms)\[openshell\.gateway\.otlp\].*?endpoint\s*=\s*"http://otel-collector\.observability\.svc:4317".*?sandbox_relay_enabled\s*=\s*true.*?service_name\s*=\s*"production-gateway"'
+
+  - it: keeps sandbox OTLP relay disabled unless explicitly enabled
+    template: templates/gateway-config.yaml
+    set:
+      server.otlp.endpoint: http://otel-collector.observability.svc:4317
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?m)^sandbox_relay_enabled\s*=\s*false$'
+
+  - it: rejects sandbox OTLP relay without a collector endpoint
+    template: templates/statefulset.yaml
+    set:
+      server.otlp.sandboxRelayEnabled: true
+    asserts:
+      - failedTemplate:
+          errorMessage: server.otlp.sandboxRelayEnabled requires server.otlp.endpoint
 
   - it: renders a separate agent-trace collector endpoint when configured
     template: templates/gateway-config.yaml

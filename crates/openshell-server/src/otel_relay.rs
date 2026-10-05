@@ -89,6 +89,10 @@ pub async fn try_create_exporter(
         debug!("no [openshell.gateway.otlp] section in config; OTEL relay disabled");
         return None;
     };
+    if !otlp.sandbox_relay_enabled {
+        debug!("sandbox OTEL relay is not enabled; relay exporter disabled");
+        return None;
+    }
     // Agent traces ride their own lane: `agent_endpoint` when the operator
     // split the collectors, otherwise the shared infrastructure endpoint.
     let endpoint = otlp.agent_lane_endpoint();
@@ -115,6 +119,19 @@ pub async fn try_create_exporter(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn gateway_otlp_does_not_enable_sandbox_relay_implicitly() {
+        let mut config = crate::config_file::ConfigFile::default();
+        config.openshell.gateway.otlp = Some(crate::config_file::OtlpConfig {
+            endpoint: "http://127.0.0.1:4317".to_string(),
+            service_name: None,
+            agent_endpoint: None,
+            sandbox_relay_enabled: false,
+        });
+
+        assert!(try_create_exporter(Some(&config)).await.is_none());
+    }
 
     #[tokio::test]
     async fn connect_rejects_invalid_endpoint_uri() {

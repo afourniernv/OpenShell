@@ -221,9 +221,16 @@ impl RelayLifecycle {
 
     /// Stop accepting, close connections (bounded by
     /// [`RECEIVER_SHUTDOWN_TIMEOUT`]), then push everything still buffered into
-    /// `tx`. Ends in [`RelayLifecycle::Stopped`]. Uses the non-blocking
-    /// `drain()` so a straggling connection task cannot stall the flush.
-    pub async fn stop_and_drain(&mut self, sandbox_id: &str, tx: &mpsc::Sender<SupervisorMessage>) {
+    /// `tx` only when the current session negotiated export. Ends in
+    /// [`RelayLifecycle::Stopped`]. Uses the non-blocking `drain()` so a
+    /// straggling connection task cannot stall the flush. A declined
+    /// capability drops final buffered items rather than bypassing negotiation.
+    pub async fn stop_and_drain(
+        &mut self,
+        sandbox_id: &str,
+        tx: &mpsc::Sender<SupervisorMessage>,
+        forwarding_confirmed: bool,
+    ) {
         let Self::Running {
             receiver,
             mut buffer,
@@ -237,11 +244,13 @@ impl RelayLifecycle {
         let items = buffer.drain();
         let buffered = items.len();
         let mut forwarded = 0usize;
-        for item in items {
-            if tx.send(export_message(sandbox_id, item)).await.is_err() {
-                break;
+        if forwarding_confirmed {
+            for item in items {
+                if tx.send(export_message(sandbox_id, item)).await.is_err() {
+                    break;
+                }
+                forwarded += 1;
             }
-            forwarded += 1;
         }
         info!(
             buffered,
@@ -335,7 +344,7 @@ mod tests {
         assert!(pended.is_err(), "a stopped relay must pend, not yield");
 
         let (tx, mut rx) = mpsc::channel(8);
-        relay.stop_and_drain("sb-test", &tx).await;
+        relay.stop_and_drain("sb-test", &tx, false).await;
         assert!(matches!(relay, RelayLifecycle::Stopped));
         assert!(rx.try_recv().is_err(), "nothing to drain");
     }
@@ -370,7 +379,7 @@ mod tests {
         assert!(status.contains("200"), "unexpected status: {status}");
         assert_eq!(relay.buffer_metrics().unwrap().depth(), 1);
 
-        relay.stop_and_drain("sb-test", &tx).await;
+        relay.stop_and_drain("sb-test", &tx, true).await;
         assert!(matches!(relay, RelayLifecycle::Stopped));
         assert!(
             server.try_reserve().is_none(),
@@ -387,5 +396,33 @@ mod tests {
             Some(otel_export_data::Signal::TraceData(_))
         ));
         assert!(rx.try_recv().is_err(), "no further messages expected");
+    }
+
+    #[tokio::test]
+    async fn stop_and_drain_drops_items_without_confirmed_capability() {
+        let (server, mut relay) = start(&small_config(), metadata());
+        let (tx, mut rx) = mpsc::channel(8);
+
+        let mut client = connect(&server);
+        let status = send(
+            &mut client,
+            &request(
+                "POST",
+                "/v1/traces",
+                "application/x-protobuf",
+                &sample_trace_body(),
+            ),
+        )
+        .await;
+        assert!(status.contains("200"), "unexpected status: {status}");
+        assert_eq!(relay.buffer_metrics().unwrap().depth(), 1);
+
+        relay.stop_and_drain("sb-test", &tx, false).await;
+
+        assert!(matches!(relay, RelayLifecycle::Stopped));
+        assert!(
+            rx.try_recv().is_err(),
+            "declined capability must not be bypassed by final drain"
+        );
     }
 }
