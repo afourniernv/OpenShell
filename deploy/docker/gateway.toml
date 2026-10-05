@@ -60,6 +60,9 @@ app_armor_profile = "Unconfined"
 # [openshell.gateway.otlp]
 # endpoint      = "http://host.docker.internal:4317"
 # service_name  = "openshell-gateway-dev"
-# Optional separate collector for relayed agent traces; omit to send agent
-# traces to `endpoint`.
+# Sandbox relay defaults to traces. Add "logs" and "metrics" only after a
+# coordinated gateway and supervisor upgrade.
+# agent_signals = ["traces"]
+# Optional separate collector for relayed agent telemetry; omit to send agent
+# signals to `endpoint`.
 # agent_endpoint = "http://host.docker.internal:4319"

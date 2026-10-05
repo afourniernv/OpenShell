@@ -931,15 +931,13 @@ pub async fn run_sandbox(
         &openshell_supervisor_process::otlp::RelayConfig::default(),
         openshell_supervisor_process::otlp::SandboxMetadata {
             sandbox_id: sandbox_id.clone().unwrap_or_default(),
-            workspace_id: workspace_rx.borrow().clone(),
-            policy: sandbox_name_for_agg.clone().unwrap_or_default(),
-            user: workload_uid.to_string(),
+            sandbox_name: sandbox_name_for_agg.clone().unwrap_or_default(),
+            workspace_name: workspace_rx.clone(),
+            workload_unix_uid: workload_uid,
             // Only the Podman driver sets this today; the OCSF context reads
             // the same variable and shares the gap.
-            image: std::env::var("OPENSHELL_CONTAINER_IMAGE").unwrap_or_default(),
-            // The backend-neutral runtime descriptor no longer names the
-            // compute driver; empty until the gateway injects it.
-            driver: String::new(),
+            workload_image_reference: std::env::var("OPENSHELL_CONTAINER_IMAGE")
+                .unwrap_or_default(),
         },
     );
     let otlp_destination = otlp_relay::reserved_destination(otlp_server);

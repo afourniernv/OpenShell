@@ -11,8 +11,10 @@
 //! selection — it has no protocol awareness of the bytes flowing through.
 
 use std::net::IpAddr;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use openshell_core::proto::open_shell_client::OpenShellClient;
@@ -35,13 +37,53 @@ use tracing::{debug, info, warn};
 use openshell_core::grpc_client;
 use openshell_core::transport_errors::is_expected_transport_close_status;
 
-use crate::otlp::{RelayLifecycle, export_message};
+use crate::otlp::buffer::TelemetryItem;
+use crate::otlp::{RelayLifecycle, export_message, try_send_export};
 
 const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
+const CONTROL_OUTBOUND_CAPACITY: usize = 64;
+const TELEMETRY_OUTBOUND_CAPACITY: usize = 1;
 
-/// Capability name under which the supervisor offers OTLP relaying.
-const OTEL_EXPORT_CAPABILITY: &str = "otel_export";
+/// Merge independent control and telemetry queues while always polling control
+/// first. A slow gRPC transport can retain at most one queued telemetry frame,
+/// and heartbeats or relay results never sit behind a telemetry FIFO.
+struct SupervisorOutboundStream {
+    control: mpsc::Receiver<SupervisorMessage>,
+    telemetry: mpsc::Receiver<SupervisorMessage>,
+}
+
+impl SupervisorOutboundStream {
+    const fn new(
+        control: mpsc::Receiver<SupervisorMessage>,
+        telemetry: mpsc::Receiver<SupervisorMessage>,
+    ) -> Self {
+        Self { control, telemetry }
+    }
+}
+
+impl tokio_stream::Stream for SupervisorOutboundStream {
+    type Item = SupervisorMessage;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        let control_closed = match this.control.poll_recv(cx) {
+            Poll::Ready(Some(message)) => return Poll::Ready(Some(message)),
+            Poll::Ready(None) => true,
+            Poll::Pending => false,
+        };
+        let telemetry_closed = match this.telemetry.poll_recv(cx) {
+            Poll::Ready(Some(message)) => return Poll::Ready(Some(message)),
+            Poll::Ready(None) => true,
+            Poll::Pending => false,
+        };
+        if control_closed && telemetry_closed {
+            Poll::Ready(None)
+        } else {
+            Poll::Pending
+        }
+    }
+}
 
 /// Final-drain request: the session acks on this sender once the OTLP
 /// receiver is stopped and the buffer is flushed onto the session stream.
@@ -72,20 +114,58 @@ pub struct SessionRuntimeContext {
 /// Capabilities the supervisor advertises in `SupervisorHello`.
 fn advertised_capabilities(relay_running: bool) -> Vec<String> {
     if relay_running {
-        vec![OTEL_EXPORT_CAPABILITY.to_string()]
+        vec![
+            openshell_core::proto::OTEL_EXPORT_TRACES_CAPABILITY.to_string(),
+            openshell_core::proto::OTEL_EXPORT_TRACES_V1_CAPABILITY.to_string(),
+            openshell_core::proto::OTEL_EXPORT_LOGS_V1_CAPABILITY.to_string(),
+            openshell_core::proto::OTEL_EXPORT_METRICS_V1_CAPABILITY.to_string(),
+        ]
     } else {
         Vec::new()
     }
 }
 
-/// Whether buffered telemetry may be forwarded on this session: the relay
-/// must be running and the gateway must have confirmed `otel_export`.
-fn otel_forwarding_active(relay_running: bool, accepted: &SessionAccepted) -> bool {
-    relay_running
-        && accepted
-            .capabilities
-            .iter()
-            .any(|capability| capability == OTEL_EXPORT_CAPABILITY)
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct OtelForwardingCapabilities {
+    traces: bool,
+    logs: bool,
+    metrics: bool,
+}
+
+impl OtelForwardingCapabilities {
+    fn negotiated(relay_running: bool, accepted: &SessionAccepted) -> Self {
+        if !relay_running {
+            return Self::default();
+        }
+        let has = |expected: &str| {
+            accepted
+                .capabilities
+                .iter()
+                .any(|capability| capability == expected)
+        };
+        Self {
+            traces: has(openshell_core::proto::OTEL_EXPORT_TRACES_V1_CAPABILITY)
+                || has(openshell_core::proto::OTEL_EXPORT_TRACES_CAPABILITY),
+            logs: has(openshell_core::proto::OTEL_EXPORT_LOGS_V1_CAPABILITY),
+            metrics: has(openshell_core::proto::OTEL_EXPORT_METRICS_V1_CAPABILITY),
+        }
+    }
+
+    const fn any(self) -> bool {
+        self.traces || self.logs || self.metrics
+    }
+
+    const fn allows(self, item: &TelemetryItem) -> bool {
+        match item {
+            TelemetryItem::Trace(_) => self.traces,
+            TelemetryItem::Logs(_) => self.logs,
+            TelemetryItem::Metrics(_) => self.metrics,
+            // OCSF rides the same OtelExportData envelope rather than an
+            // OTLP signal field. Any versioned export capability proves that
+            // the gateway understands that envelope.
+            TelemetryItem::Ocsf(_) => self.any(),
+        }
+    }
 }
 
 /// Parse a gRPC endpoint URI into an OCSF `Endpoint` (host + port). Falls back
@@ -459,23 +539,28 @@ async fn run_single_session(
         .map_err(|e| format!("connect failed: {e}"))?;
     let mut client = OpenShellClient::new(channel.clone());
 
-    // Create the outbound message stream.
-    let (tx, rx) = mpsc::channel::<SupervisorMessage>(64);
-    let outbound = tokio_stream::wrappers::ReceiverStream::new(rx);
+    // Keep control and telemetry on independent queues. The outbound stream
+    // polls control first, while the one-frame telemetry queue preserves the
+    // bounded relay budget after an item leaves the primary buffer.
+    let (control_tx, control_rx) = mpsc::channel::<SupervisorMessage>(CONTROL_OUTBOUND_CAPACITY);
+    let (telemetry_tx, telemetry_rx) =
+        mpsc::channel::<SupervisorMessage>(TELEMETRY_OUTBOUND_CAPACITY);
+    let outbound = SupervisorOutboundStream::new(control_rx, telemetry_rx);
 
     // Send hello as the first message.
-    tx.send(SupervisorMessage {
-        payload: Some(supervisor_message::Payload::Hello(SupervisorHello {
-            sandbox_id: config.sandbox_id.clone(),
-            instance_id: config.instance_id.clone(),
-            connection_epoch,
-            // The gateway confirms only capabilities it can serve.
-            capabilities: advertised_capabilities(relay.is_running()),
-            supports_provider_readiness: true,
-        })),
-    })
-    .await
-    .map_err(|_| "failed to queue hello")?;
+    control_tx
+        .send(SupervisorMessage {
+            payload: Some(supervisor_message::Payload::Hello(SupervisorHello {
+                sandbox_id: config.sandbox_id.clone(),
+                instance_id: config.instance_id.clone(),
+                connection_epoch,
+                // The gateway confirms only capabilities it can serve.
+                capabilities: advertised_capabilities(relay.is_running()),
+                supports_provider_readiness: true,
+            })),
+        })
+        .await
+        .map_err(|_| "failed to queue hello")?;
 
     // Open the bidirectional stream.
     let response = client
@@ -501,9 +586,15 @@ async fn run_single_session(
     // Forwarding is gated per session on the negotiated capability. The
     // receiver keeps serving either way; a declining session just leaves
     // items in the bounded buffer until a later session confirms.
-    let mut otel_active = otel_forwarding_active(relay.is_running(), &accepted);
-    if otel_active {
-        info!("gateway confirmed otel_export capability; OTLP forwarding active");
+    let mut otel_capabilities =
+        OtelForwardingCapabilities::negotiated(relay.is_running(), &accepted);
+    if otel_capabilities.any() {
+        info!(
+            traces = otel_capabilities.traces,
+            logs = otel_capabilities.logs,
+            metrics = otel_capabilities.metrics,
+            "gateway confirmed OTLP export capabilities; forwarding active"
+        );
     } else if relay.is_running() {
         debug!("gateway did not confirm otel_export; OTLP forwarding paused for this session");
     }
@@ -532,16 +623,25 @@ async fn run_single_session(
 
     loop {
         tokio::select! {
-            item = relay.next_item(), if otel_active => {
+            item = relay.next_item(), if otel_capabilities.any() => {
                 match item {
                     Some(item) => {
+                        if !otel_capabilities.allows(&item) {
+                            relay.record_session_drop();
+                            debug!("OTEL relay: signal not confirmed by gateway, dropping message");
+                            continue;
+                        }
                         // Non-blocking on purpose: telemetry must never stall
-                        // control traffic on the shared outbound channel.
-                        if tx.try_send(export_message(&config.sandbox_id, item)).is_err() {
-                            debug!("OTEL relay: session channel full or closed, dropping message");
+                        // the independently queued control plane.
+                        if !try_send_export(
+                            &telemetry_tx,
+                            export_message(&config.sandbox_id, item),
+                        ) {
+                            relay.record_session_drop();
+                            debug!("OTEL relay: telemetry session queue is full or closed, dropping message");
                         }
                     }
-                    None => otel_active = false,
+                    None => otel_capabilities = OtelForwardingCapabilities::default(),
                 }
             }
             request = async {
@@ -552,9 +652,14 @@ async fn run_single_session(
             } => {
                 // A completed oneshot must not be polled again.
                 *drain_rx = None;
-                otel_active = false;
+                let drain_capabilities = otel_capabilities;
+                otel_capabilities = OtelForwardingCapabilities::default();
                 if let Ok(done_tx) = request {
-                    relay.stop_and_drain(&config.sandbox_id, &tx).await;
+                    relay
+                        .stop_and_drain(&config.sandbox_id, &telemetry_tx, |item| {
+                            drain_capabilities.allows(item)
+                        })
+                        .await;
                     let _ = done_tx.send(());
                 }
                 // Keep the session up: heartbeats and relays must continue
@@ -575,7 +680,7 @@ async fn run_single_session(
                     port_forward: &config.port_forward,
                     expected_ssh_peer_pid: config.expected_ssh_peer_pid,
                     channel: &channel,
-                    tx: &tx,
+                    tx: &control_tx,
                     terminating: &config.terminating,
                 };
                 handle_gateway_message(
@@ -589,7 +694,7 @@ async fn run_single_session(
                         SupervisorHeartbeat {},
                     )),
                 };
-                if tx.send(hb).await.is_err() {
+                if control_tx.send(hb).await.is_err() {
                     return Err("outbound channel closed".into());
                 }
             }
@@ -972,32 +1077,100 @@ mod telemetry_tests {
         }
     }
 
+    #[tokio::test]
+    async fn outbound_stream_prioritizes_control_over_queued_telemetry() {
+        let (control_tx, control_rx) = mpsc::channel(2);
+        let (telemetry_tx, telemetry_rx) = mpsc::channel(1);
+        telemetry_tx
+            .send(export_message("sb-test", TelemetryItem::Trace(vec![1])))
+            .await
+            .unwrap();
+        control_tx
+            .send(SupervisorMessage {
+                payload: Some(supervisor_message::Payload::Heartbeat(
+                    SupervisorHeartbeat {},
+                )),
+            })
+            .await
+            .unwrap();
+
+        let mut outbound = SupervisorOutboundStream::new(control_rx, telemetry_rx);
+        assert!(matches!(
+            outbound.next().await.and_then(|message| message.payload),
+            Some(supervisor_message::Payload::Heartbeat(_))
+        ));
+        assert!(matches!(
+            outbound.next().await.and_then(|message| message.payload),
+            Some(supervisor_message::Payload::OtelExport(_))
+        ));
+    }
+
     #[test]
-    fn otel_export_is_advertised_only_with_a_running_relay() {
+    fn each_otel_signal_is_advertised_only_with_a_running_relay() {
         assert_eq!(
             advertised_capabilities(true),
-            vec!["otel_export".to_string()]
+            vec![
+                "otel_export".to_string(),
+                "otel_export_traces_v1".to_string(),
+                "otel_export_logs_v1".to_string(),
+                "otel_export_metrics_v1".to_string(),
+            ]
         );
         assert!(advertised_capabilities(false).is_empty());
     }
 
     #[test]
-    fn forwarding_requires_both_a_running_relay_and_gateway_confirmation() {
-        assert!(otel_forwarding_active(
+    fn old_gateway_confirmation_enables_only_legacy_traces() {
+        let negotiated =
+            OtelForwardingCapabilities::negotiated(true, &accepted_with(&["otel_export"]));
+        assert!(negotiated.allows(&TelemetryItem::Trace(vec![])));
+        assert!(negotiated.allows(&TelemetryItem::Ocsf(vec![])));
+        assert!(!negotiated.allows(&TelemetryItem::Logs(vec![])));
+        assert!(!negotiated.allows(&TelemetryItem::Metrics(vec![])));
+    }
+
+    #[test]
+    fn new_gateway_confirmation_enables_each_negotiated_signal() {
+        let negotiated = OtelForwardingCapabilities::negotiated(
             true,
-            &accepted_with(&["otel_export"])
-        ));
-        assert!(
-            !otel_forwarding_active(true, &accepted_with(&[])),
-            "a declining gateway pauses forwarding"
+            &accepted_with(&[
+                "otel_export_traces_v1",
+                "otel_export_logs_v1",
+                "otel_export_metrics_v1",
+            ]),
         );
+        assert!(negotiated.allows(&TelemetryItem::Trace(vec![])));
+        assert!(negotiated.allows(&TelemetryItem::Logs(vec![])));
+        assert!(negotiated.allows(&TelemetryItem::Metrics(vec![])));
+    }
+
+    #[test]
+    fn any_negotiated_export_signal_also_allows_ocsf_envelopes() {
+        for capability in [
+            "otel_export",
+            "otel_export_traces_v1",
+            "otel_export_logs_v1",
+            "otel_export_metrics_v1",
+        ] {
+            let negotiated =
+                OtelForwardingCapabilities::negotiated(true, &accepted_with(&[capability]));
+            assert!(negotiated.allows(&TelemetryItem::Ocsf(vec![])));
+        }
+    }
+
+    #[test]
+    fn stopped_or_declined_relay_forwards_nothing() {
+        assert!(!OtelForwardingCapabilities::negotiated(true, &accepted_with(&[])).any());
         assert!(
-            !otel_forwarding_active(false, &accepted_with(&["otel_export"])),
-            "a stopped relay never forwards, whatever the gateway says"
-        );
-        assert!(
-            !otel_forwarding_active(true, &accepted_with(&["metrics_export"])),
-            "only the exact capability name counts"
+            !OtelForwardingCapabilities::negotiated(
+                false,
+                &accepted_with(&[
+                    "otel_export_traces_v1",
+                    "otel_export_logs_v1",
+                    "otel_export_metrics_v1",
+                ]),
+            )
+            .any()
         );
     }
 }

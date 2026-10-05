@@ -445,7 +445,8 @@ discovery endpoint or its TLS CA.
 | server.oidc.rolesClaim | string | `""` | Dot-separated path to the roles array in the JWT claims. Keycloak: "realm_access.roles", Entra ID: "roles", Okta: "groups". |
 | server.oidc.scopesClaim | string | `""` | Dot-separated path to the scopes array in the JWT claims. |
 | server.oidc.userRole | string | `""` | Role name for standard user access. |
-| server.otlp.agentEndpoint | string | `""` | Separate OTLP/gRPC collector endpoint for relayed agent traces. Empty sends agent traces to `endpoint`. |
+| server.otlp.agentEndpoint | string | `""` | Separate OTLP/gRPC collector endpoint for relayed agent telemetry. Empty sends agent signals to `endpoint`. |
+| server.otlp.agentSignals | list | `["traces"]` | Agent signals relayed from sandboxes. Traces are enabled by default. The chart omits the trace-only default for compatibility with older gateways; add logs and metrics only when gateway and supervisor are upgraded together. |
 | server.otlp.endpoint | string | `""` | OTLP/gRPC collector endpoint, conventionally using port 4317. |
 | server.otlp.serviceName | string | `""` | Gateway OpenTelemetry service name. Empty uses openshell-gateway. |
 | server.policyValidationFailureMode | string | `"fail_closed"` | Posture when a candidate sandbox policy fails validation. `fail_closed` deactivates the previous policy; `retain_last_valid` keeps it active. |

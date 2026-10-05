@@ -15,6 +15,12 @@ One value is intentionally NOT rendered here:
 {{- $credentialDrivers := list -}}
 {{- $otlp := .Values.server.otlp | default dict -}}
 {{- $ocsfLog := .Values.server.ocsfLog | default dict -}}
+{{- $agentSignals := $otlp.agentSignals | default (list) -}}
+{{- range $signal := $agentSignals -}}
+{{- if not (has $signal (list "traces" "logs" "metrics")) -}}
+{{- fail (printf "server.otlp.agentSignals value %q must be one of: traces, logs, metrics" $signal) -}}
+{{- end -}}
+{{- end -}}
 {{- if .Values.server.credentialDrivers.kubernetesSecrets.enabled -}}
 {{- $credentialDrivers = append $credentialDrivers "kubernetes-secrets" -}}
 {{- end -}}
@@ -89,6 +95,9 @@ data:
     {{- end }}
     {{- if $otlp.agentEndpoint }}
     agent_endpoint = {{ $otlp.agentEndpoint | quote }}
+    {{- end }}
+    {{- if and (hasKey $otlp "agentSignals") (or (eq (len $agentSignals) 0) (has "logs" $agentSignals) (has "metrics" $agentSignals)) }}
+    agent_signals = [{{- range $index, $signal := $agentSignals }}{{ if $index }}, {{ end }}{{ $signal | quote }}{{- end }}]
     {{- end }}
     {{- end }}
 

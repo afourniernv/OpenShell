@@ -291,6 +291,24 @@ pub const OTEL_EXPORTER_OTLP_TRACES_ENDPOINT: &str = "OTEL_EXPORTER_OTLP_TRACES_
 /// A caller-selected `http/protobuf` or `http/json` value is retained.
 pub const OTEL_EXPORTER_OTLP_TRACES_PROTOCOL: &str = "OTEL_EXPORTER_OTLP_TRACES_PROTOCOL";
 
+/// Standard OpenTelemetry environment variable for the logs OTLP endpoint.
+pub const OTEL_EXPORTER_OTLP_LOGS_ENDPOINT: &str = "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT";
+
+/// Standard OpenTelemetry environment variable for the logs OTLP protocol.
+///
+/// Defaults to `http/protobuf` alongside [`OTEL_EXPORTER_OTLP_LOGS_ENDPOINT`].
+/// A caller-selected `http/protobuf` or `http/json` value is retained.
+pub const OTEL_EXPORTER_OTLP_LOGS_PROTOCOL: &str = "OTEL_EXPORTER_OTLP_LOGS_PROTOCOL";
+
+/// Standard OpenTelemetry environment variable for the metrics OTLP endpoint.
+pub const OTEL_EXPORTER_OTLP_METRICS_ENDPOINT: &str = "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT";
+
+/// Standard OpenTelemetry environment variable for the metrics OTLP protocol.
+///
+/// Defaults to `http/protobuf` alongside [`OTEL_EXPORTER_OTLP_METRICS_ENDPOINT`].
+/// A caller-selected `http/protobuf` or `http/json` value is retained.
+pub const OTEL_EXPORTER_OTLP_METRICS_PROTOCOL: &str = "OTEL_EXPORTER_OTLP_METRICS_PROTOCOL";
+
 /// Reserved destination agent processes export OTLP to.
 ///
 /// This address is never routed. A workload `connect()` to any non-loopback
@@ -314,6 +332,12 @@ pub const OTLP_RELAY_ENDPOINT: &str = "http://192.0.0.8:4318";
 /// therefore include `/v1/traces`.
 pub const OTLP_RELAY_TRACES_ENDPOINT: &str = "http://192.0.0.8:4318/v1/traces";
 
+/// Log ingestion URL injected through [`OTEL_EXPORTER_OTLP_LOGS_ENDPOINT`].
+pub const OTLP_RELAY_LOGS_ENDPOINT: &str = "http://192.0.0.8:4318/v1/logs";
+
+/// Metric ingestion URL injected through [`OTEL_EXPORTER_OTLP_METRICS_ENDPOINT`].
+pub const OTLP_RELAY_METRICS_ENDPOINT: &str = "http://192.0.0.8:4318/v1/metrics";
+
 // The corporate upstream-proxy configuration deliberately has no reserved
 // environment variables: it travels on the supervisor's argv
 // (`--upstream-proxy` and friends), which a sandbox image cannot forge the
@@ -323,7 +347,10 @@ pub const OTLP_RELAY_TRACES_ENDPOINT: &str = "http://192.0.0.8:4318/v1/traces";
 mod otlp_relay_address_tests {
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
-    use super::{OTLP_RELAY_ADDR, OTLP_RELAY_ENDPOINT, OTLP_RELAY_TRACES_ENDPOINT};
+    use super::{
+        OTLP_RELAY_ADDR, OTLP_RELAY_ENDPOINT, OTLP_RELAY_LOGS_ENDPOINT,
+        OTLP_RELAY_METRICS_ENDPOINT, OTLP_RELAY_TRACES_ENDPOINT,
+    };
 
     #[test]
     fn relay_address_is_an_unroutable_non_loopback_label() {
@@ -346,6 +373,14 @@ mod otlp_relay_address_tests {
         assert_eq!(
             OTLP_RELAY_TRACES_ENDPOINT,
             format!("{OTLP_RELAY_ENDPOINT}/v1/traces")
+        );
+        assert_eq!(
+            OTLP_RELAY_LOGS_ENDPOINT,
+            format!("{OTLP_RELAY_ENDPOINT}/v1/logs")
+        );
+        assert_eq!(
+            OTLP_RELAY_METRICS_ENDPOINT,
+            format!("{OTLP_RELAY_ENDPOINT}/v1/metrics")
         );
     }
 }

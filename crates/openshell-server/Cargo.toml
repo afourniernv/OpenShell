@@ -57,6 +57,7 @@ http-body-util = { workspace = true }
 tokio-rustls = { workspace = true }
 rustls = { workspace = true }
 rustls-pemfile = { workspace = true }
+webpki-roots = { workspace = true }
 
 # CLI
 clap = { workspace = true }

@@ -1993,6 +1993,7 @@ async fn establish_supervisor_session(
 
     // Step 3: Determine confirmed capabilities.
     let confirmed_capabilities = confirm_capabilities(&hello.capabilities, &state);
+    let confirmed_otel = ConfirmedOtelCapabilities::from_confirmed(&confirmed_capabilities);
 
     // Step 4: Send SessionAccepted.
     let accepted = GatewayMessage {
@@ -2060,10 +2061,13 @@ async fn establish_supervisor_session(
         let _session_lifetime = session_lifetime;
         let mut owner_guard = owner_guard;
         run_session_loop(
-            &state_clone,
-            &sandbox_id_clone,
-            &session_id,
-            &tx,
+            SessionLoopContext {
+                state: &state_clone,
+                sandbox_id: &sandbox_id_clone,
+                session_id: &session_id,
+                tx: &tx,
+                confirmed_otel,
+            },
             &mut inbound,
             shutdown_rx,
             &mut owner_guard,
@@ -2179,15 +2183,27 @@ pub async fn handle_finalize_main_process_exit(
     ))
 }
 
+struct SessionLoopContext<'a> {
+    state: &'a Arc<ServerState>,
+    sandbox_id: &'a str,
+    session_id: &'a str,
+    tx: &'a mpsc::Sender<GatewayMessage>,
+    confirmed_otel: ConfirmedOtelCapabilities,
+}
+
 async fn run_session_loop(
-    state: &Arc<ServerState>,
-    sandbox_id: &str,
-    session_id: &str,
-    tx: &mpsc::Sender<GatewayMessage>,
+    context: SessionLoopContext<'_>,
     inbound: &mut tonic::Streaming<SupervisorMessage>,
     mut shutdown_rx: oneshot::Receiver<()>,
     owner_guard: &mut OwnerGuard,
 ) {
+    let SessionLoopContext {
+        state,
+        sandbox_id,
+        session_id,
+        tx,
+        confirmed_otel,
+    } = context;
     let mut gateway_shutdown = state.supervisor_sessions.shutdown.subscribe();
     let heartbeat_interval = Duration::from_secs(u64::from(HEARTBEAT_INTERVAL_SECS));
     let mut heartbeat_timer = tokio::time::interval(heartbeat_interval);
@@ -2207,7 +2223,14 @@ async fn run_session_loop(
             msg = inbound.message() => {
                 match msg {
                     Ok(Some(msg)) => {
-                        if !handle_supervisor_message(state, sandbox_id, session_id, msg, owner_guard).await {
+                        if !handle_supervisor_message(
+                            state,
+                            sandbox_id,
+                            session_id,
+                            msg,
+                            owner_guard,
+                            confirmed_otel,
+                        ).await {
                             break;
                         }
                     }
@@ -2258,6 +2281,7 @@ async fn handle_supervisor_message(
     session_id: &str,
     msg: SupervisorMessage,
     owner_guard: &mut OwnerGuard,
+    confirmed_otel: ConfirmedOtelCapabilities,
 ) -> bool {
     match msg.payload {
         Some(supervisor_message::Payload::Heartbeat(_)) => {
@@ -2344,7 +2368,7 @@ async fn handle_supervisor_message(
             );
         }
         Some(supervisor_message::Payload::OtelExport(otel_data)) => {
-            handle_otel_export(state, sandbox_id, session_id, otel_data);
+            handle_otel_export(state, sandbox_id, session_id, confirmed_otel, otel_data);
         }
         _ => {
             debug!(
@@ -2357,9 +2381,39 @@ async fn handle_supervisor_message(
     true
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct ConfirmedOtelCapabilities {
+    traces_v1: bool,
+    logs_v1: bool,
+    metrics_v1: bool,
+}
+
+impl ConfirmedOtelCapabilities {
+    fn from_confirmed(confirmed: &[String]) -> Self {
+        let has = |expected: &str| confirmed.iter().any(|capability| capability == expected);
+        Self {
+            traces_v1: has(openshell_core::proto::OTEL_EXPORT_TRACES_V1_CAPABILITY),
+            logs_v1: has(openshell_core::proto::OTEL_EXPORT_LOGS_V1_CAPABILITY),
+            metrics_v1: has(openshell_core::proto::OTEL_EXPORT_METRICS_V1_CAPABILITY),
+        }
+    }
+
+    const fn any(self) -> bool {
+        self.traces_v1 || self.logs_v1 || self.metrics_v1
+    }
+}
+
 /// Check which advertised capabilities the gateway can confirm.
 fn confirm_capabilities(advertised: &[String], state: &Arc<ServerState>) -> Vec<String> {
-    let confirmed = select_confirmed_capabilities(advertised, state.otel_relay_exporter.is_some());
+    let confirmed = select_confirmed_capabilities(
+        advertised,
+        state
+            .otel_relay_exporter
+            .as_ref()
+            .map_or_else(crate::otel_relay::RelaySignals::none, |exporter| {
+                exporter.enabled_signals()
+            }),
+    );
     if !confirmed.is_empty() {
         info!(capabilities = ?confirmed, "confirmed supervisor capabilities");
     }
@@ -2367,21 +2421,36 @@ fn confirm_capabilities(advertised: &[String], state: &Arc<ServerState>) -> Vec<
 }
 
 /// Keep each advertised capability the gateway can actually serve and drop
-/// the rest. `otel_relay_enabled` reflects whether `[openshell.gateway.otlp]`
-/// produced a relay exporter at startup.
-fn select_confirmed_capabilities(advertised: &[String], otel_relay_enabled: bool) -> Vec<String> {
+/// the rest. `relay_signals` reflects the active relay exporter's signal
+/// allowlist; an all-false value means no relay exporter is available.
+fn select_confirmed_capabilities(
+    advertised: &[String],
+    relay_signals: impl Into<crate::otel_relay::RelaySignals>,
+) -> Vec<String> {
+    let relay_signals = relay_signals.into();
     let mut confirmed = Vec::new();
     for cap in advertised {
         match cap.as_str() {
-            "otel_export" if otel_relay_enabled => {
+            openshell_core::proto::OTEL_EXPORT_TRACES_V1_CAPABILITY if relay_signals.traces() => {
                 confirmed.push(cap.clone());
             }
-            "otel_export" => {
+            openshell_core::proto::OTEL_EXPORT_LOGS_V1_CAPABILITY if relay_signals.logs() => {
+                confirmed.push(cap.clone());
+            }
+            openshell_core::proto::OTEL_EXPORT_METRICS_V1_CAPABILITY if relay_signals.metrics() => {
+                confirmed.push(cap.clone());
+            }
+            openshell_core::proto::OTEL_EXPORT_TRACES_CAPABILITY => {
                 debug!(
-                    capability = "otel_export",
-                    "supervisor advertised otel_export but gateway has no \
-                     [openshell.gateway.otlp] config; capability not confirmed"
+                    capability = %cap,
+                    "legacy trace relay lacks trusted-attribute sanitization; capability not confirmed"
                 );
+            }
+            openshell_core::proto::OTEL_EXPORT_TRACES_V1_CAPABILITY
+            | openshell_core::proto::OTEL_EXPORT_LOGS_V1_CAPABILITY
+            | openshell_core::proto::OTEL_EXPORT_METRICS_V1_CAPABILITY => {
+                let diagnostic = otlp_capability_rejection_diagnostic(relay_signals);
+                debug!(capability = %cap, "{diagnostic}");
             }
             other => {
                 debug!(capability = %other, "ignoring unknown supervisor capability");
@@ -2389,6 +2458,18 @@ fn select_confirmed_capabilities(advertised: &[String], otel_relay_enabled: bool
         }
     }
     confirmed
+}
+
+fn otlp_capability_rejection_diagnostic(
+    relay_signals: crate::otel_relay::RelaySignals,
+) -> &'static str {
+    if relay_signals.any() {
+        "supervisor advertised OTLP export for a signal disabled in \
+         [openshell.gateway.otlp].agent_signals; capability not confirmed"
+    } else {
+        "supervisor advertised OTLP export but gateway has no active OTLP relay; \
+         capability not confirmed"
+    }
 }
 
 /// Upper bound on a single relayed OCSF event; larger events are skipped.
@@ -2416,43 +2497,71 @@ fn relayable_ocsf_event(event: &[u8]) -> Result<&str, OcsfEventRejection> {
     Ok(json_str)
 }
 
-/// Handle incoming OTEL export data from the supervisor: forward trace data to
-/// the configured OTLP collector and dispatch OCSF events to the log sink.
+/// Handle incoming OTEL export data from the supervisor: forward OTLP signals
+/// to the configured collector and dispatch OCSF events to the log sink.
 fn handle_otel_export(
     state: &Arc<ServerState>,
     sandbox_id: &str,
     session_id: &str,
+    confirmed: ConfirmedOtelCapabilities,
     otel_data: openshell_core::proto::OtelExportData,
 ) {
-    if let Some(openshell_core::proto::otel_export_data::Signal::TraceData(trace_data)) =
-        otel_data.signal
-        && !trace_data.is_empty()
+    use crate::otel_relay::RelaySignal;
+    use openshell_core::proto::otel_export_data::Signal;
+
+    let signal = match otel_data.signal {
+        Some(Signal::TraceData(data)) if !data.is_empty() && confirmed.traces_v1 => {
+            Some(RelaySignal::Traces(data))
+        }
+        Some(Signal::LogsData(data)) if !data.is_empty() && confirmed.logs_v1 => {
+            Some(RelaySignal::Logs(data))
+        }
+        Some(Signal::MetricsData(data)) if !data.is_empty() && confirmed.metrics_v1 => {
+            Some(RelaySignal::Metrics(data))
+        }
+        Some(Signal::TraceData(data)) if !data.is_empty() => {
+            debug!(
+                sandbox_id = %sandbox_id,
+                signal = "traces",
+                "OTEL relay: dropping signal not confirmed for this supervisor session"
+            );
+            None
+        }
+        Some(Signal::LogsData(data)) if !data.is_empty() => {
+            debug!(
+                sandbox_id = %sandbox_id,
+                signal = "logs",
+                "OTEL relay: dropping signal not confirmed for this supervisor session"
+            );
+            None
+        }
+        Some(Signal::MetricsData(data)) if !data.is_empty() => {
+            debug!(
+                sandbox_id = %sandbox_id,
+                signal = "metrics",
+                "OTEL relay: dropping signal not confirmed for this supervisor session"
+            );
+            None
+        }
+        _ => None,
+    };
+    if let Some(signal) = signal
         && let Some(relay_exporter) = state.otel_relay_exporter.as_ref()
+        && !relay_exporter.try_spawn_export(signal, sandbox_id.to_string())
     {
-        let exporter = relay_exporter.clone();
-        let sandbox_id = sandbox_id.to_string();
-        tokio::spawn(async move {
-            match tokio::time::timeout(Duration::from_secs(10), exporter.export_raw(trace_data))
-                .await
-            {
-                Ok(Err(e)) => {
-                    debug!(
-                        sandbox_id = %sandbox_id,
-                        error = %e,
-                        "OTEL relay: failed to export trace data"
-                    );
-                }
-                Err(_) => {
-                    debug!(
-                        sandbox_id = %sandbox_id,
-                        "OTEL relay: export timed out"
-                    );
-                }
-                Ok(Ok(())) => {}
-            }
-        });
+        debug!(
+            sandbox_id = %sandbox_id,
+            "OTEL relay: gateway did not accept telemetry data"
+        );
     }
 
+    if !confirmed.any() && !otel_data.ocsf_events.is_empty() {
+        debug!(
+            sandbox_id = %sandbox_id,
+            "OTEL relay: dropping OCSF events from a session without a confirmed export capability"
+        );
+        return;
+    }
     for ocsf_event in &otel_data.ocsf_events {
         match relayable_ocsf_event(ocsf_event) {
             Ok(json_str) => info!(
@@ -2719,14 +2828,58 @@ mod tests {
     }
 
     #[test]
-    fn select_confirmed_capabilities_keeps_otel_export_when_relay_enabled() {
+    fn select_confirmed_capabilities_rejects_legacy_trace_relay() {
         let confirmed = select_confirmed_capabilities(&caps(&["otel_export"]), true);
-        assert_eq!(confirmed, caps(&["otel_export"]));
+        assert!(confirmed.is_empty());
     }
 
     #[test]
-    fn select_confirmed_capabilities_drops_otel_export_without_relay() {
-        let confirmed = select_confirmed_capabilities(&caps(&["otel_export"]), false);
+    fn trace_only_rollout_does_not_confirm_new_signal_capabilities() {
+        let confirmed = select_confirmed_capabilities(
+            &caps(&[
+                "otel_export",
+                "otel_export_traces_v1",
+                "otel_export_logs_v1",
+                "otel_export_metrics_v1",
+            ]),
+            crate::otel_relay::RelaySignals::traces_only(),
+        );
+        assert_eq!(confirmed, caps(&["otel_export_traces_v1"]));
+    }
+
+    #[test]
+    fn disabled_signal_diagnostic_names_the_signal_allowlist() {
+        assert_eq!(
+            otlp_capability_rejection_diagnostic(crate::otel_relay::RelaySignals::traces_only()),
+            "supervisor advertised OTLP export for a signal disabled in \
+             [openshell.gateway.otlp].agent_signals; capability not confirmed"
+        );
+    }
+
+    #[test]
+    fn explicit_multi_signal_rollout_confirms_each_signal() {
+        let confirmed = select_confirmed_capabilities(
+            &caps(&[
+                "otel_export",
+                "otel_export_traces_v1",
+                "otel_export_logs_v1",
+                "otel_export_metrics_v1",
+            ]),
+            crate::otel_relay::RelaySignals::all(),
+        );
+        assert_eq!(
+            confirmed,
+            caps(&[
+                "otel_export_traces_v1",
+                "otel_export_logs_v1",
+                "otel_export_metrics_v1",
+            ])
+        );
+    }
+
+    #[test]
+    fn select_confirmed_capabilities_drops_versioned_trace_without_relay() {
+        let confirmed = select_confirmed_capabilities(&caps(&["otel_export_traces_v1"]), false);
         assert!(confirmed.is_empty());
     }
 
@@ -2734,12 +2887,28 @@ mod tests {
     fn select_confirmed_capabilities_ignores_unknown_capabilities() {
         let confirmed =
             select_confirmed_capabilities(&caps(&["metrics_export", "otel_export", "bogus"]), true);
-        assert_eq!(confirmed, caps(&["otel_export"]));
+        assert!(confirmed.is_empty());
     }
 
     #[test]
     fn select_confirmed_capabilities_empty_advertisement_confirms_nothing() {
         assert!(select_confirmed_capabilities(&[], true).is_empty());
+    }
+
+    #[test]
+    fn only_versioned_confirmations_authorize_relay_payloads() {
+        let legacy = ConfirmedOtelCapabilities::from_confirmed(&caps(&["otel_export"]));
+        assert_eq!(legacy, ConfirmedOtelCapabilities::default());
+
+        let current = ConfirmedOtelCapabilities::from_confirmed(&caps(&[
+            "otel_export_traces_v1",
+            "otel_export_logs_v1",
+            "otel_export_metrics_v1",
+        ]));
+        assert!(current.traces_v1);
+        assert!(current.logs_v1);
+        assert!(current.metrics_v1);
+        assert!(current.any());
     }
 
     #[test]
