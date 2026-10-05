@@ -9,6 +9,9 @@
 
 use std::sync::Arc;
 
+use opentelemetry_proto::tonic::collector::logs::v1::{
+    ExportLogsServiceRequest, logs_service_client::LogsServiceClient,
+};
 use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
 use prost::Message;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
@@ -23,10 +26,68 @@ use opentelemetry_proto::tonic::collector::trace::v1::trace_service_client::Trac
 /// hardening; normal Hermes/Relay delivery does not depend on reaching it.
 pub const MAX_IN_FLIGHT_OTEL_EXPORTS: usize = 32;
 
+/// Agent telemetry signals enabled for one gateway deployment.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RelaySignals {
+    traces: bool,
+    logs: bool,
+}
+
+impl RelaySignals {
+    pub const fn none() -> Self {
+        Self {
+            traces: false,
+            logs: false,
+        }
+    }
+
+    pub const fn traces_only() -> Self {
+        Self {
+            traces: true,
+            logs: false,
+        }
+    }
+
+    pub fn from_config(signals: &[crate::config_file::OtlpAgentSignal]) -> Self {
+        let mut enabled = Self::none();
+        for signal in signals {
+            match signal {
+                crate::config_file::OtlpAgentSignal::Traces => enabled.traces = true,
+                crate::config_file::OtlpAgentSignal::Logs => enabled.logs = true,
+            }
+        }
+        enabled
+    }
+
+    pub const fn traces(self) -> bool {
+        self.traces
+    }
+
+    pub const fn logs(self) -> bool {
+        self.logs
+    }
+
+    pub const fn any(self) -> bool {
+        self.traces || self.logs
+    }
+}
+
+impl From<bool> for RelaySignals {
+    fn from(enabled: bool) -> Self {
+        if enabled {
+            Self::traces_only()
+        } else {
+            Self::none()
+        }
+    }
+}
+
 /// Exporter that forwards raw protobuf-encoded trace data to an OTLP collector.
 #[derive(Debug, Clone)]
 pub struct OtelRelayExporter {
-    client: TraceServiceClient<Channel>,
+    trace_client: TraceServiceClient<Channel>,
+    logs_client: LogsServiceClient<Channel>,
+    enabled_signals: RelaySignals,
     export_permits: Arc<Semaphore>,
 }
 
@@ -37,13 +98,26 @@ impl OtelRelayExporter {
     /// outages, so collector availability does not determine whether the
     /// gateway enables its relay capability at startup.
     pub fn connect(endpoint: &str) -> Result<Self, ConnectError> {
+        Self::connect_with_signals(endpoint, RelaySignals::traces_only())
+    }
+
+    pub fn connect_with_signals(
+        endpoint: &str,
+        enabled_signals: RelaySignals,
+    ) -> Result<Self, ConnectError> {
         let channel = Channel::from_shared(endpoint.to_string())
             .map_err(|e| ConnectError::InvalidUri(e.to_string()))?
             .connect_lazy();
         Ok(Self {
-            client: TraceServiceClient::new(channel),
+            trace_client: TraceServiceClient::new(channel.clone()),
+            logs_client: LogsServiceClient::new(channel),
+            enabled_signals,
             export_permits: Arc::new(Semaphore::new(MAX_IN_FLIGHT_OTEL_EXPORTS)),
         })
+    }
+
+    pub const fn enabled_signals(&self) -> RelaySignals {
+        self.enabled_signals
     }
 
     /// Reserve one in-flight export slot without waiting.
@@ -55,10 +129,11 @@ impl OtelRelayExporter {
     /// RPC, for tests that only need "a relay exporter is configured".
     #[cfg(test)]
     pub(crate) fn lazy_for_test() -> Self {
+        let channel = Channel::from_static("http://127.0.0.1:1").connect_lazy();
         Self {
-            client: TraceServiceClient::new(
-                Channel::from_static("http://127.0.0.1:1").connect_lazy(),
-            ),
+            trace_client: TraceServiceClient::new(channel.clone()),
+            logs_client: LogsServiceClient::new(channel),
+            enabled_signals: RelaySignals::traces_only(),
             export_permits: Arc::new(Semaphore::new(MAX_IN_FLIGHT_OTEL_EXPORTS)),
         }
     }
@@ -68,7 +143,7 @@ impl OtelRelayExporter {
         let request = ExportTraceServiceRequest::decode(trace_data.as_slice())
             .map_err(ExportError::Decode)?;
 
-        let mut client = self.client.clone();
+        let mut client = self.trace_client.clone();
         let response = client
             .export(tonic::Request::new(request))
             .await
@@ -79,7 +154,31 @@ impl OtelRelayExporter {
             && (partial.rejected_spans != 0 || !partial.error_message.is_empty())
         {
             return Ok(ExportOutcome::PartialSuccess {
-                rejected_spans: partial.rejected_spans,
+                rejected_items: partial.rejected_spans,
+                error_message: partial.error_message,
+            });
+        }
+
+        Ok(ExportOutcome::FullSuccess)
+    }
+
+    /// Export raw protobuf-encoded `ExportLogsServiceRequest` bytes.
+    pub async fn export_logs_raw(&self, logs_data: Vec<u8>) -> Result<ExportOutcome, ExportError> {
+        let request =
+            ExportLogsServiceRequest::decode(logs_data.as_slice()).map_err(ExportError::Decode)?;
+
+        let mut client = self.logs_client.clone();
+        let response = client
+            .export(tonic::Request::new(request))
+            .await
+            .map_err(ExportError::Grpc)?
+            .into_inner();
+
+        if let Some(partial) = response.partial_success
+            && (partial.rejected_log_records != 0 || !partial.error_message.is_empty())
+        {
+            return Ok(ExportOutcome::PartialSuccess {
+                rejected_items: partial.rejected_log_records,
                 error_message: partial.error_message,
             });
         }
@@ -96,7 +195,7 @@ impl OtelRelayExporter {
 pub enum ExportOutcome {
     FullSuccess,
     PartialSuccess {
-        rejected_spans: i64,
+        rejected_items: i64,
         error_message: String,
     },
 }
@@ -134,11 +233,18 @@ pub fn try_create_exporter(
     // Agent traces ride their own lane: `agent_endpoint` when the operator
     // split the collectors, otherwise the shared infrastructure endpoint.
     let endpoint = otlp.agent_lane_endpoint();
-    match OtelRelayExporter::connect(endpoint) {
+    let enabled_signals = RelaySignals::from_config(&otlp.agent_signals);
+    if !enabled_signals.any() {
+        debug!("sandbox OTEL relay has no enabled signals; relay exporter disabled");
+        return None;
+    }
+    match OtelRelayExporter::connect_with_signals(endpoint, enabled_signals) {
         Ok(exporter) => {
             info!(
                 endpoint,
                 dedicated_lane = otlp.agent_endpoint.is_some(),
+                traces = enabled_signals.traces(),
+                logs = enabled_signals.logs(),
                 "OTEL relay exporter configured"
             );
             Some(Arc::new(exporter))
@@ -159,6 +265,10 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    use opentelemetry_proto::tonic::collector::logs::v1::{
+        ExportLogsServiceResponse,
+        logs_service_server::{LogsService, LogsServiceServer},
+    };
     use opentelemetry_proto::tonic::collector::trace::v1::{
         ExportTracePartialSuccess, ExportTraceServiceResponse,
         trace_service_server::{TraceService, TraceServiceServer},
@@ -194,6 +304,19 @@ mod tests {
     #[derive(Clone)]
     struct ResultCollector {
         reply: CollectorReply,
+    }
+
+    #[derive(Clone, Default)]
+    struct LogCollector;
+
+    #[tonic::async_trait]
+    impl LogsService for LogCollector {
+        async fn export(
+            &self,
+            _request: tonic::Request<ExportLogsServiceRequest>,
+        ) -> Result<tonic::Response<ExportLogsServiceResponse>, tonic::Status> {
+            Ok(tonic::Response::new(ExportLogsServiceResponse::default()))
+        }
     }
 
     #[tonic::async_trait]
@@ -236,6 +359,7 @@ mod tests {
             let task = tokio::spawn(async move {
                 tonic::transport::Server::builder()
                     .add_service(TraceServiceServer::new(ResultCollector { reply }))
+                    .add_service(LogsServiceServer::new(LogCollector))
                     .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async {
                         let _ = shutdown_rx.await;
                     })
@@ -258,6 +382,10 @@ mod tests {
         ExportTraceServiceRequest::default().encode_to_vec()
     }
 
+    fn empty_logs_request() -> Vec<u8> {
+        ExportLogsServiceRequest::default().encode_to_vec()
+    }
+
     #[tokio::test]
     async fn gateway_otlp_does_not_enable_sandbox_relay_implicitly() {
         let mut config = crate::config_file::ConfigFile::default();
@@ -266,6 +394,7 @@ mod tests {
             service_name: None,
             agent_endpoint: None,
             sandbox_relay_enabled: false,
+            agent_signals: vec![crate::config_file::OtlpAgentSignal::Traces],
         });
 
         assert!(try_create_exporter(Some(&config)).is_none());
@@ -384,6 +513,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn export_logs_raw_accepts_a_successful_collector_response() {
+        let collector = TestCollector::start(CollectorReply::Success).await;
+        let exporter = OtelRelayExporter::connect_with_signals(
+            &collector.endpoint,
+            RelaySignals::from_config(&[
+                crate::config_file::OtlpAgentSignal::Traces,
+                crate::config_file::OtlpAgentSignal::Logs,
+            ]),
+        )
+        .unwrap();
+
+        assert_eq!(
+            exporter
+                .export_logs_raw(empty_logs_request())
+                .await
+                .unwrap(),
+            ExportOutcome::FullSuccess
+        );
+
+        collector.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn export_raw_reports_rejected_spans() {
         let collector = TestCollector::start(CollectorReply::Partial {
             rejected_spans: 2,
@@ -399,7 +551,7 @@ mod tests {
         assert_eq!(
             outcome,
             ExportOutcome::PartialSuccess {
-                rejected_spans: 2,
+                rejected_items: 2,
                 error_message: "span limit exceeded".to_string(),
             }
         );
@@ -423,7 +575,7 @@ mod tests {
         assert_eq!(
             outcome,
             ExportOutcome::PartialSuccess {
-                rejected_spans: 0,
+                rejected_items: 0,
                 error_message: "collector sampled the request".to_string(),
             }
         );

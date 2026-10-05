@@ -298,6 +298,7 @@ mod tests {
             service_name: None,
             agent_endpoint: None,
             sandbox_relay_enabled: false,
+            agent_signals: vec![crate::config_file::OtlpAgentSignal::Traces],
         }
     }
 

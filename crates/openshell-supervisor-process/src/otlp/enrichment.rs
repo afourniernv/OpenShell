@@ -1,8 +1,9 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Span enrichment: injects sandbox resource attributes into OTLP trace data.
+//! Enrichment for OTLP data emitted by sandbox workloads.
 
+use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
 use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
 use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue, any_value};
 use opentelemetry_proto::tonic::resource::v1::Resource;
@@ -39,6 +40,7 @@ pub enum ContentType {
 // This check runs after protobuf/JSON decode, so it does not bound allocations
 // performed by the decoder itself.
 pub const MAX_RESOURCE_SPANS: usize = 64;
+pub const MAX_RESOURCE_LOGS: usize = 64;
 
 /// Enrich spans with sandbox resource attributes. Input can be protobuf or
 /// JSON-encoded `ExportTraceServiceRequest`. Output is always protobuf.
@@ -104,6 +106,48 @@ pub fn enrich_spans(
     Ok(request.encode_to_vec())
 }
 
+/// Enrich log records with trusted sandbox resource attributes.
+pub fn enrich_logs(
+    raw: &[u8],
+    content_type: ContentType,
+    attrs: &SandboxMetadata,
+    enrichment_enabled: bool,
+) -> Result<Vec<u8>, EnrichmentError> {
+    let mut request = match content_type {
+        ContentType::Protobuf => {
+            ExportLogsServiceRequest::decode(raw).map_err(EnrichmentError::ProtobufDecode)?
+        }
+        ContentType::Json => serde_json::from_slice::<ExportLogsServiceRequest>(raw)
+            .map_err(EnrichmentError::JsonDecode)?,
+    };
+
+    if request.resource_logs.len() > MAX_RESOURCE_LOGS {
+        return Err(EnrichmentError::StructuralLimit {
+            structure: "resource logs",
+            limit: MAX_RESOURCE_LOGS,
+            actual: request.resource_logs.len(),
+        });
+    }
+
+    let extra_attrs = build_attributes(attrs, enrichment_enabled);
+    for resource_logs in &mut request.resource_logs {
+        let resource = resource_logs.resource.get_or_insert_with(Resource::default);
+        strip_authoritative_attributes(&mut resource.attributes);
+        resource.attributes.extend(extra_attrs.iter().cloned());
+
+        for scope_logs in &mut resource_logs.scope_logs {
+            if let Some(scope) = &mut scope_logs.scope {
+                strip_authoritative_attributes(&mut scope.attributes);
+            }
+            for record in &mut scope_logs.log_records {
+                strip_authoritative_attributes(&mut record.attributes);
+            }
+        }
+    }
+
+    Ok(request.encode_to_vec())
+}
+
 fn strip_authoritative_attributes(attributes: &mut Vec<KeyValue>) {
     attributes.retain(|attribute| !AUTHORITATIVE_ATTRIBUTE_KEYS.contains(&attribute.key.as_str()));
 }
@@ -153,7 +197,9 @@ pub enum EnrichmentError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
     use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
+    use opentelemetry_proto::tonic::logs::v1::{LogRecord, ResourceLogs, ScopeLogs};
     use opentelemetry_proto::tonic::trace::v1::{ResourceSpans, ScopeSpans, Span};
     use prost::Message;
 
@@ -198,6 +244,41 @@ mod tests {
         assert!(attr_keys.contains(&"openshell.sandbox.id"));
         assert!(attr_keys.contains(&"openshell.workspace.id"));
         assert!(attr_keys.contains(&"openshell.telemetry.source"));
+    }
+
+    #[test]
+    fn log_enrichment_adds_trusted_attributes() {
+        let raw = ExportLogsServiceRequest {
+            resource_logs: vec![ResourceLogs {
+                scope_logs: vec![ScopeLogs {
+                    log_records: vec![LogRecord {
+                        attributes: vec![kv("openshell.sandbox.id", "spoofed")],
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+        }
+        .encode_to_vec();
+
+        let result = enrich_logs(&raw, ContentType::Protobuf, &test_metadata(), true).unwrap();
+        let decoded = ExportLogsServiceRequest::decode(result.as_slice()).unwrap();
+        let resource = decoded.resource_logs[0].resource.as_ref().unwrap();
+        assert!(resource.attributes.iter().any(|attribute| {
+            attribute.key == "openshell.sandbox.id"
+                && attribute
+                    .value
+                    .as_ref()
+                    .and_then(|value| value.value.as_ref())
+                    == Some(&any_value::Value::StringValue("sb-123".to_string()))
+        }));
+        assert!(
+            decoded.resource_logs[0].scope_logs[0].log_records[0]
+                .attributes
+                .iter()
+                .all(|attribute| attribute.key != "openshell.sandbox.id")
+        );
     }
 
     #[test]

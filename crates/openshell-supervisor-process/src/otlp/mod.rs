@@ -162,6 +162,11 @@ pub fn export_message(sandbox_id: &str, item: TelemetryItem) -> SupervisorMessag
             signal: Some(otel_export_data::Signal::TraceData(data)),
             ocsf_events: Vec::new(),
         },
+        TelemetryItem::Logs(data) => OtelExportData {
+            sandbox_id: sandbox_id.to_string(),
+            signal: Some(otel_export_data::Signal::LogsData(data)),
+            ocsf_events: Vec::new(),
+        },
         TelemetryItem::Ocsf(data) => OtelExportData {
             sandbox_id: sandbox_id.to_string(),
             signal: None,
@@ -188,6 +193,22 @@ pub(crate) fn admit_trace_message(sandbox_id: &str, trace_data: Vec<u8>) -> Resu
         unreachable!("trace export always contains trace data")
     };
     Ok(trace_data)
+}
+
+pub(crate) fn admit_logs_message(sandbox_id: &str, logs_data: Vec<u8>) -> Result<Vec<u8>, usize> {
+    let mut message = export_message(sandbox_id, TelemetryItem::Logs(logs_data));
+    let encoded_len = message.encoded_len();
+    if encoded_len > MAX_ENCODED_SUPERVISOR_MESSAGE_BYTES {
+        return Err(encoded_len);
+    }
+
+    let Some(supervisor_message::Payload::OtelExport(mut export)) = message.payload.take() else {
+        unreachable!("export_message always constructs an OTEL export")
+    };
+    let Some(otel_export_data::Signal::LogsData(logs_data)) = export.signal.take() else {
+        unreachable!("logs export always contains logs data")
+    };
+    Ok(logs_data)
 }
 
 /// Start the relay: build the bounded buffer and the connection server.
@@ -268,6 +289,17 @@ impl RelayLifecycle {
         tx: &mpsc::Sender<SupervisorMessage>,
         forwarding_confirmed: bool,
     ) {
+        self.stop_and_drain_signals(sandbox_id, tx, forwarding_confirmed, false)
+            .await;
+    }
+
+    pub async fn stop_and_drain_signals(
+        &mut self,
+        sandbox_id: &str,
+        tx: &mpsc::Sender<SupervisorMessage>,
+        traces_confirmed: bool,
+        logs_confirmed: bool,
+    ) {
         let Self::Running {
             receiver,
             mut buffer,
@@ -281,8 +313,12 @@ impl RelayLifecycle {
         let items = buffer.drain();
         let buffered = items.len();
         let mut forwarded = 0usize;
-        if forwarding_confirmed {
-            for item in items {
+        for item in items {
+            let allowed = match &item {
+                TelemetryItem::Trace(_) | TelemetryItem::Ocsf(_) => traces_confirmed,
+                TelemetryItem::Logs(_) => logs_confirmed,
+            };
+            if allowed {
                 if tx.send(export_message(sandbox_id, item)).await.is_err() {
                     break;
                 }

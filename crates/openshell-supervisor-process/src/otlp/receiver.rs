@@ -28,7 +28,8 @@ use tracing::{debug, warn};
 use super::buffer::{TelemetrySendError, TelemetrySender};
 use super::enrichment::{self, ContentType, EnrichmentError};
 use super::{
-    MAX_TELEMETRY_ITEM_BYTES, RECEIVER_SHUTDOWN_TIMEOUT, SandboxMetadata, admit_trace_message,
+    MAX_TELEMETRY_ITEM_BYTES, RECEIVER_SHUTDOWN_TIMEOUT, SandboxMetadata, admit_logs_message,
+    admit_trace_message,
 };
 
 /// Upper bound on concurrently served relay connections.
@@ -224,12 +225,16 @@ async fn handle_request(
     body_read_timeout: Duration,
     processing: Arc<Semaphore>,
 ) -> Result<Response<Full<Bytes>>, Infallible> {
-    if req.method() != Method::POST || req.uri().path() != "/v1/traces" {
-        return Ok(Response::builder()
-            .status(StatusCode::NOT_FOUND)
-            .body(Full::new(Bytes::from("{\"error\":\"not found\"}")))
-            .unwrap());
-    }
+    let signal = match (req.method(), req.uri().path()) {
+        (&Method::POST, "/v1/traces") => SignalKind::Traces,
+        (&Method::POST, "/v1/logs") => SignalKind::Logs,
+        _ => {
+            return Ok(Response::builder()
+                .status(StatusCode::NOT_FOUND)
+                .body(Full::new(Bytes::from("{\"error\":\"not found\"}")))
+                .unwrap());
+        }
+    };
 
     let Some(content_type) = parse_content_type(req.headers()) else {
         return Ok(Response::builder()
@@ -301,12 +306,20 @@ async fn handle_request(
     let metadata_for_processing = metadata.clone();
     let processed = tokio::task::spawn_blocking(move || {
         let _processing_permit = processing_permit;
-        enrichment::enrich_spans(
-            &body,
-            content_type,
-            &metadata_for_processing,
-            enrichment_enabled,
-        )
+        match signal {
+            SignalKind::Traces => enrichment::enrich_spans(
+                &body,
+                content_type,
+                &metadata_for_processing,
+                enrichment_enabled,
+            ),
+            SignalKind::Logs => enrichment::enrich_logs(
+                &body,
+                content_type,
+                &metadata_for_processing,
+                enrichment_enabled,
+            ),
+        }
     })
     .await;
 
@@ -325,7 +338,11 @@ async fn handle_request(
 
     match processed {
         Ok(enriched) => {
-            let enriched = match admit_trace_message(&metadata.sandbox_id, enriched) {
+            let enriched = match signal {
+                SignalKind::Traces => admit_trace_message(&metadata.sandbox_id, enriched),
+                SignalKind::Logs => admit_logs_message(&metadata.sandbox_id, enriched),
+            };
+            let enriched = match enriched {
                 Ok(enriched) => enriched,
                 Err(encoded_bytes) => {
                     warn!(encoded_bytes, "OTLP export exceeds session message limit");
@@ -338,7 +355,11 @@ async fn handle_request(
                 }
             };
 
-            match buf_tx.send_trace(enriched) {
+            let queued = match signal {
+                SignalKind::Traces => buf_tx.send_trace(enriched),
+                SignalKind::Logs => buf_tx.send_logs(enriched),
+            };
+            match queued {
                 Ok(()) => {
                     let (response_content_type, response_body) = match content_type {
                         ContentType::Protobuf => ("application/x-protobuf", Bytes::new()),
@@ -398,6 +419,12 @@ async fn handle_request(
     }
 }
 
+#[derive(Clone, Copy)]
+enum SignalKind {
+    Traces,
+    Logs,
+}
+
 fn parse_content_type(headers: &hyper::HeaderMap) -> Option<ContentType> {
     let ct = headers.get("content-type")?.to_str().ok()?;
     if ct.starts_with("application/x-protobuf") {
@@ -417,7 +444,9 @@ pub(crate) mod test_util {
     use std::sync::Arc;
     use std::time::Duration;
 
+    use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
     use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
+    use opentelemetry_proto::tonic::logs::v1::{LogRecord, ResourceLogs, ScopeLogs};
     use opentelemetry_proto::tonic::trace::v1::{ResourceSpans, ScopeSpans, Span};
     use prost::Message;
     use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream};
@@ -442,6 +471,19 @@ pub(crate) mod test_util {
 
     pub fn sample_trace_json_body() -> Vec<u8> {
         serde_json::to_vec(&sample_trace_request()).expect("serialize trace request")
+    }
+
+    pub fn sample_logs_body() -> Vec<u8> {
+        ExportLogsServiceRequest {
+            resource_logs: vec![ResourceLogs {
+                scope_logs: vec![ScopeLogs {
+                    log_records: vec![LogRecord::default()],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+        }
+        .encode_to_vec()
     }
 
     fn sample_trace_request() -> ExportTraceServiceRequest {
@@ -526,7 +568,8 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     use super::test_util::{
-        connect, metadata, request, sample_trace_body, sample_trace_json_body, send, send_response,
+        connect, metadata, request, sample_logs_body, sample_trace_body, sample_trace_json_body,
+        send, send_response,
     };
     use super::*;
     use crate::otlp::buffer::{TelemetryReceiver, new_telemetry_buffer};
@@ -636,6 +679,23 @@ mod tests {
             "valid protobuf should be 200, got {status}"
         );
         assert_eq!(buf_rx.metrics().depth(), 1);
+
+        let mut client = connect(&server);
+        let status = send(
+            &mut client,
+            &request(
+                "POST",
+                "/v1/logs",
+                "application/x-protobuf",
+                &sample_logs_body(),
+            ),
+        )
+        .await;
+        assert!(
+            status.contains("200"),
+            "valid logs should be 200, got {status}"
+        );
+        assert_eq!(buf_rx.metrics().depth(), 2);
 
         handle.shutdown().await;
     }
