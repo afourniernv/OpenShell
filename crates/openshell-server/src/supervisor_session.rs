@@ -2476,19 +2476,41 @@ fn handle_otel_export(
                     .await
                 {
                     Ok(Err(e)) => {
-                        debug!(
+                        warn!(
                             sandbox_id = %sandbox_id,
                             error = %e,
                             "OTEL relay: failed to export trace data"
                         );
                     }
                     Err(_) => {
-                        debug!(
+                        warn!(
                             sandbox_id = %sandbox_id,
                             "OTEL relay: export timed out"
                         );
                     }
-                    Ok(Ok(())) => {}
+                    Ok(Ok(crate::otel_relay::ExportOutcome::FullSuccess)) => {}
+                    Ok(Ok(crate::otel_relay::ExportOutcome::PartialSuccess {
+                        rejected_spans,
+                        error_message,
+                    })) if rejected_spans != 0 => {
+                        warn!(
+                            sandbox_id = %sandbox_id,
+                            rejected_spans,
+                            error = %error_message,
+                            "OTEL relay: collector partially accepted trace data"
+                        );
+                    }
+                    Ok(Ok(crate::otel_relay::ExportOutcome::PartialSuccess {
+                        rejected_spans,
+                        error_message,
+                    })) => {
+                        info!(
+                            sandbox_id = %sandbox_id,
+                            rejected_spans,
+                            message = %error_message,
+                            "OTEL relay: collector returned an export diagnostic"
+                        );
+                    }
                 }
             });
         } else {

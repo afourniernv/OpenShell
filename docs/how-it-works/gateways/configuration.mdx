@@ -358,6 +358,8 @@ The address is never routed. The sandbox stages the connection for the superviso
 
 The relay bounds request size, post-decode trace structure before enrichment, concurrent processing, queued items, and queued bytes. The structural limit does not replace the decoder's own allocation behavior. The receiver returns an HTTP error when it cannot accept a batch, allowing a conforming OTLP exporter to observe overload instead of treating a dropped batch as delivered. The gateway also bounds concurrent collector exports so collector backpressure cannot create an unbounded task backlog.
 
+Collector availability does not gate startup. The gateway connects lazily and reconnects after an outage. It logs failed exports, timeouts, and OTLP `partial_success` responses, including the number of rejected spans reported by the collector.
+
 For Helm deployments, set `server.otlp.endpoint` to render this table and
 `server.otlp.sandboxRelayEnabled=true` to authorize sandbox trace relay. The
 optional `server.otlp.serviceName` value overrides the gateway service name;

@@ -31,13 +31,15 @@ pub struct OtelRelayExporter {
 }
 
 impl OtelRelayExporter {
-    /// Connect to the OTLP collector at the given gRPC endpoint.
-    pub async fn connect(endpoint: &str) -> Result<Self, ConnectError> {
+    /// Configure a lazy channel to the OTLP collector at the given gRPC endpoint.
+    ///
+    /// The channel connects on the first export and reconnects after collector
+    /// outages, so collector availability does not determine whether the
+    /// gateway enables its relay capability at startup.
+    pub fn connect(endpoint: &str) -> Result<Self, ConnectError> {
         let channel = Channel::from_shared(endpoint.to_string())
             .map_err(|e| ConnectError::InvalidUri(e.to_string()))?
-            .connect()
-            .await
-            .map_err(ConnectError::Transport)?;
+            .connect_lazy();
         Ok(Self {
             client: TraceServiceClient::new(channel),
             export_permits: Arc::new(Semaphore::new(MAX_IN_FLIGHT_OTEL_EXPORTS)),
@@ -62,18 +64,41 @@ impl OtelRelayExporter {
     }
 
     /// Export raw protobuf-encoded `ExportTraceServiceRequest` bytes.
-    pub async fn export_raw(&self, trace_data: Vec<u8>) -> Result<(), ExportError> {
+    pub async fn export_raw(&self, trace_data: Vec<u8>) -> Result<ExportOutcome, ExportError> {
         let request = ExportTraceServiceRequest::decode(trace_data.as_slice())
             .map_err(ExportError::Decode)?;
 
         let mut client = self.client.clone();
-        client
+        let response = client
             .export(tonic::Request::new(request))
             .await
-            .map_err(ExportError::Grpc)?;
+            .map_err(ExportError::Grpc)?
+            .into_inner();
 
-        Ok(())
+        if let Some(partial) = response.partial_success
+            && (partial.rejected_spans != 0 || !partial.error_message.is_empty())
+        {
+            return Ok(ExportOutcome::PartialSuccess {
+                rejected_spans: partial.rejected_spans,
+                error_message: partial.error_message,
+            });
+        }
+
+        Ok(ExportOutcome::FullSuccess)
     }
+}
+
+/// Collector acknowledgement for an accepted OTLP export.
+///
+/// OTLP partial success is non-retryable, so it is a successful outcome with
+/// diagnostics rather than an [`ExportError`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExportOutcome {
+    FullSuccess,
+    PartialSuccess {
+        rejected_spans: i64,
+        error_message: String,
+    },
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -88,12 +113,10 @@ pub enum ExportError {
 pub enum ConnectError {
     #[error("invalid OTLP endpoint URI: {0}")]
     InvalidUri(String),
-    #[error("transport error: {0}")]
-    Transport(tonic::transport::Error),
 }
 
 /// Create a relay exporter from the gateway's OTLP config, if configured.
-pub async fn try_create_exporter(
+pub fn try_create_exporter(
     config_file: Option<&crate::config_file::ConfigFile>,
 ) -> Option<Arc<OtelRelayExporter>> {
     let Some(cf) = config_file else {
@@ -111,12 +134,12 @@ pub async fn try_create_exporter(
     // Agent traces ride their own lane: `agent_endpoint` when the operator
     // split the collectors, otherwise the shared infrastructure endpoint.
     let endpoint = otlp.agent_lane_endpoint();
-    match OtelRelayExporter::connect(endpoint).await {
+    match OtelRelayExporter::connect(endpoint) {
         Ok(exporter) => {
             info!(
                 endpoint,
                 dedicated_lane = otlp.agent_endpoint.is_some(),
-                "OTEL relay exporter connected"
+                "OTEL relay exporter configured"
             );
             Some(Arc::new(exporter))
         }
@@ -124,7 +147,7 @@ pub async fn try_create_exporter(
             tracing::warn!(
                 endpoint,
                 error = %e,
-                "failed to connect OTEL relay exporter; relay disabled"
+                "failed to configure OTEL relay exporter; relay disabled"
             );
             None
         }
@@ -134,6 +157,106 @@ pub async fn try_create_exporter(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use opentelemetry_proto::tonic::collector::trace::v1::{
+        ExportTracePartialSuccess, ExportTraceServiceResponse,
+        trace_service_server::{TraceService, TraceServiceServer},
+    };
+    use tokio_stream::wrappers::TcpListenerStream;
+
+    #[derive(Clone, Default)]
+    struct CountingCollector {
+        exports: Arc<AtomicUsize>,
+    }
+
+    #[tonic::async_trait]
+    impl TraceService for CountingCollector {
+        async fn export(
+            &self,
+            _request: tonic::Request<ExportTraceServiceRequest>,
+        ) -> Result<tonic::Response<ExportTraceServiceResponse>, tonic::Status> {
+            self.exports.fetch_add(1, Ordering::Relaxed);
+            Ok(tonic::Response::new(ExportTraceServiceResponse::default()))
+        }
+    }
+
+    #[derive(Clone)]
+    enum CollectorReply {
+        Success,
+        Partial {
+            rejected_spans: i64,
+            error_message: &'static str,
+        },
+        GrpcError(tonic::Code),
+    }
+
+    #[derive(Clone)]
+    struct ResultCollector {
+        reply: CollectorReply,
+    }
+
+    #[tonic::async_trait]
+    impl TraceService for ResultCollector {
+        async fn export(
+            &self,
+            _request: tonic::Request<ExportTraceServiceRequest>,
+        ) -> Result<tonic::Response<ExportTraceServiceResponse>, tonic::Status> {
+            match &self.reply {
+                CollectorReply::Success => {
+                    Ok(tonic::Response::new(ExportTraceServiceResponse::default()))
+                }
+                CollectorReply::Partial {
+                    rejected_spans,
+                    error_message,
+                } => Ok(tonic::Response::new(ExportTraceServiceResponse {
+                    partial_success: Some(ExportTracePartialSuccess {
+                        rejected_spans: *rejected_spans,
+                        error_message: (*error_message).to_string(),
+                    }),
+                })),
+                CollectorReply::GrpcError(code) => {
+                    Err(tonic::Status::new(*code, "collector unavailable"))
+                }
+            }
+        }
+    }
+
+    struct TestCollector {
+        endpoint: String,
+        shutdown: tokio::sync::oneshot::Sender<()>,
+        task: tokio::task::JoinHandle<Result<(), tonic::transport::Error>>,
+    }
+
+    impl TestCollector {
+        async fn start(reply: CollectorReply) -> Self {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let endpoint = format!("http://{}", listener.local_addr().unwrap());
+            let (shutdown, shutdown_rx) = tokio::sync::oneshot::channel();
+            let task = tokio::spawn(async move {
+                tonic::transport::Server::builder()
+                    .add_service(TraceServiceServer::new(ResultCollector { reply }))
+                    .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async {
+                        let _ = shutdown_rx.await;
+                    })
+                    .await
+            });
+            Self {
+                endpoint,
+                shutdown,
+                task,
+            }
+        }
+
+        async fn shutdown(self) {
+            self.shutdown.send(()).unwrap();
+            self.task.await.unwrap().unwrap();
+        }
+    }
+
+    fn empty_request() -> Vec<u8> {
+        ExportTraceServiceRequest::default().encode_to_vec()
+    }
 
     #[tokio::test]
     async fn gateway_otlp_does_not_enable_sandbox_relay_implicitly() {
@@ -145,15 +268,72 @@ mod tests {
             sandbox_relay_enabled: false,
         });
 
-        assert!(try_create_exporter(Some(&config)).await.is_none());
+        assert!(try_create_exporter(Some(&config)).is_none());
     }
 
     #[tokio::test]
     async fn connect_rejects_invalid_endpoint_uri() {
         let err = OtelRelayExporter::connect("not a valid uri")
-            .await
             .expect_err("an unparsable endpoint must not connect");
         assert!(matches!(err, ConnectError::InvalidUri(_)), "{err}");
+    }
+
+    #[tokio::test]
+    async fn exporter_survives_collector_starting_after_configuration() {
+        let reservation = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = reservation.local_addr().unwrap();
+        drop(reservation);
+
+        let exporter = OtelRelayExporter::connect(&format!("http://{addr}"))
+            .expect("a valid collector URI should configure while the collector is down");
+
+        let request = ExportTraceServiceRequest::default().encode_to_vec();
+        let first_error = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            exporter.export_raw(request.clone()),
+        )
+        .await
+        .expect("the first connection attempt should fail promptly")
+        .expect_err("an export cannot succeed before the collector starts");
+        assert!(matches!(first_error, ExportError::Grpc(_)), "{first_error}");
+
+        let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+        let collector = CountingCollector::default();
+        let exports = Arc::clone(&collector.exports);
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .add_service(TraceServiceServer::new(collector))
+                .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async {
+                    let _ = shutdown_rx.await;
+                })
+                .await
+        });
+
+        let delivered = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            for _ in 0..20 {
+                let attempt = tokio::time::timeout(
+                    std::time::Duration::from_millis(250),
+                    exporter.export_raw(request.clone()),
+                )
+                .await;
+                if matches!(attempt, Ok(Ok(ExportOutcome::FullSuccess))) {
+                    return true;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            false
+        })
+        .await
+        .expect("collector recovery probe must have a total deadline");
+        assert!(
+            delivered,
+            "the channel should reconnect after the collector starts"
+        );
+        assert_eq!(exports.load(Ordering::Relaxed), 1);
+
+        shutdown_tx.send(()).unwrap();
+        server.await.unwrap().unwrap();
     }
 
     #[tokio::test]
@@ -188,5 +368,81 @@ mod tests {
             exporter.try_reserve_export().is_some(),
             "releasing an export restores admission"
         );
+    }
+
+    #[tokio::test]
+    async fn export_raw_accepts_a_successful_collector_response() {
+        let collector = TestCollector::start(CollectorReply::Success).await;
+        let exporter = OtelRelayExporter::connect(&collector.endpoint).unwrap();
+
+        assert_eq!(
+            exporter.export_raw(empty_request()).await.unwrap(),
+            ExportOutcome::FullSuccess
+        );
+
+        collector.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn export_raw_reports_rejected_spans() {
+        let collector = TestCollector::start(CollectorReply::Partial {
+            rejected_spans: 2,
+            error_message: "span limit exceeded",
+        })
+        .await;
+        let exporter = OtelRelayExporter::connect(&collector.endpoint).unwrap();
+
+        let outcome = exporter
+            .export_raw(empty_request())
+            .await
+            .expect("partial success must not request a retry");
+        assert_eq!(
+            outcome,
+            ExportOutcome::PartialSuccess {
+                rejected_spans: 2,
+                error_message: "span limit exceeded".to_string(),
+            }
+        );
+
+        collector.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn export_raw_reports_collector_warning_messages() {
+        let collector = TestCollector::start(CollectorReply::Partial {
+            rejected_spans: 0,
+            error_message: "collector sampled the request",
+        })
+        .await;
+        let exporter = OtelRelayExporter::connect(&collector.endpoint).unwrap();
+
+        let outcome = exporter
+            .export_raw(empty_request())
+            .await
+            .expect("collector warnings must not request a retry");
+        assert_eq!(
+            outcome,
+            ExportOutcome::PartialSuccess {
+                rejected_spans: 0,
+                error_message: "collector sampled the request".to_string(),
+            }
+        );
+
+        collector.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn export_raw_preserves_grpc_errors() {
+        let collector =
+            TestCollector::start(CollectorReply::GrpcError(tonic::Code::Unavailable)).await;
+        let exporter = OtelRelayExporter::connect(&collector.endpoint).unwrap();
+
+        let err = exporter.export_raw(empty_request()).await.unwrap_err();
+        assert!(
+            matches!(err, ExportError::Grpc(ref status) if status.code() == tonic::Code::Unavailable),
+            "{err}"
+        );
+
+        collector.shutdown().await;
     }
 }
