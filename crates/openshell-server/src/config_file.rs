@@ -304,6 +304,21 @@ pub struct OtlpConfig {
     /// self-observability does not implicitly authorize workload telemetry.
     #[serde(default)]
     pub sandbox_relay_enabled: bool,
+
+    /// Signals exposed to sandbox workloads when the relay is enabled.
+    #[serde(default = "default_agent_signals")]
+    pub agent_signals: Vec<OtlpAgentSignal>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OtlpAgentSignal {
+    Traces,
+    Logs,
+}
+
+fn default_agent_signals() -> Vec<OtlpAgentSignal> {
+    vec![OtlpAgentSignal::Traces]
 }
 
 impl OtlpConfig {
@@ -946,6 +961,7 @@ service_name = "openshell-gateway-dev"
         assert_eq!(otlp.service_name.as_deref(), Some("openshell-gateway-dev"));
         assert_eq!(otlp.agent_lane_endpoint(), otlp.endpoint);
         assert!(!otlp.sandbox_relay_enabled);
+        assert_eq!(otlp.agent_signals, vec![OtlpAgentSignal::Traces]);
     }
 
     #[test]
@@ -974,6 +990,22 @@ sandbox_relay_enabled = true
         let file = load(tmp.path()).expect("valid otlp config parses");
         let otlp = file.openshell.gateway.otlp.expect("otlp config");
         assert!(otlp.sandbox_relay_enabled);
+    }
+
+    #[test]
+    fn parses_explicit_agent_signals() {
+        let toml = r#"
+[openshell.gateway.otlp]
+endpoint = "http://infra-collector:4317"
+sandbox_relay_enabled = true
+agent_signals = ["traces", "logs"]
+"#;
+        let tmp = write_tmp(toml);
+        let file = load(tmp.path()).expect("valid otlp config parses");
+        assert_eq!(
+            file.openshell.gateway.otlp.unwrap().agent_signals,
+            vec![OtlpAgentSignal::Traces, OtlpAgentSignal::Logs]
+        );
     }
 
     #[test]

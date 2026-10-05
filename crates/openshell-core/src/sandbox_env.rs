@@ -278,6 +278,12 @@ pub const OTEL_EXPORTER_OTLP_TRACES_ENDPOINT: &str = "OTEL_EXPORTER_OTLP_TRACES_
 /// Trace-specific OpenTelemetry OTLP exporter protocol.
 pub const OTEL_EXPORTER_OTLP_TRACES_PROTOCOL: &str = "OTEL_EXPORTER_OTLP_TRACES_PROTOCOL";
 
+/// Log-specific OpenTelemetry OTLP exporter endpoint.
+pub const OTEL_EXPORTER_OTLP_LOGS_ENDPOINT: &str = "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT";
+
+/// Log-specific OpenTelemetry OTLP exporter protocol.
+pub const OTEL_EXPORTER_OTLP_LOGS_PROTOCOL: &str = "OTEL_EXPORTER_OTLP_LOGS_PROTOCOL";
+
 /// Reserved destination agent processes export OTLP to.
 ///
 /// This address is never routed. A workload `connect()` to any non-loopback
@@ -297,6 +303,9 @@ pub const OTLP_RELAY_ENDPOINT: &str = "http://192.0.0.8:4318";
 /// Trace-specific HTTP ingestion URL for the sandbox relay.
 pub const OTLP_RELAY_TRACES_ENDPOINT: &str = "http://192.0.0.8:4318/v1/traces";
 
+/// Log-specific HTTP ingestion URL for the sandbox relay.
+pub const OTLP_RELAY_LOGS_ENDPOINT: &str = "http://192.0.0.8:4318/v1/logs";
+
 // The corporate upstream-proxy configuration deliberately has no reserved
 // environment variables: it travels on the supervisor's argv
 // (`--upstream-proxy` and friends), which a sandbox image cannot forge the
@@ -306,7 +315,9 @@ pub const OTLP_RELAY_TRACES_ENDPOINT: &str = "http://192.0.0.8:4318/v1/traces";
 mod otlp_relay_address_tests {
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
-    use super::{OTLP_RELAY_ADDR, OTLP_RELAY_ENDPOINT, OTLP_RELAY_TRACES_ENDPOINT};
+    use super::{
+        OTLP_RELAY_ADDR, OTLP_RELAY_ENDPOINT, OTLP_RELAY_LOGS_ENDPOINT, OTLP_RELAY_TRACES_ENDPOINT,
+    };
 
     #[test]
     fn relay_address_is_an_unroutable_non_loopback_label() {
@@ -329,6 +340,10 @@ mod otlp_relay_address_tests {
         assert_eq!(
             OTLP_RELAY_TRACES_ENDPOINT,
             format!("{OTLP_RELAY_ENDPOINT}/v1/traces")
+        );
+        assert_eq!(
+            OTLP_RELAY_LOGS_ENDPOINT,
+            format!("{OTLP_RELAY_ENDPOINT}/v1/logs")
         );
     }
 }

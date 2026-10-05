@@ -2981,7 +2981,7 @@ message OtelExportData {
   oneof signal {
     bytes trace_data = 2;
     // bytes metrics_data = 4;  // future
-    // bytes logs_data = 5;     // future
+    bytes logs_data = 5;
   }
 
   // Serialized OCSF events (each entry is a JSON-encoded OCSF event).

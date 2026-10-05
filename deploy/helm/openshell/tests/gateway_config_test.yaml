@@ -272,7 +272,20 @@ tests:
     asserts:
       - matchRegex:
           path: data["gateway.toml"]
-          pattern: '(?ms)\[openshell\.gateway\.otlp\].*?endpoint\s*=\s*"http://otel-collector\.observability\.svc:4317".*?sandbox_relay_enabled\s*=\s*true.*?service_name\s*=\s*"production-gateway"'
+          pattern: '(?ms)\[openshell\.gateway\.otlp\].*?endpoint\s*=\s*"http://otel-collector\.observability\.svc:4317".*?sandbox_relay_enabled\s*=\s*true.*?agent_signals\s*=\s*\["traces"\].*?service_name\s*=\s*"production-gateway"'
+
+  - it: renders explicit OTLP agent signals
+    template: templates/gateway-config.yaml
+    set:
+      server.otlp.endpoint: http://otel-collector.observability.svc:4317
+      server.otlp.sandboxRelayEnabled: true
+      server.otlp.agentSignals:
+        - traces
+        - logs
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?m)^agent_signals\s*=\s*\["traces", "logs"\]$'
 
   - it: keeps sandbox OTLP relay disabled unless explicitly enabled
     template: templates/gateway-config.yaml

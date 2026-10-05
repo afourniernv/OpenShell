@@ -812,6 +812,7 @@ mod tests {
                 service_name: Some("custom-gateway".to_string()),
                 agent_endpoint: None,
                 sandbox_relay_enabled: false,
+                agent_signals: Vec::default(),
             }),
             "production-us-west",
         );

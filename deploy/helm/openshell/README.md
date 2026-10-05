@@ -446,6 +446,7 @@ discovery endpoint or its TLS CA.
 | server.oidc.scopesClaim | string | `""` | Dot-separated path to the scopes array in the JWT claims. |
 | server.oidc.userRole | string | `""` | Role name for standard user access. |
 | server.otlp.agentEndpoint | string | `""` | Separate OTLP/gRPC collector endpoint for relayed agent traces. Empty sends agent traces to `endpoint`. |
+| server.otlp.agentSignals | list | `["traces"]` | Sandbox OTLP signals exposed through the relay. Logs require a gateway and supervisor that support `otel_export_logs_v1`. |
 | server.otlp.endpoint | string | `""` | OTLP/gRPC collector endpoint, conventionally using port 4317. |
 | server.otlp.sandboxRelayEnabled | bool | `false` | Allow sandbox traces to use the supervisor/gateway relay. This is a separate, default-off trust boundary from gateway self-observability. |
 | server.otlp.serviceName | string | `""` | Gateway OpenTelemetry service name. Empty uses openshell-gateway. |

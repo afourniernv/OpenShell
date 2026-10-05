@@ -33,6 +33,7 @@ use crate::supervisor_owner::{OWNER_TTL, OwnerError, OwnerGuard, SupervisorOwner
 
 const HEARTBEAT_INTERVAL_SECS: u32 = 15;
 const OTEL_EXPORT_CAPABILITY: &str = "otel_export";
+const OTEL_EXPORT_LOGS_CAPABILITY: &str = openshell_core::proto::OTEL_EXPORT_LOGS_V1_CAPABILITY;
 const OWNER_RENEW_TIMEOUT: Duration = Duration::from_secs(5);
 const RELAY_PENDING_TIMEOUT: Duration = Duration::from_secs(10);
 /// Initial backoff between session-availability polls in `wait_for_session`.
@@ -1994,9 +1995,7 @@ async fn establish_supervisor_session(
 
     // Step 3: Determine confirmed capabilities.
     let confirmed_capabilities = confirm_capabilities(&hello.capabilities, &state);
-    let otel_export_confirmed = confirmed_capabilities
-        .iter()
-        .any(|capability| capability == OTEL_EXPORT_CAPABILITY);
+    let otel_capabilities = ConfirmedOtelCapabilities::from_confirmed(&confirmed_capabilities);
 
     // Step 4: Send SessionAccepted.
     let accepted = GatewayMessage {
@@ -2071,7 +2070,7 @@ async fn establish_supervisor_session(
             &mut inbound,
             shutdown_rx,
             &mut owner_guard,
-            otel_export_confirmed,
+            otel_capabilities,
         )
         .await;
         let terminal_finalized = state_clone
@@ -2193,7 +2192,7 @@ async fn run_session_loop(
     inbound: &mut tonic::Streaming<SupervisorMessage>,
     mut shutdown_rx: oneshot::Receiver<()>,
     owner_guard: &mut OwnerGuard,
-    otel_export_confirmed: bool,
+    otel_capabilities: ConfirmedOtelCapabilities,
 ) {
     let mut gateway_shutdown = state.supervisor_sessions.shutdown.subscribe();
     let heartbeat_interval = Duration::from_secs(u64::from(HEARTBEAT_INTERVAL_SECS));
@@ -2220,7 +2219,7 @@ async fn run_session_loop(
                             session_id,
                             msg,
                             owner_guard,
-                            otel_export_confirmed,
+                            otel_capabilities,
                         )
                         .await
                         {
@@ -2274,9 +2273,9 @@ async fn handle_supervisor_message(
     session_id: &str,
     msg: SupervisorMessage,
     owner_guard: &mut OwnerGuard,
-    otel_export_confirmed: bool,
+    otel_capabilities: ConfirmedOtelCapabilities,
 ) -> bool {
-    if !supervisor_message_allowed(&msg, otel_export_confirmed) {
+    if !supervisor_message_allowed(&msg, otel_capabilities.any()) {
         warn!(
             sandbox_id = %sandbox_id,
             session_id = %session_id,
@@ -2371,7 +2370,7 @@ async fn handle_supervisor_message(
             );
         }
         Some(supervisor_message::Payload::OtelExport(otel_data)) => {
-            handle_otel_export(state, sandbox_id, session_id, otel_data);
+            handle_otel_export(state, sandbox_id, session_id, otel_capabilities, otel_data);
         }
         _ => {
             debug!(
@@ -2395,9 +2394,37 @@ fn supervisor_message_allowed(msg: &SupervisorMessage, otel_export_confirmed: bo
     ) || otel_export_confirmed
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+struct ConfirmedOtelCapabilities {
+    traces: bool,
+    logs: bool,
+}
+
+impl ConfirmedOtelCapabilities {
+    fn from_confirmed(confirmed: &[String]) -> Self {
+        let has = |expected: &str| confirmed.iter().any(|capability| capability == expected);
+        Self {
+            traces: has(OTEL_EXPORT_CAPABILITY),
+            logs: has(OTEL_EXPORT_LOGS_CAPABILITY),
+        }
+    }
+
+    const fn any(self) -> bool {
+        self.traces || self.logs
+    }
+}
+
 /// Check which advertised capabilities the gateway can confirm.
 fn confirm_capabilities(advertised: &[String], state: &Arc<ServerState>) -> Vec<String> {
-    let confirmed = select_confirmed_capabilities(advertised, state.otel_relay_exporter.is_some());
+    let confirmed = select_confirmed_capabilities(
+        advertised,
+        state
+            .otel_relay_exporter
+            .as_ref()
+            .map_or_else(crate::otel_relay::RelaySignals::none, |exporter| {
+                exporter.enabled_signals()
+            }),
+    );
     if !confirmed.is_empty() {
         info!(capabilities = ?confirmed, "confirmed supervisor capabilities");
     }
@@ -2407,11 +2434,18 @@ fn confirm_capabilities(advertised: &[String], state: &Arc<ServerState>) -> Vec<
 /// Keep each advertised capability the gateway can actually serve and drop
 /// the rest. `otel_relay_enabled` reflects whether `[openshell.gateway.otlp]`
 /// produced a relay exporter at startup.
-fn select_confirmed_capabilities(advertised: &[String], otel_relay_enabled: bool) -> Vec<String> {
+fn select_confirmed_capabilities(
+    advertised: &[String],
+    relay_signals: impl Into<crate::otel_relay::RelaySignals>,
+) -> Vec<String> {
+    let relay_signals = relay_signals.into();
     let mut confirmed = Vec::new();
     for cap in advertised {
         match cap.as_str() {
-            OTEL_EXPORT_CAPABILITY if otel_relay_enabled => {
+            OTEL_EXPORT_CAPABILITY if relay_signals.traces() => {
+                confirmed.push(cap.clone());
+            }
+            OTEL_EXPORT_LOGS_CAPABILITY if relay_signals.logs() => {
                 confirmed.push(cap.clone());
             }
             OTEL_EXPORT_CAPABILITY => {
@@ -2419,6 +2453,12 @@ fn select_confirmed_capabilities(advertised: &[String], otel_relay_enabled: bool
                     capability = "otel_export",
                     "supervisor advertised otel_export but gateway has no \
                      [openshell.gateway.otlp] config; capability not confirmed"
+                );
+            }
+            OTEL_EXPORT_LOGS_CAPABILITY => {
+                debug!(
+                    capability = OTEL_EXPORT_LOGS_CAPABILITY,
+                    "supervisor advertised OTLP logs but the signal is not enabled; capability not confirmed"
                 );
             }
             other => {
@@ -2460,11 +2500,33 @@ fn handle_otel_export(
     state: &Arc<ServerState>,
     sandbox_id: &str,
     session_id: &str,
+    confirmed: ConfirmedOtelCapabilities,
     otel_data: openshell_core::proto::OtelExportData,
 ) {
-    if let Some(openshell_core::proto::otel_export_data::Signal::TraceData(trace_data)) =
-        otel_data.signal
-        && !trace_data.is_empty()
+    use openshell_core::proto::otel_export_data::Signal;
+
+    enum ExportData {
+        Traces(Vec<u8>),
+        Logs(Vec<u8>),
+    }
+
+    let signal = match otel_data.signal {
+        Some(Signal::TraceData(data)) if !data.is_empty() && confirmed.traces => {
+            Some(ExportData::Traces(data))
+        }
+        Some(Signal::LogsData(data)) if !data.is_empty() && confirmed.logs => {
+            Some(ExportData::Logs(data))
+        }
+        Some(Signal::TraceData(_) | Signal::LogsData(_)) => {
+            debug!(
+                sandbox_id = %sandbox_id,
+                "OTEL relay: dropping signal not confirmed for this session"
+            );
+            None
+        }
+        None => None,
+    };
+    if let Some(signal) = signal
         && let Some(relay_exporter) = state.otel_relay_exporter.as_ref()
     {
         let exporter = relay_exporter.clone();
@@ -2472,41 +2534,53 @@ fn handle_otel_export(
         if let Some(export_permit) = exporter.try_reserve_export() {
             tokio::spawn(async move {
                 let _export_permit = export_permit;
-                match tokio::time::timeout(Duration::from_secs(10), exporter.export_raw(trace_data))
-                    .await
-                {
+                let signal_name = match &signal {
+                    ExportData::Traces(_) => "traces",
+                    ExportData::Logs(_) => "logs",
+                };
+                let export = async {
+                    match signal {
+                        ExportData::Traces(data) => exporter.export_raw(data).await,
+                        ExportData::Logs(data) => exporter.export_logs_raw(data).await,
+                    }
+                };
+                match tokio::time::timeout(Duration::from_secs(10), export).await {
                     Ok(Err(e)) => {
                         warn!(
                             sandbox_id = %sandbox_id,
+                            signal = signal_name,
                             error = %e,
-                            "OTEL relay: failed to export trace data"
+                            "OTEL relay: failed to export telemetry"
                         );
                     }
                     Err(_) => {
                         warn!(
                             sandbox_id = %sandbox_id,
+                            signal = signal_name,
                             "OTEL relay: export timed out"
                         );
                     }
                     Ok(Ok(crate::otel_relay::ExportOutcome::FullSuccess)) => {}
                     Ok(Ok(crate::otel_relay::ExportOutcome::PartialSuccess {
-                        rejected_spans,
+                        rejected_items,
                         error_message,
-                    })) if rejected_spans != 0 => {
+                    })) if rejected_items != 0 => {
                         warn!(
                             sandbox_id = %sandbox_id,
-                            rejected_spans,
+                            signal = signal_name,
+                            rejected_items,
                             error = %error_message,
-                            "OTEL relay: collector partially accepted trace data"
+                            "OTEL relay: collector partially accepted telemetry"
                         );
                     }
                     Ok(Ok(crate::otel_relay::ExportOutcome::PartialSuccess {
-                        rejected_spans,
+                        rejected_items,
                         error_message,
                     })) => {
                         info!(
                             sandbox_id = %sandbox_id,
-                            rejected_spans,
+                            signal = signal_name,
+                            rejected_items,
                             message = %error_message,
                             "OTEL relay: collector returned an export diagnostic"
                         );
@@ -2516,7 +2590,7 @@ fn handle_otel_export(
         } else {
             debug!(
                 sandbox_id = %sandbox_id,
-                "OTEL relay: in-flight export limit reached, dropping trace batch"
+                "OTEL relay: in-flight export limit reached, dropping telemetry batch"
             );
         }
     }
@@ -2808,6 +2882,27 @@ mod tests {
     #[test]
     fn select_confirmed_capabilities_empty_advertisement_confirms_nothing() {
         assert!(select_confirmed_capabilities(&[], true).is_empty());
+    }
+
+    #[test]
+    fn logs_capability_requires_logs_to_be_enabled() {
+        let advertised = caps(&["otel_export", "otel_export_logs_v1"]);
+        let traces_only = crate::otel_relay::RelaySignals::from_config(&[
+            crate::config_file::OtlpAgentSignal::Traces,
+        ]);
+        assert_eq!(
+            select_confirmed_capabilities(&advertised, traces_only),
+            caps(&["otel_export"])
+        );
+
+        let traces_and_logs = crate::otel_relay::RelaySignals::from_config(&[
+            crate::config_file::OtlpAgentSignal::Traces,
+            crate::config_file::OtlpAgentSignal::Logs,
+        ]);
+        assert_eq!(
+            select_confirmed_capabilities(&advertised, traces_and_logs),
+            advertised
+        );
     }
 
     #[test]

@@ -42,6 +42,7 @@ const MAX_BACKOFF: Duration = Duration::from_secs(30);
 
 /// Capability name under which the supervisor offers OTLP relaying.
 const OTEL_EXPORT_CAPABILITY: &str = "otel_export";
+const OTEL_EXPORT_LOGS_CAPABILITY: &str = openshell_core::proto::OTEL_EXPORT_LOGS_V1_CAPABILITY;
 
 /// Final-drain request: the session acks on this sender once the OTLP
 /// receiver is stopped and the buffer is flushed onto the session stream.
@@ -72,7 +73,10 @@ pub struct SessionRuntimeContext {
 /// Capabilities the supervisor advertises in `SupervisorHello`.
 fn advertised_capabilities(relay_running: bool) -> Vec<String> {
     if relay_running {
-        vec![OTEL_EXPORT_CAPABILITY.to_string()]
+        vec![
+            OTEL_EXPORT_CAPABILITY.to_string(),
+            OTEL_EXPORT_LOGS_CAPABILITY.to_string(),
+        ]
     } else {
         Vec::new()
     }
@@ -80,12 +84,38 @@ fn advertised_capabilities(relay_running: bool) -> Vec<String> {
 
 /// Whether buffered telemetry may be forwarded on this session: the relay
 /// must be running and the gateway must have confirmed `otel_export`.
-fn otel_forwarding_active(relay_running: bool, accepted: &SessionAccepted) -> bool {
-    relay_running
-        && accepted
-            .capabilities
-            .iter()
-            .any(|capability| capability == OTEL_EXPORT_CAPABILITY)
+#[derive(Clone, Copy)]
+struct OtelForwardingCapabilities {
+    traces: bool,
+    logs: bool,
+}
+
+impl OtelForwardingCapabilities {
+    fn negotiated(relay_running: bool, accepted: &SessionAccepted) -> Self {
+        let has = |expected: &str| {
+            relay_running
+                && accepted
+                    .capabilities
+                    .iter()
+                    .any(|capability| capability == expected)
+        };
+        Self {
+            traces: has(OTEL_EXPORT_CAPABILITY),
+            logs: has(OTEL_EXPORT_LOGS_CAPABILITY),
+        }
+    }
+
+    const fn any(self) -> bool {
+        self.traces || self.logs
+    }
+
+    const fn allows(self, item: &crate::otlp::buffer::TelemetryItem) -> bool {
+        match item {
+            crate::otlp::buffer::TelemetryItem::Trace(_)
+            | crate::otlp::buffer::TelemetryItem::Ocsf(_) => self.traces,
+            crate::otlp::buffer::TelemetryItem::Logs(_) => self.logs,
+        }
+    }
 }
 
 /// Parse a gRPC endpoint URI into an OCSF `Endpoint` (host + port). Falls back
@@ -501,8 +531,8 @@ async fn run_single_session(
     // Forwarding is gated per session on the negotiated capability. The
     // receiver keeps serving either way; a declining session just leaves
     // items in the bounded buffer until a later session confirms.
-    let otel_export_confirmed = otel_forwarding_active(relay.is_running(), &accepted);
-    let mut otel_active = otel_export_confirmed;
+    let otel_capabilities = OtelForwardingCapabilities::negotiated(relay.is_running(), &accepted);
+    let mut otel_active = otel_capabilities.any();
     if otel_active {
         info!("gateway confirmed otel_export capability; OTLP forwarding active");
     } else if relay.is_running() {
@@ -538,7 +568,9 @@ async fn run_single_session(
                     Some(item) => {
                         // Non-blocking on purpose: telemetry must never stall
                         // control traffic on the shared outbound channel.
-                        if tx.try_send(export_message(&config.sandbox_id, item)).is_err() {
+                        if !otel_capabilities.allows(&item) {
+                            debug!("OTEL relay: dropping signal not confirmed for this session");
+                        } else if tx.try_send(export_message(&config.sandbox_id, item)).is_err() {
                             debug!("OTEL relay: session channel full or closed, dropping message");
                         }
                     }
@@ -556,7 +588,12 @@ async fn run_single_session(
                 otel_active = false;
                 if let Ok(done_tx) = request {
                     relay
-                        .stop_and_drain(&config.sandbox_id, &tx, otel_export_confirmed)
+                        .stop_and_drain_signals(
+                            &config.sandbox_id,
+                            &tx,
+                            otel_capabilities.traces,
+                            otel_capabilities.logs,
+                        )
                         .await;
                     let _ = done_tx.send(());
                 }
@@ -1008,28 +1045,32 @@ mod telemetry_tests {
     fn otel_export_is_advertised_only_with_a_running_relay() {
         assert_eq!(
             advertised_capabilities(true),
-            vec!["otel_export".to_string()]
+            vec!["otel_export".to_string(), "otel_export_logs_v1".to_string()]
         );
         assert!(advertised_capabilities(false).is_empty());
     }
 
     #[test]
     fn forwarding_requires_both_a_running_relay_and_gateway_confirmation() {
-        assert!(otel_forwarding_active(
-            true,
-            &accepted_with(&["otel_export"])
-        ));
         assert!(
-            !otel_forwarding_active(true, &accepted_with(&[])),
+            OtelForwardingCapabilities::negotiated(true, &accepted_with(&["otel_export"])).traces
+        );
+        assert!(
+            !OtelForwardingCapabilities::negotiated(true, &accepted_with(&[])).any(),
             "a declining gateway pauses forwarding"
         );
         assert!(
-            !otel_forwarding_active(false, &accepted_with(&["otel_export"])),
+            !OtelForwardingCapabilities::negotiated(false, &accepted_with(&["otel_export"])).any(),
             "a stopped relay never forwards, whatever the gateway says"
         );
         assert!(
-            !otel_forwarding_active(true, &accepted_with(&["metrics_export"])),
+            !OtelForwardingCapabilities::negotiated(true, &accepted_with(&["metrics_export"]))
+                .any(),
             "only the exact capability name counts"
+        );
+        assert!(
+            OtelForwardingCapabilities::negotiated(true, &accepted_with(&["otel_export_logs_v1"]))
+                .logs
         );
     }
 }

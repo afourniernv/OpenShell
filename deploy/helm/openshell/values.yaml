@@ -274,6 +274,9 @@ server:
     agentEndpoint: ""
     # -- Allow sandbox traces to use the supervisor/gateway relay. This is a separate, default-off trust boundary from gateway self-observability.
     sandboxRelayEnabled: false
+    # -- Sandbox OTLP signals exposed through the relay. Logs require a gateway and supervisor that support `otel_export_logs_v1`.
+    agentSignals:
+      - traces
   # Gateway-native OCSF JSONL output.
   ocsfLog:
     # -- Write gateway OCSF events as JSONL.
