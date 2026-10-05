@@ -278,9 +278,10 @@ impl TryFrom<RawOcsfLogConfig> for OcsfLogConfig {
 }
 /// `[openshell.gateway.otlp]` section.
 ///
-/// Presence of this table enables OTLP export; there is no `enabled` flag.
-/// SDK tuning knobs are deliberately absent — see [`crate::otel_tracing`] for what
-/// this table owns and what the `OTEL_*` environment variables own.
+/// Presence of this table enables gateway OTLP export. Sandbox-originated
+/// telemetry remains disabled unless [`OtlpConfig::sandbox_relay_enabled`] is
+/// true. SDK tuning knobs are deliberately absent — see [`crate::otel_tracing`]
+/// for what this table owns and what the `OTEL_*` environment variables own.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OtlpConfig {
@@ -297,6 +298,12 @@ pub struct OtlpConfig {
     /// unless the operator splits them.
     #[serde(default)]
     pub agent_endpoint: Option<String>,
+
+    /// Allow sandboxes to send traces through the supervisor and gateway to
+    /// the agent collector lane. Defaults to false so gateway
+    /// self-observability does not implicitly authorize workload telemetry.
+    #[serde(default)]
+    pub sandbox_relay_enabled: bool,
 }
 
 impl OtlpConfig {
@@ -938,6 +945,7 @@ service_name = "openshell-gateway-dev"
         );
         assert_eq!(otlp.service_name.as_deref(), Some("openshell-gateway-dev"));
         assert_eq!(otlp.agent_lane_endpoint(), otlp.endpoint);
+        assert!(!otlp.sandbox_relay_enabled);
     }
 
     #[test]
@@ -952,6 +960,20 @@ agent_endpoint = "http://agent-collector:4317"
         let otlp = file.openshell.gateway.otlp.expect("otlp config");
         assert_eq!(otlp.endpoint, "http://infra-collector:4317");
         assert_eq!(otlp.agent_lane_endpoint(), "http://agent-collector:4317");
+        assert!(!otlp.sandbox_relay_enabled);
+    }
+
+    #[test]
+    fn parses_explicit_sandbox_otlp_relay_enablement() {
+        let toml = r#"
+[openshell.gateway.otlp]
+endpoint = "http://infra-collector:4317"
+sandbox_relay_enabled = true
+"#;
+        let tmp = write_tmp(toml);
+        let file = load(tmp.path()).expect("valid otlp config parses");
+        let otlp = file.openshell.gateway.otlp.expect("otlp config");
+        assert!(otlp.sandbox_relay_enabled);
     }
 
     #[test]

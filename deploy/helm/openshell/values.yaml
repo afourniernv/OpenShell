@@ -272,6 +272,8 @@ server:
     serviceName: ""
     # -- Separate OTLP/gRPC collector endpoint for relayed agent traces. Empty sends agent traces to `endpoint`.
     agentEndpoint: ""
+    # -- Allow sandbox traces to use the supervisor/gateway relay. This is a separate, default-off trust boundary from gateway self-observability.
+    sandboxRelayEnabled: false
   # Gateway-native OCSF JSONL output.
   ocsfLog:
     # -- Write gateway OCSF events as JSONL.

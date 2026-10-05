@@ -811,6 +811,7 @@ mod tests {
                 endpoint: "http://collector.internal:4317".to_string(),
                 service_name: Some("custom-gateway".to_string()),
                 agent_endpoint: None,
+                sandbox_relay_enabled: false,
             }),
             "production-us-west",
         );

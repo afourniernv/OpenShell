@@ -32,6 +32,7 @@ use crate::persistence::ObjectId;
 use crate::supervisor_owner::{OWNER_TTL, OwnerError, OwnerGuard, SupervisorOwnerIndex};
 
 const HEARTBEAT_INTERVAL_SECS: u32 = 15;
+const OTEL_EXPORT_CAPABILITY: &str = "otel_export";
 const OWNER_RENEW_TIMEOUT: Duration = Duration::from_secs(5);
 const RELAY_PENDING_TIMEOUT: Duration = Duration::from_secs(10);
 /// Initial backoff between session-availability polls in `wait_for_session`.
@@ -1993,6 +1994,9 @@ async fn establish_supervisor_session(
 
     // Step 3: Determine confirmed capabilities.
     let confirmed_capabilities = confirm_capabilities(&hello.capabilities, &state);
+    let otel_export_confirmed = confirmed_capabilities
+        .iter()
+        .any(|capability| capability == OTEL_EXPORT_CAPABILITY);
 
     // Step 4: Send SessionAccepted.
     let accepted = GatewayMessage {
@@ -2067,6 +2071,7 @@ async fn establish_supervisor_session(
             &mut inbound,
             shutdown_rx,
             &mut owner_guard,
+            otel_export_confirmed,
         )
         .await;
         let terminal_finalized = state_clone
@@ -2179,6 +2184,7 @@ pub async fn handle_finalize_main_process_exit(
     ))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_session_loop(
     state: &Arc<ServerState>,
     sandbox_id: &str,
@@ -2187,6 +2193,7 @@ async fn run_session_loop(
     inbound: &mut tonic::Streaming<SupervisorMessage>,
     mut shutdown_rx: oneshot::Receiver<()>,
     owner_guard: &mut OwnerGuard,
+    otel_export_confirmed: bool,
 ) {
     let mut gateway_shutdown = state.supervisor_sessions.shutdown.subscribe();
     let heartbeat_interval = Duration::from_secs(u64::from(HEARTBEAT_INTERVAL_SECS));
@@ -2207,7 +2214,16 @@ async fn run_session_loop(
             msg = inbound.message() => {
                 match msg {
                     Ok(Some(msg)) => {
-                        if !handle_supervisor_message(state, sandbox_id, session_id, msg, owner_guard).await {
+                        if !handle_supervisor_message(
+                            state,
+                            sandbox_id,
+                            session_id,
+                            msg,
+                            owner_guard,
+                            otel_export_confirmed,
+                        )
+                        .await
+                        {
                             break;
                         }
                     }
@@ -2258,7 +2274,18 @@ async fn handle_supervisor_message(
     session_id: &str,
     msg: SupervisorMessage,
     owner_guard: &mut OwnerGuard,
+    otel_export_confirmed: bool,
 ) -> bool {
+    if !supervisor_message_allowed(&msg, otel_export_confirmed) {
+        warn!(
+            sandbox_id = %sandbox_id,
+            session_id = %session_id,
+            capability = OTEL_EXPORT_CAPABILITY,
+            "supervisor session: dropped telemetry without negotiated capability"
+        );
+        return true;
+    }
+
     match msg.payload {
         Some(supervisor_message::Payload::Heartbeat(_)) => {
             let owner_index = SupervisorOwnerIndex::new(state.store.clone(), OWNER_TTL);
@@ -2357,6 +2384,17 @@ async fn handle_supervisor_message(
     true
 }
 
+/// Apply capability negotiation to supervisor-originated payloads before any
+/// payload-specific work. Heartbeats and relay control remain available on
+/// legacy sessions; telemetry is accepted only after `otel_export` was
+/// confirmed in `SessionAccepted`.
+fn supervisor_message_allowed(msg: &SupervisorMessage, otel_export_confirmed: bool) -> bool {
+    !matches!(
+        msg.payload.as_ref(),
+        Some(supervisor_message::Payload::OtelExport(_))
+    ) || otel_export_confirmed
+}
+
 /// Check which advertised capabilities the gateway can confirm.
 fn confirm_capabilities(advertised: &[String], state: &Arc<ServerState>) -> Vec<String> {
     let confirmed = select_confirmed_capabilities(advertised, state.otel_relay_exporter.is_some());
@@ -2373,10 +2411,10 @@ fn select_confirmed_capabilities(advertised: &[String], otel_relay_enabled: bool
     let mut confirmed = Vec::new();
     for cap in advertised {
         match cap.as_str() {
-            "otel_export" if otel_relay_enabled => {
+            OTEL_EXPORT_CAPABILITY if otel_relay_enabled => {
                 confirmed.push(cap.clone());
             }
-            "otel_export" => {
+            OTEL_EXPORT_CAPABILITY => {
                 debug!(
                     capability = "otel_export",
                     "supervisor advertised otel_export but gateway has no \
@@ -2740,6 +2778,29 @@ mod tests {
     #[test]
     fn select_confirmed_capabilities_empty_advertisement_confirms_nothing() {
         assert!(select_confirmed_capabilities(&[], true).is_empty());
+    }
+
+    #[test]
+    fn supervisor_otel_export_requires_session_capability() {
+        let telemetry = SupervisorMessage {
+            payload: Some(supervisor_message::Payload::OtelExport(
+                openshell_core::proto::OtelExportData::default(),
+            )),
+        };
+
+        assert!(!supervisor_message_allowed(&telemetry, false));
+        assert!(supervisor_message_allowed(&telemetry, true));
+    }
+
+    #[test]
+    fn supervisor_control_messages_do_not_require_otel_capability() {
+        let heartbeat = SupervisorMessage {
+            payload: Some(supervisor_message::Payload::Heartbeat(
+                openshell_core::proto::SupervisorHeartbeat {},
+            )),
+        };
+
+        assert!(supervisor_message_allowed(&heartbeat, false));
     }
 
     #[test]
