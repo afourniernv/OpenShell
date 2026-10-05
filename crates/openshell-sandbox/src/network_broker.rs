@@ -841,6 +841,7 @@ fn connect_socket(
     // it through loopback. Relay it before the ordinary local socket path.
     if destination.ip().is_loopback()
         && !openshell_core::google_cloud::is_metadata_destination(destination)
+        && destination != openshell_core::sandbox_env::OTLP_RELAY_SOCKET_ADDR
     {
         let mut registry = lock(&registry);
         let entry = registry.resolve_mut(notification.tid, fd)?;
@@ -2158,6 +2159,54 @@ mod tests {
             let mut probe = [0; 14];
             stream.read_exact(&mut probe).await.unwrap();
             assert_eq!(&probe, b"metadata-probe");
+            stream.write_all(b"ok").await.unwrap();
+        });
+        assert_eq!(&client.join().unwrap().unwrap(), b"ok");
+    }
+
+    #[test]
+    fn otlp_loopback_connect_is_relayed_to_supervisor() {
+        use std::io::{Read as _, Write as _};
+        let (launcher, listener) =
+            openshell_isolation_interface::linux::workload_launcher::start().unwrap();
+        let broker = NetworkBroker::start_for_test(listener).unwrap();
+        let client = std::thread::spawn(move || {
+            launcher
+                .execute(|| {
+                    let mut stream =
+                        TcpStream::connect(openshell_core::sandbox_env::OTLP_RELAY_SOCKET_ADDR)?;
+                    stream.write_all(b"otlp-probe")?;
+                    let mut reply = [0; 2];
+                    stream.read_exact(&mut reply)?;
+                    Ok::<_, io::Error>(reply)
+                })
+                .unwrap()
+        });
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+            let pending = tokio::time::timeout(Duration::from_secs(30), broker.accept())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                pending.destination,
+                openshell_core::sandbox_env::OTLP_RELAY_SOCKET_ADDR
+            );
+            let stream = pending
+                .complete(TcpOpenDecision::RelayReady)
+                .await
+                .unwrap()
+                .unwrap();
+            stream.set_nonblocking(true).unwrap();
+            let mut stream = tokio::net::TcpStream::from_std(stream).unwrap();
+            let mut probe = [0; 10];
+            stream.read_exact(&mut probe).await.unwrap();
+            assert_eq!(&probe, b"otlp-probe");
             stream.write_all(b"ok").await.unwrap();
         });
         assert_eq!(&client.join().unwrap().unwrap(), b"ok");
