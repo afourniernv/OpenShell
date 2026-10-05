@@ -294,12 +294,10 @@ pub(crate) mod test_util {
         }
     }
 
-    /// A minimal but non-empty protobuf `ExportTraceServiceRequest`.
     pub fn sample_trace_body() -> Vec<u8> {
         sample_trace_request().encode_to_vec()
     }
 
-    /// The same minimal request encoded with OTLP/HTTP JSON mapping.
     pub fn sample_trace_json_body() -> Vec<u8> {
         serde_json::to_vec(&sample_trace_request()).expect("serialize trace request")
     }
@@ -339,7 +337,6 @@ pub(crate) mod test_util {
         client
     }
 
-    /// Write `req` and read one complete response, including its declared body.
     pub async fn send_response<S: AsyncRead + AsyncWrite + Unpin>(
         stream: &mut S,
         req: &[u8],
@@ -373,7 +370,6 @@ pub(crate) mod test_util {
         }
     }
 
-    /// Write `req` and return the response status line; the stream stays open.
     pub async fn send<S: AsyncRead + AsyncWrite + Unpin>(stream: &mut S, req: &[u8]) -> String {
         let response = send_response(stream, req).await;
         let head = String::from_utf8_lossy(&response);

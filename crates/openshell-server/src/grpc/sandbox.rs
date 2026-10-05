@@ -782,17 +782,8 @@ fn validate_create_sandbox_request_pre_io(
     Ok(())
 }
 
-/// Set the traces-specific OTLP endpoint and protocol to the supervisor relay
-/// when `otel_relay_enabled`, unless the caller already chose an endpoint or
-/// an incompatible traces-specific protocol.
-///
-/// A traces-specific endpoint takes precedence over the generic endpoint under
-/// the OpenTelemetry environment contract. Either non-empty caller-supplied
-/// endpoint, or the valid but incompatible `grpc` traces protocol, leaves the
-/// environment untouched. Empty and unknown values behave as unset. The relay
-/// supports both OTLP HTTP protocols, so a preselected `http/protobuf` or
-/// `http/json` protocol is normalized and preserved.
-/// Returns whether anything was injected.
+/// Inject trace-specific relay settings unless the caller selected an endpoint
+/// or the unsupported gRPC protocol.
 fn inject_otel_relay_environment(
     environment: &mut HashMap<String, String>,
     otel_relay_enabled: bool,
@@ -4055,28 +4046,24 @@ mod tests {
     }
 
     #[test]
-    fn inject_otel_relay_environment_keeps_a_caller_supplied_traces_endpoint() {
-        let mut env = HashMap::from([(
-            OTEL_EXPORTER_OTLP_TRACES_ENDPOINT.to_string(),
-            "https://traces.example/v1/traces".to_string(),
-        )]);
-        let original = env.clone();
-        assert!(!inject_otel_relay_environment(&mut env, true));
-        assert_eq!(env, original);
-    }
-
-    #[test]
-    fn inject_otel_relay_environment_keeps_a_caller_supplied_generic_endpoint() {
-        let mut env = HashMap::from([
-            (
-                OTEL_EXPORTER_OTLP_ENDPOINT.to_string(),
-                "https://collector.example:4317".to_string(),
-            ),
-            (OTEL_EXPORTER_OTLP_PROTOCOL.to_string(), "grpc".to_string()),
-        ]);
-        let original = env.clone();
-        assert!(!inject_otel_relay_environment(&mut env, true));
-        assert_eq!(env, original);
+    fn inject_otel_relay_environment_keeps_caller_supplied_endpoints() {
+        for mut env in [
+            HashMap::from([(
+                OTEL_EXPORTER_OTLP_TRACES_ENDPOINT.to_string(),
+                "https://traces.example/v1/traces".to_string(),
+            )]),
+            HashMap::from([
+                (
+                    OTEL_EXPORTER_OTLP_ENDPOINT.to_string(),
+                    "https://collector.example:4317".to_string(),
+                ),
+                (OTEL_EXPORTER_OTLP_PROTOCOL.to_string(), "grpc".to_string()),
+            ]),
+        ] {
+            let original = env.clone();
+            assert!(!inject_otel_relay_environment(&mut env, true));
+            assert_eq!(env, original);
+        }
     }
 
     #[test]
@@ -4101,69 +4088,37 @@ mod tests {
     }
 
     #[test]
-    fn inject_otel_relay_environment_keeps_an_incompatible_traces_protocol() {
-        let mut env = HashMap::from([(
-            OTEL_EXPORTER_OTLP_TRACES_PROTOCOL.to_string(),
-            "grpc".to_string(),
-        )]);
-        let original = env.clone();
-        assert!(!inject_otel_relay_environment(&mut env, true));
-        assert_eq!(env, original);
-    }
-
-    #[test]
-    fn inject_otel_relay_environment_accepts_a_compatible_traces_protocol() {
-        let mut env = HashMap::from([(
-            OTEL_EXPORTER_OTLP_TRACES_PROTOCOL.to_string(),
-            " HTTP/PROTOBUF ".to_string(),
-        )]);
-        assert!(inject_otel_relay_environment(&mut env, true));
-        assert_eq!(
-            env.get(OTEL_EXPORTER_OTLP_TRACES_ENDPOINT)
-                .map(String::as_str),
-            Some(OTLP_RELAY_TRACES_ENDPOINT)
-        );
-        assert_eq!(
-            env.get(OTEL_EXPORTER_OTLP_TRACES_PROTOCOL)
-                .map(String::as_str),
-            Some("http/protobuf")
-        );
-    }
-
-    #[test]
-    fn inject_otel_relay_environment_defaults_blank_or_unknown_protocols() {
-        for protocol in ["", " \t", "http/xml", "not-a-protocol"] {
+    fn inject_otel_relay_environment_honors_trace_protocols() {
+        for (protocol, should_inject, expected_protocol) in [
+            ("grpc", false, "grpc"),
+            (" HTTP/PROTOBUF ", true, "http/protobuf"),
+            (" HTTP/JSON ", true, "http/json"),
+            ("", true, "http/protobuf"),
+            (" \t", true, "http/protobuf"),
+            ("http/xml", true, "http/protobuf"),
+            ("not-a-protocol", true, "http/protobuf"),
+        ] {
             let mut env = HashMap::from([(
                 OTEL_EXPORTER_OTLP_TRACES_PROTOCOL.to_string(),
                 protocol.to_string(),
             )]);
-            assert!(inject_otel_relay_environment(&mut env, true));
+            assert_eq!(
+                inject_otel_relay_environment(&mut env, true),
+                should_inject,
+                "unexpected relay decision for {protocol:?}"
+            );
             assert_eq!(
                 env.get(OTEL_EXPORTER_OTLP_TRACES_PROTOCOL)
                     .map(String::as_str),
-                Some("http/protobuf"),
-                "protocol {protocol:?} should behave as unset"
+                Some(expected_protocol),
+                "unexpected normalized protocol for {protocol:?}"
+            );
+            assert_eq!(
+                env.get(OTEL_EXPORTER_OTLP_TRACES_ENDPOINT)
+                    .map(String::as_str),
+                should_inject.then_some(OTLP_RELAY_TRACES_ENDPOINT)
             );
         }
-    }
-
-    #[test]
-    fn inject_otel_relay_environment_preserves_http_json() {
-        let mut env = HashMap::from([(
-            OTEL_EXPORTER_OTLP_TRACES_PROTOCOL.to_string(),
-            " HTTP/JSON ".to_string(),
-        )]);
-        assert!(inject_otel_relay_environment(&mut env, true));
-        assert_eq!(
-            env.get(OTEL_EXPORTER_OTLP_TRACES_ENDPOINT)
-                .map(String::as_str),
-            Some(OTLP_RELAY_TRACES_ENDPOINT)
-        );
-        assert_eq!(
-            env.get(OTEL_EXPORTER_OTLP_TRACES_PROTOCOL)
-                .map(String::as_str),
-            Some("http/json")
-        );
     }
 
     #[test]
