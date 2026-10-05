@@ -806,8 +806,10 @@ fn inject_otel_relay_environment(
 ) -> bool {
     use openshell_core::sandbox_env::{
         OTEL_EXPORTER_OTLP_ENDPOINT, OTEL_EXPORTER_OTLP_LOGS_ENDPOINT,
-        OTEL_EXPORTER_OTLP_LOGS_PROTOCOL, OTEL_EXPORTER_OTLP_TRACES_ENDPOINT,
-        OTEL_EXPORTER_OTLP_TRACES_PROTOCOL, OTLP_RELAY_LOGS_ENDPOINT, OTLP_RELAY_TRACES_ENDPOINT,
+        OTEL_EXPORTER_OTLP_LOGS_PROTOCOL, OTEL_EXPORTER_OTLP_METRICS_ENDPOINT,
+        OTEL_EXPORTER_OTLP_METRICS_PROTOCOL, OTEL_EXPORTER_OTLP_TRACES_ENDPOINT,
+        OTEL_EXPORTER_OTLP_TRACES_PROTOCOL, OTLP_RELAY_LOGS_ENDPOINT, OTLP_RELAY_METRICS_ENDPOINT,
+        OTLP_RELAY_TRACES_ENDPOINT,
     };
     let relay_signals = relay_signals.into();
     let has_nonempty_endpoint = |environment: &HashMap<String, String>, key: &str| {
@@ -832,6 +834,12 @@ fn inject_otel_relay_environment(
             OTEL_EXPORTER_OTLP_LOGS_ENDPOINT,
             OTEL_EXPORTER_OTLP_LOGS_PROTOCOL,
             OTLP_RELAY_LOGS_ENDPOINT,
+        ),
+        (
+            relay_signals.metrics(),
+            OTEL_EXPORTER_OTLP_METRICS_ENDPOINT,
+            OTEL_EXPORTER_OTLP_METRICS_PROTOCOL,
+            OTLP_RELAY_METRICS_ENDPOINT,
         ),
     ] {
         if !enabled || has_nonempty_endpoint(environment, endpoint_key) {
@@ -4013,9 +4021,10 @@ mod tests {
     };
     use openshell_core::sandbox_env::{
         OTEL_EXPORTER_OTLP_ENDPOINT, OTEL_EXPORTER_OTLP_LOGS_ENDPOINT,
-        OTEL_EXPORTER_OTLP_LOGS_PROTOCOL, OTEL_EXPORTER_OTLP_PROTOCOL,
+        OTEL_EXPORTER_OTLP_LOGS_PROTOCOL, OTEL_EXPORTER_OTLP_METRICS_ENDPOINT,
+        OTEL_EXPORTER_OTLP_METRICS_PROTOCOL, OTEL_EXPORTER_OTLP_PROTOCOL,
         OTEL_EXPORTER_OTLP_TRACES_ENDPOINT, OTEL_EXPORTER_OTLP_TRACES_PROTOCOL,
-        OTLP_RELAY_LOGS_ENDPOINT, OTLP_RELAY_TRACES_ENDPOINT,
+        OTLP_RELAY_LOGS_ENDPOINT, OTLP_RELAY_METRICS_ENDPOINT, OTLP_RELAY_TRACES_ENDPOINT,
     };
 
     #[tokio::test]
@@ -4178,11 +4187,12 @@ mod tests {
     }
 
     #[test]
-    fn inject_otel_relay_environment_adds_logs_only_when_enabled() {
+    fn inject_otel_relay_environment_adds_optional_signals_when_enabled() {
         let mut env = HashMap::new();
         let signals = crate::otel_relay::RelaySignals::from_config(&[
             crate::config_file::OtlpAgentSignal::Traces,
             crate::config_file::OtlpAgentSignal::Logs,
+            crate::config_file::OtlpAgentSignal::Metrics,
         ]);
         assert!(inject_otel_relay_environment(&mut env, signals));
         assert_eq!(
@@ -4195,10 +4205,21 @@ mod tests {
                 .map(String::as_str),
             Some("http/protobuf")
         );
+        assert_eq!(
+            env.get(OTEL_EXPORTER_OTLP_METRICS_ENDPOINT)
+                .map(String::as_str),
+            Some(OTLP_RELAY_METRICS_ENDPOINT)
+        );
+        assert_eq!(
+            env.get(OTEL_EXPORTER_OTLP_METRICS_PROTOCOL)
+                .map(String::as_str),
+            Some("http/protobuf")
+        );
 
         let mut trace_only = HashMap::new();
         assert!(inject_otel_relay_environment(&mut trace_only, true));
         assert!(!trace_only.contains_key(OTEL_EXPORTER_OTLP_LOGS_ENDPOINT));
+        assert!(!trace_only.contains_key(OTEL_EXPORTER_OTLP_METRICS_ENDPOINT));
     }
 
     #[test]

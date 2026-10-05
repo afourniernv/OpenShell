@@ -66,6 +66,9 @@ pub mod test {
 /// Supervisor capability for relaying OTLP logs.
 pub const OTEL_EXPORT_LOGS_V1_CAPABILITY: &str = "otel_export_logs_v1";
 
+/// Supervisor capability for relaying OTLP metrics.
+pub const OTEL_EXPORT_METRICS_V1_CAPABILITY: &str = "otel_export_metrics_v1";
+
 pub mod middleware {
     pub use super::generated::openshell::middleware::v1;
 }

@@ -29,7 +29,7 @@ use super::buffer::{TelemetrySendError, TelemetrySender};
 use super::enrichment::{self, ContentType, EnrichmentError};
 use super::{
     MAX_TELEMETRY_ITEM_BYTES, RECEIVER_SHUTDOWN_TIMEOUT, SandboxMetadata, admit_logs_message,
-    admit_trace_message,
+    admit_metrics_message, admit_trace_message,
 };
 
 /// Upper bound on concurrently served relay connections.
@@ -228,6 +228,7 @@ async fn handle_request(
     let signal = match (req.method(), req.uri().path()) {
         (&Method::POST, "/v1/traces") => SignalKind::Traces,
         (&Method::POST, "/v1/logs") => SignalKind::Logs,
+        (&Method::POST, "/v1/metrics") => SignalKind::Metrics,
         _ => {
             return Ok(Response::builder()
                 .status(StatusCode::NOT_FOUND)
@@ -319,6 +320,12 @@ async fn handle_request(
                 &metadata_for_processing,
                 enrichment_enabled,
             ),
+            SignalKind::Metrics => enrichment::enrich_metrics(
+                &body,
+                content_type,
+                &metadata_for_processing,
+                enrichment_enabled,
+            ),
         }
     })
     .await;
@@ -341,6 +348,7 @@ async fn handle_request(
             let enriched = match signal {
                 SignalKind::Traces => admit_trace_message(&metadata.sandbox_id, enriched),
                 SignalKind::Logs => admit_logs_message(&metadata.sandbox_id, enriched),
+                SignalKind::Metrics => admit_metrics_message(&metadata.sandbox_id, enriched),
             };
             let enriched = match enriched {
                 Ok(enriched) => enriched,
@@ -358,6 +366,7 @@ async fn handle_request(
             let queued = match signal {
                 SignalKind::Traces => buf_tx.send_trace(enriched),
                 SignalKind::Logs => buf_tx.send_logs(enriched),
+                SignalKind::Metrics => buf_tx.send_metrics(enriched),
             };
             match queued {
                 Ok(()) => {
@@ -423,6 +432,7 @@ async fn handle_request(
 enum SignalKind {
     Traces,
     Logs,
+    Metrics,
 }
 
 fn parse_content_type(headers: &hyper::HeaderMap) -> Option<ContentType> {
@@ -445,8 +455,12 @@ pub(crate) mod test_util {
     use std::time::Duration;
 
     use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
+    use opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest;
     use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
     use opentelemetry_proto::tonic::logs::v1::{LogRecord, ResourceLogs, ScopeLogs};
+    use opentelemetry_proto::tonic::metrics::v1::{
+        Gauge, Metric, NumberDataPoint, ResourceMetrics, ScopeMetrics, metric,
+    };
     use opentelemetry_proto::tonic::trace::v1::{ResourceSpans, ScopeSpans, Span};
     use prost::Message;
     use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream};
@@ -478,6 +492,24 @@ pub(crate) mod test_util {
             resource_logs: vec![ResourceLogs {
                 scope_logs: vec![ScopeLogs {
                     log_records: vec![LogRecord::default()],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+        }
+        .encode_to_vec()
+    }
+
+    pub fn sample_metrics_body() -> Vec<u8> {
+        ExportMetricsServiceRequest {
+            resource_metrics: vec![ResourceMetrics {
+                scope_metrics: vec![ScopeMetrics {
+                    metrics: vec![Metric {
+                        data: Some(metric::Data::Gauge(Gauge {
+                            data_points: vec![NumberDataPoint::default()],
+                        })),
+                        ..Default::default()
+                    }],
                     ..Default::default()
                 }],
                 ..Default::default()
@@ -568,8 +600,8 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     use super::test_util::{
-        connect, metadata, request, sample_logs_body, sample_trace_body, sample_trace_json_body,
-        send, send_response,
+        connect, metadata, request, sample_logs_body, sample_metrics_body, sample_trace_body,
+        sample_trace_json_body, send, send_response,
     };
     use super::*;
     use crate::otlp::buffer::{TelemetryReceiver, new_telemetry_buffer};
@@ -696,6 +728,23 @@ mod tests {
             "valid logs should be 200, got {status}"
         );
         assert_eq!(buf_rx.metrics().depth(), 2);
+
+        let mut client = connect(&server);
+        let status = send(
+            &mut client,
+            &request(
+                "POST",
+                "/v1/metrics",
+                "application/x-protobuf",
+                &sample_metrics_body(),
+            ),
+        )
+        .await;
+        assert!(
+            status.contains("200"),
+            "valid metrics should be 200, got {status}"
+        );
+        assert_eq!(buf_rx.metrics().depth(), 3);
 
         handle.shutdown().await;
     }

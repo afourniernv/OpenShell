@@ -34,6 +34,8 @@ use crate::supervisor_owner::{OWNER_TTL, OwnerError, OwnerGuard, SupervisorOwner
 const HEARTBEAT_INTERVAL_SECS: u32 = 15;
 const OTEL_EXPORT_CAPABILITY: &str = "otel_export";
 const OTEL_EXPORT_LOGS_CAPABILITY: &str = openshell_core::proto::OTEL_EXPORT_LOGS_V1_CAPABILITY;
+const OTEL_EXPORT_METRICS_CAPABILITY: &str =
+    openshell_core::proto::OTEL_EXPORT_METRICS_V1_CAPABILITY;
 const OWNER_RENEW_TIMEOUT: Duration = Duration::from_secs(5);
 const RELAY_PENDING_TIMEOUT: Duration = Duration::from_secs(10);
 /// Initial backoff between session-availability polls in `wait_for_session`.
@@ -2398,6 +2400,7 @@ fn supervisor_message_allowed(msg: &SupervisorMessage, otel_export_confirmed: bo
 struct ConfirmedOtelCapabilities {
     traces: bool,
     logs: bool,
+    metrics: bool,
 }
 
 impl ConfirmedOtelCapabilities {
@@ -2406,11 +2409,12 @@ impl ConfirmedOtelCapabilities {
         Self {
             traces: has(OTEL_EXPORT_CAPABILITY),
             logs: has(OTEL_EXPORT_LOGS_CAPABILITY),
+            metrics: has(OTEL_EXPORT_METRICS_CAPABILITY),
         }
     }
 
     const fn any(self) -> bool {
-        self.traces || self.logs
+        self.traces || self.logs || self.metrics
     }
 }
 
@@ -2448,6 +2452,9 @@ fn select_confirmed_capabilities(
             OTEL_EXPORT_LOGS_CAPABILITY if relay_signals.logs() => {
                 confirmed.push(cap.clone());
             }
+            OTEL_EXPORT_METRICS_CAPABILITY if relay_signals.metrics() => {
+                confirmed.push(cap.clone());
+            }
             OTEL_EXPORT_CAPABILITY => {
                 debug!(
                     capability = "otel_export",
@@ -2459,6 +2466,12 @@ fn select_confirmed_capabilities(
                 debug!(
                     capability = OTEL_EXPORT_LOGS_CAPABILITY,
                     "supervisor advertised OTLP logs but the signal is not enabled; capability not confirmed"
+                );
+            }
+            OTEL_EXPORT_METRICS_CAPABILITY => {
+                debug!(
+                    capability = OTEL_EXPORT_METRICS_CAPABILITY,
+                    "supervisor advertised OTLP metrics but the signal is not enabled; capability not confirmed"
                 );
             }
             other => {
@@ -2508,6 +2521,7 @@ fn handle_otel_export(
     enum ExportData {
         Traces(Vec<u8>),
         Logs(Vec<u8>),
+        Metrics(Vec<u8>),
     }
 
     let signal = match otel_data.signal {
@@ -2517,7 +2531,10 @@ fn handle_otel_export(
         Some(Signal::LogsData(data)) if !data.is_empty() && confirmed.logs => {
             Some(ExportData::Logs(data))
         }
-        Some(Signal::TraceData(_) | Signal::LogsData(_)) => {
+        Some(Signal::MetricsData(data)) if !data.is_empty() && confirmed.metrics => {
+            Some(ExportData::Metrics(data))
+        }
+        Some(Signal::TraceData(_) | Signal::LogsData(_) | Signal::MetricsData(_)) => {
             debug!(
                 sandbox_id = %sandbox_id,
                 "OTEL relay: dropping signal not confirmed for this session"
@@ -2537,11 +2554,13 @@ fn handle_otel_export(
                 let signal_name = match &signal {
                     ExportData::Traces(_) => "traces",
                     ExportData::Logs(_) => "logs",
+                    ExportData::Metrics(_) => "metrics",
                 };
                 let export = async {
                     match signal {
                         ExportData::Traces(data) => exporter.export_raw(data).await,
                         ExportData::Logs(data) => exporter.export_logs_raw(data).await,
+                        ExportData::Metrics(data) => exporter.export_metrics_raw(data).await,
                     }
                 };
                 match tokio::time::timeout(Duration::from_secs(10), export).await {
@@ -2885,8 +2904,12 @@ mod tests {
     }
 
     #[test]
-    fn logs_capability_requires_logs_to_be_enabled() {
-        let advertised = caps(&["otel_export", "otel_export_logs_v1"]);
+    fn optional_signal_capabilities_require_each_signal_to_be_enabled() {
+        let advertised = caps(&[
+            "otel_export",
+            "otel_export_logs_v1",
+            "otel_export_metrics_v1",
+        ]);
         let traces_only = crate::otel_relay::RelaySignals::from_config(&[
             crate::config_file::OtlpAgentSignal::Traces,
         ]);
@@ -2901,6 +2924,16 @@ mod tests {
         ]);
         assert_eq!(
             select_confirmed_capabilities(&advertised, traces_and_logs),
+            caps(&["otel_export", "otel_export_logs_v1"])
+        );
+
+        let all_signals = crate::otel_relay::RelaySignals::from_config(&[
+            crate::config_file::OtlpAgentSignal::Traces,
+            crate::config_file::OtlpAgentSignal::Logs,
+            crate::config_file::OtlpAgentSignal::Metrics,
+        ]);
+        assert_eq!(
+            select_confirmed_capabilities(&advertised, all_signals),
             advertised
         );
     }

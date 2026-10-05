@@ -6,7 +6,7 @@ relay described below.
 
 ## Telemetry relay
 
-The supervisor relays enabled OpenTelemetry trace and log data from agent processes to the
+The supervisor relays enabled OpenTelemetry trace, log, and metric data from agent processes to the
 gateway over the session stream, so OTel-instrumented agents reach an
 external collector without any sandbox egress.
 
@@ -22,7 +22,7 @@ broker and staged for the supervisor as a `PendingTcpOpen`, so the address is
 a label the supervisor switches on. The proxy recognises it ahead of host
 mapping, policy, and SSRF validation and hands the staged stream to the OTLP
 receiver instead of dialing upstream. The receiver speaks HTTP/1.1 on that
-stream and accepts `POST /v1/traces` and `/v1/logs` as protobuf or JSON. No socket is bound,
+stream and accepts `POST /v1/traces`, `/v1/logs`, and `/v1/metrics` as protobuf or JSON. No socket is bound,
 the driver outer fence is untouched, and the isolation contract and boundary
 protocol are unchanged. Loopback cannot serve this purpose because the broker
 completes loopback connects locally without mediation.
@@ -37,9 +37,9 @@ Agent process --> connect(192.0.0.8:4318) --> seccomp broker stages the open
 ```
 
 The relay starts before networking, so the first staged stream finds it. The
-supervisor advertises `otel_export` in `SupervisorHello`; the gateway confirms
-it in `SessionAccepted` only when it has a relay exporter. Forwarding is gated
-per session on that confirmation. Items received before a confirming session,
+supervisor advertises one capability per supported signal in `SupervisorHello`;
+the gateway confirms each in `SessionAccepted` only when that signal is enabled.
+Forwarding is gated per signal on that confirmation. Items received before a confirming session,
 or while a session declines, wait in the bounded buffer. The receiver serves
 at most 64 concurrent connections and refuses further opens before the
 sandbox commits the socket, which the agent observes as `EAGAIN`.
@@ -54,11 +54,11 @@ than acknowledged as delivered. The gateway independently caps collector
 exports in flight so a collector outage cannot grow export tasks without
 bound.
 
-Forwarded spans gain `openshell.sandbox.id`, `openshell.workspace.id`,
+Forwarded telemetry resources gain `openshell.sandbox.id`, `openshell.workspace.id`,
 `openshell.sandbox.policy`, `openshell.sandbox.user`,
 `openshell.sandbox.image`, and `openshell.sandbox.driver`, and always
-`openshell.telemetry.source=agent` so collectors can separate agent spans
-from gateway spans. Agent-supplied values for these keys are replaced.
+`openshell.telemetry.source=agent` so collectors can separate agent telemetry
+from gateway telemetry. Agent-supplied values for these keys are replaced.
 
 Both hops are non-blocking. The receiver uses `try_send` into the buffer and
 the session uses `try_send` into its outbound channel, so telemetry can never
@@ -68,7 +68,7 @@ streams, keep-alive disabled, two seconds for in-flight requests, then
 stragglers cut) and flush the buffer onto the stream. The whole drain is
 bounded at three seconds so an unreachable gateway cannot delay the report.
 
-The gateway forwards trace and log bytes through a dedicated `OtelRelayExporter`
+The gateway forwards trace, log, and metric bytes through a dedicated `OtelRelayExporter`
 rather than its own tracer provider, so the supervisor's resource attributes
 survive. `OtelExportData` also carries OCSF events, which the gateway
 re-emits on the `ocsf_relay` target; the supervisor-side OCSF sink is not

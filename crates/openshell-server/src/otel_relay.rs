@@ -3,7 +3,7 @@
 
 //! Dedicated OTLP exporter for relayed telemetry from supervisors.
 //!
-//! Uses a separate gRPC client to forward pre-enriched trace data to the
+//! Uses separate gRPC clients to forward pre-enriched telemetry to the
 //! configured OTLP collector, bypassing the gateway's own `SdkTracerProvider`
 //! which would overwrite resource attributes.
 
@@ -11,6 +11,9 @@ use std::sync::Arc;
 
 use opentelemetry_proto::tonic::collector::logs::v1::{
     ExportLogsServiceRequest, logs_service_client::LogsServiceClient,
+};
+use opentelemetry_proto::tonic::collector::metrics::v1::{
+    ExportMetricsServiceRequest, metrics_service_client::MetricsServiceClient,
 };
 use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
 use prost::Message;
@@ -20,7 +23,7 @@ use tracing::{debug, info};
 
 use opentelemetry_proto::tonic::collector::trace::v1::trace_service_client::TraceServiceClient;
 
-/// Gateway-wide cap on trace batches waiting for an external collector.
+/// Gateway-wide cap on telemetry batches waiting for an external collector.
 /// Admission happens before spawning so an outage cannot accumulate an
 /// unbounded number of tasks retaining payloads. This is availability
 /// hardening; normal Hermes/Relay delivery does not depend on reaching it.
@@ -31,6 +34,7 @@ pub const MAX_IN_FLIGHT_OTEL_EXPORTS: usize = 32;
 pub struct RelaySignals {
     traces: bool,
     logs: bool,
+    metrics: bool,
 }
 
 impl RelaySignals {
@@ -38,6 +42,7 @@ impl RelaySignals {
         Self {
             traces: false,
             logs: false,
+            metrics: false,
         }
     }
 
@@ -45,6 +50,7 @@ impl RelaySignals {
         Self {
             traces: true,
             logs: false,
+            metrics: false,
         }
     }
 
@@ -54,6 +60,7 @@ impl RelaySignals {
             match signal {
                 crate::config_file::OtlpAgentSignal::Traces => enabled.traces = true,
                 crate::config_file::OtlpAgentSignal::Logs => enabled.logs = true,
+                crate::config_file::OtlpAgentSignal::Metrics => enabled.metrics = true,
             }
         }
         enabled
@@ -67,8 +74,12 @@ impl RelaySignals {
         self.logs
     }
 
+    pub const fn metrics(self) -> bool {
+        self.metrics
+    }
+
     pub const fn any(self) -> bool {
-        self.traces || self.logs
+        self.traces || self.logs || self.metrics
     }
 }
 
@@ -82,11 +93,12 @@ impl From<bool> for RelaySignals {
     }
 }
 
-/// Exporter that forwards raw protobuf-encoded trace data to an OTLP collector.
+/// Exporter that forwards raw protobuf-encoded telemetry to an OTLP collector.
 #[derive(Debug, Clone)]
 pub struct OtelRelayExporter {
     trace_client: TraceServiceClient<Channel>,
     logs_client: LogsServiceClient<Channel>,
+    metrics_client: MetricsServiceClient<Channel>,
     enabled_signals: RelaySignals,
     export_permits: Arc<Semaphore>,
 }
@@ -110,7 +122,8 @@ impl OtelRelayExporter {
             .connect_lazy();
         Ok(Self {
             trace_client: TraceServiceClient::new(channel.clone()),
-            logs_client: LogsServiceClient::new(channel),
+            logs_client: LogsServiceClient::new(channel.clone()),
+            metrics_client: MetricsServiceClient::new(channel),
             enabled_signals,
             export_permits: Arc::new(Semaphore::new(MAX_IN_FLIGHT_OTEL_EXPORTS)),
         })
@@ -132,7 +145,8 @@ impl OtelRelayExporter {
         let channel = Channel::from_static("http://127.0.0.1:1").connect_lazy();
         Self {
             trace_client: TraceServiceClient::new(channel.clone()),
-            logs_client: LogsServiceClient::new(channel),
+            logs_client: LogsServiceClient::new(channel.clone()),
+            metrics_client: MetricsServiceClient::new(channel),
             enabled_signals: RelaySignals::traces_only(),
             export_permits: Arc::new(Semaphore::new(MAX_IN_FLIGHT_OTEL_EXPORTS)),
         }
@@ -185,6 +199,33 @@ impl OtelRelayExporter {
 
         Ok(ExportOutcome::FullSuccess)
     }
+
+    /// Export raw protobuf-encoded `ExportMetricsServiceRequest` bytes.
+    pub async fn export_metrics_raw(
+        &self,
+        metrics_data: Vec<u8>,
+    ) -> Result<ExportOutcome, ExportError> {
+        let request = ExportMetricsServiceRequest::decode(metrics_data.as_slice())
+            .map_err(ExportError::Decode)?;
+
+        let mut client = self.metrics_client.clone();
+        let response = client
+            .export(tonic::Request::new(request))
+            .await
+            .map_err(ExportError::Grpc)?
+            .into_inner();
+
+        if let Some(partial) = response.partial_success
+            && (partial.rejected_data_points != 0 || !partial.error_message.is_empty())
+        {
+            return Ok(ExportOutcome::PartialSuccess {
+                rejected_items: partial.rejected_data_points,
+                error_message: partial.error_message,
+            });
+        }
+
+        Ok(ExportOutcome::FullSuccess)
+    }
 }
 
 /// Collector acknowledgement for an accepted OTLP export.
@@ -202,7 +243,7 @@ pub enum ExportOutcome {
 
 #[derive(Debug, thiserror::Error)]
 pub enum ExportError {
-    #[error("failed to decode trace data: {0}")]
+    #[error("failed to decode OTLP data: {0}")]
     Decode(prost::DecodeError),
     #[error("gRPC export failed: {0}")]
     Grpc(tonic::Status),
@@ -245,6 +286,7 @@ pub fn try_create_exporter(
                 dedicated_lane = otlp.agent_endpoint.is_some(),
                 traces = enabled_signals.traces(),
                 logs = enabled_signals.logs(),
+                metrics = enabled_signals.metrics(),
                 "OTEL relay exporter configured"
             );
             Some(Arc::new(exporter))
@@ -268,6 +310,10 @@ mod tests {
     use opentelemetry_proto::tonic::collector::logs::v1::{
         ExportLogsServiceResponse,
         logs_service_server::{LogsService, LogsServiceServer},
+    };
+    use opentelemetry_proto::tonic::collector::metrics::v1::{
+        ExportMetricsServiceResponse,
+        metrics_service_server::{MetricsService, MetricsServiceServer},
     };
     use opentelemetry_proto::tonic::collector::trace::v1::{
         ExportTracePartialSuccess, ExportTraceServiceResponse,
@@ -319,6 +365,19 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Default)]
+    struct MetricCollector;
+
+    #[tonic::async_trait]
+    impl MetricsService for MetricCollector {
+        async fn export(
+            &self,
+            _request: tonic::Request<ExportMetricsServiceRequest>,
+        ) -> Result<tonic::Response<ExportMetricsServiceResponse>, tonic::Status> {
+            Ok(tonic::Response::new(ExportMetricsServiceResponse::default()))
+        }
+    }
+
     #[tonic::async_trait]
     impl TraceService for ResultCollector {
         async fn export(
@@ -360,6 +419,7 @@ mod tests {
                 tonic::transport::Server::builder()
                     .add_service(TraceServiceServer::new(ResultCollector { reply }))
                     .add_service(LogsServiceServer::new(LogCollector))
+                    .add_service(MetricsServiceServer::new(MetricCollector))
                     .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async {
                         let _ = shutdown_rx.await;
                     })
@@ -384,6 +444,10 @@ mod tests {
 
     fn empty_logs_request() -> Vec<u8> {
         ExportLogsServiceRequest::default().encode_to_vec()
+    }
+
+    fn empty_metrics_request() -> Vec<u8> {
+        ExportMetricsServiceRequest::default().encode_to_vec()
     }
 
     #[tokio::test]
@@ -527,6 +591,30 @@ mod tests {
         assert_eq!(
             exporter
                 .export_logs_raw(empty_logs_request())
+                .await
+                .unwrap(),
+            ExportOutcome::FullSuccess
+        );
+
+        collector.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn export_metrics_raw_accepts_a_successful_collector_response() {
+        let collector = TestCollector::start(CollectorReply::Success).await;
+        let exporter = OtelRelayExporter::connect_with_signals(
+            &collector.endpoint,
+            RelaySignals::from_config(&[
+                crate::config_file::OtlpAgentSignal::Traces,
+                crate::config_file::OtlpAgentSignal::Logs,
+                crate::config_file::OtlpAgentSignal::Metrics,
+            ]),
+        )
+        .unwrap();
+
+        assert_eq!(
+            exporter
+                .export_metrics_raw(empty_metrics_request())
                 .await
                 .unwrap(),
             ExportOutcome::FullSuccess

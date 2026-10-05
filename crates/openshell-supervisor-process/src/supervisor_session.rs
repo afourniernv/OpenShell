@@ -43,6 +43,8 @@ const MAX_BACKOFF: Duration = Duration::from_secs(30);
 /// Capability name under which the supervisor offers OTLP relaying.
 const OTEL_EXPORT_CAPABILITY: &str = "otel_export";
 const OTEL_EXPORT_LOGS_CAPABILITY: &str = openshell_core::proto::OTEL_EXPORT_LOGS_V1_CAPABILITY;
+const OTEL_EXPORT_METRICS_CAPABILITY: &str =
+    openshell_core::proto::OTEL_EXPORT_METRICS_V1_CAPABILITY;
 
 /// Final-drain request: the session acks on this sender once the OTLP
 /// receiver is stopped and the buffer is flushed onto the session stream.
@@ -76,6 +78,7 @@ fn advertised_capabilities(relay_running: bool) -> Vec<String> {
         vec![
             OTEL_EXPORT_CAPABILITY.to_string(),
             OTEL_EXPORT_LOGS_CAPABILITY.to_string(),
+            OTEL_EXPORT_METRICS_CAPABILITY.to_string(),
         ]
     } else {
         Vec::new()
@@ -88,6 +91,7 @@ fn advertised_capabilities(relay_running: bool) -> Vec<String> {
 struct OtelForwardingCapabilities {
     traces: bool,
     logs: bool,
+    metrics: bool,
 }
 
 impl OtelForwardingCapabilities {
@@ -102,11 +106,12 @@ impl OtelForwardingCapabilities {
         Self {
             traces: has(OTEL_EXPORT_CAPABILITY),
             logs: has(OTEL_EXPORT_LOGS_CAPABILITY),
+            metrics: has(OTEL_EXPORT_METRICS_CAPABILITY),
         }
     }
 
     const fn any(self) -> bool {
-        self.traces || self.logs
+        self.traces || self.logs || self.metrics
     }
 
     const fn allows(self, item: &crate::otlp::buffer::TelemetryItem) -> bool {
@@ -114,6 +119,7 @@ impl OtelForwardingCapabilities {
             crate::otlp::buffer::TelemetryItem::Trace(_)
             | crate::otlp::buffer::TelemetryItem::Ocsf(_) => self.traces,
             crate::otlp::buffer::TelemetryItem::Logs(_) => self.logs,
+            crate::otlp::buffer::TelemetryItem::Metrics(_) => self.metrics,
         }
     }
 }
@@ -593,6 +599,7 @@ async fn run_single_session(
                             &tx,
                             otel_capabilities.traces,
                             otel_capabilities.logs,
+                            otel_capabilities.metrics,
                         )
                         .await;
                     let _ = done_tx.send(());
@@ -1045,7 +1052,11 @@ mod telemetry_tests {
     fn otel_export_is_advertised_only_with_a_running_relay() {
         assert_eq!(
             advertised_capabilities(true),
-            vec!["otel_export".to_string(), "otel_export_logs_v1".to_string()]
+            vec![
+                "otel_export".to_string(),
+                "otel_export_logs_v1".to_string(),
+                "otel_export_metrics_v1".to_string(),
+            ]
         );
         assert!(advertised_capabilities(false).is_empty());
     }
@@ -1071,6 +1082,13 @@ mod telemetry_tests {
         assert!(
             OtelForwardingCapabilities::negotiated(true, &accepted_with(&["otel_export_logs_v1"]))
                 .logs
+        );
+        assert!(
+            OtelForwardingCapabilities::negotiated(
+                true,
+                &accepted_with(&["otel_export_metrics_v1"])
+            )
+            .metrics
         );
     }
 }

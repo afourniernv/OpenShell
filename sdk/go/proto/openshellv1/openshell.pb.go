@@ -13143,6 +13143,7 @@ type OtelExportData struct {
 	// Types that are valid to be assigned to Signal:
 	//
 	//	*OtelExportData_TraceData
+	//	*OtelExportData_MetricsData
 	//	*OtelExportData_LogsData
 	Signal isOtelExportData_Signal `protobuf_oneof:"signal"`
 	// Serialized OCSF events (each entry is a JSON-encoded OCSF event).
@@ -13205,6 +13206,15 @@ func (x *OtelExportData) GetTraceData() []byte {
 	return nil
 }
 
+func (x *OtelExportData) GetMetricsData() []byte {
+	if x != nil {
+		if x, ok := x.Signal.(*OtelExportData_MetricsData); ok {
+			return x.MetricsData
+		}
+	}
+	return nil
+}
+
 func (x *OtelExportData) GetLogsData() []byte {
 	if x != nil {
 		if x, ok := x.Signal.(*OtelExportData_LogsData); ok {
@@ -13229,12 +13239,17 @@ type OtelExportData_TraceData struct {
 	TraceData []byte `protobuf:"bytes,2,opt,name=trace_data,json=traceData,proto3,oneof"`
 }
 
+type OtelExportData_MetricsData struct {
+	MetricsData []byte `protobuf:"bytes,4,opt,name=metrics_data,json=metricsData,proto3,oneof"`
+}
+
 type OtelExportData_LogsData struct {
-	// bytes metrics_data = 4;  // future
 	LogsData []byte `protobuf:"bytes,5,opt,name=logs_data,json=logsData,proto3,oneof"`
 }
 
 func (*OtelExportData_TraceData) isOtelExportData_Signal() {}
+
+func (*OtelExportData_MetricsData) isOtelExportData_Signal() {}
 
 func (*OtelExportData_LogsData) isOtelExportData_Signal() {}
 
@@ -18993,12 +19008,13 @@ const file_openshell_proto_rawDesc = "" +
 	"\x17PushSandboxLogsResponse\"m\n" +
 	"\x16GetSandboxLogsResponse\x120\n" +
 	"\x04logs\x18\x01 \x03(\v2\x1c.openshell.v1.SandboxLogLineR\x04logs\x12!\n" +
-	"\fbuffer_total\x18\x02 \x01(\rR\vbufferTotal\"\x9a\x01\n" +
+	"\fbuffer_total\x18\x02 \x01(\rR\vbufferTotal\"\xbf\x01\n" +
 	"\x0eOtelExportData\x12\x1d\n" +
 	"\n" +
 	"sandbox_id\x18\x01 \x01(\tR\tsandboxId\x12\x1f\n" +
 	"\n" +
-	"trace_data\x18\x02 \x01(\fH\x00R\ttraceData\x12\x1d\n" +
+	"trace_data\x18\x02 \x01(\fH\x00R\ttraceData\x12#\n" +
+	"\fmetrics_data\x18\x04 \x01(\fH\x00R\vmetricsData\x12\x1d\n" +
 	"\tlogs_data\x18\x05 \x01(\fH\x00R\blogsData\x12\x1f\n" +
 	"\vocsf_events\x18\x03 \x03(\fR\n" +
 	"ocsfEventsB\b\n" +
@@ -20542,6 +20558,7 @@ func file_openshell_proto_init() {
 	file_openshell_proto_msgTypes[145].OneofWrappers = []any{}
 	file_openshell_proto_msgTypes[164].OneofWrappers = []any{
 		(*OtelExportData_TraceData)(nil),
+		(*OtelExportData_MetricsData)(nil),
 		(*OtelExportData_LogsData)(nil),
 	}
 	file_openshell_proto_msgTypes[165].OneofWrappers = []any{

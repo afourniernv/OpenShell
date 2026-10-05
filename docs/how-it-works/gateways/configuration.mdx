@@ -330,12 +330,12 @@ The gateway already uses the Rust `tracing` framework for structured logs sent t
 [openshell.gateway.otlp]
 endpoint     = "http://otel-collector.observability.svc:4317"
 service_name = "openshell-gateway"
-# Optional separate collector for relayed agent traces.
+# Optional separate collector for relayed agent telemetry.
 # agent_endpoint = "http://agent-collector.observability.svc:4317"
-# Explicitly allow untrusted sandbox processes to send traces.
+# Explicitly allow untrusted sandbox processes to send telemetry.
 sandbox_relay_enabled = false
-# Logs are opt-in; omit this line for the trace-only default.
-# agent_signals = ["traces", "logs"]
+# Logs and metrics are opt-in; omit this line for the trace-only default.
+# agent_signals = ["traces", "logs", "metrics"]
 ```
 
 `endpoint` is required and must be a valid URI. If it is malformed, the gateway logs the configuration error and continues with export disabled. It does not connect at startup: an unreachable collector produces export failures, never a failure to serve.
@@ -354,20 +354,20 @@ The gateway forwards the OTLP configuration, configured gateway name, configured
 
 Set `sandbox_relay_enabled = true` to enable the sandbox telemetry relay. Gateway and compute-driver tracing remain enabled when the flag is omitted or false, but sandbox environments receive no collector route and the gateway does not negotiate the relay capability. This separate opt-in prevents gateway self-observability from silently authorizing agent-controlled telemetry.
 
-With the relay enabled, traces remain the default. Add `agent_signals = ["traces", "logs"]` to opt in to logs. `CreateSandbox` sets the corresponding signal-specific endpoint and protocol under `http://192.0.0.8:4318`; it does not set the generic OTLP endpoint. Caller-supplied generic or signal-specific endpoints take precedence, and the relay does not override the `grpc` protocol. The values persist in the sandbox spec and survive restarts. Recreate existing sandboxes after changing relay settings.
+With the relay enabled, traces remain the default. Add `agent_signals = ["traces", "logs", "metrics"]` to opt in to logs and metrics. `CreateSandbox` sets the corresponding signal-specific endpoint and protocol under `http://192.0.0.8:4318`; it does not set the generic OTLP endpoint. Caller-supplied generic or signal-specific endpoints take precedence, and the relay does not override the `grpc` protocol. The values persist in the sandbox spec and survive restarts. Recreate existing sandboxes after changing relay settings.
 
-The address is never routed. The sandbox stages the connection for the supervisor, which serves the OTLP receiver itself, adds trusted `openshell.*` resource attributes, and forwards enabled signals to the gateway. The gateway exports them through matching OTLP/gRPC trace and logs services. Set `agent_endpoint` to send agent telemetry to a separate collector. When it is absent, agent signals go to `endpoint`. Agent telemetry needs no sandbox egress and no network policy entry.
+The address is never routed. The sandbox stages the connection for the supervisor, which serves the OTLP receiver itself, adds trusted `openshell.*` resource attributes, and forwards enabled signals to the gateway. The gateway exports them through matching OTLP/gRPC trace, logs, and metrics services. Set `agent_endpoint` to send agent telemetry to a separate collector. When it is absent, agent signals go to `endpoint`. Agent telemetry needs no sandbox egress and no network policy entry.
 
 The relay bounds request size, post-decode trace structure before enrichment, concurrent processing, queued items, and queued bytes. The structural limit does not replace the decoder's own allocation behavior. The receiver returns an HTTP error when it cannot accept a batch, allowing a conforming OTLP exporter to observe overload instead of treating a dropped batch as delivered. The gateway also bounds concurrent collector exports so collector backpressure cannot create an unbounded task backlog.
 
-Collector availability does not gate startup. The gateway connects lazily and reconnects after an outage. It logs failed exports, timeouts, and OTLP `partial_success` responses, including the number of rejected spans reported by the collector.
+Collector availability does not gate startup. The gateway connects lazily and reconnects after an outage. It logs failed exports, timeouts, and OTLP `partial_success` responses, including the number of rejected items reported by the collector.
 
 For Helm deployments, set `server.otlp.endpoint` to render this table and
 `server.otlp.sandboxRelayEnabled=true` to authorize sandbox telemetry relay.
-Set `server.otlp.agentSignals` to opt in to logs; it defaults to traces. The
+Set `server.otlp.agentSignals` to opt in to logs and metrics; it defaults to traces. The
 optional `server.otlp.serviceName` value overrides the gateway service name;
 driver service names remain fixed. The optional `server.otlp.agentEndpoint`
-value renders `agent_endpoint` for a separate agent-trace collector.
+value renders `agent_endpoint` for a separate agent-telemetry collector.
 
 The local `mise run helm:k3s:create` workflow installs a trace collector and UI,
 enables Agent Sandbox controller tracing on supported releases, and configures
