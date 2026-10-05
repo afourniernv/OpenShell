@@ -25,16 +25,26 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
 use tracing::{debug, warn};
 
-use super::buffer::TelemetrySender;
+use super::buffer::{TelemetrySendError, TelemetrySender};
 use super::enrichment::{self, ContentType, EnrichmentError};
-use super::{RECEIVER_SHUTDOWN_TIMEOUT, SandboxMetadata};
+use super::{
+    MAX_TELEMETRY_ITEM_BYTES, RECEIVER_SHUTDOWN_TIMEOUT, SandboxMetadata, admit_trace_message,
+};
 
 /// Upper bound on concurrently served relay connections.
 pub const MAX_CONCURRENT_CONNECTIONS: usize = 64;
-const MAX_BODY_SIZE: usize = 4 * 1024 * 1024; // 4 MiB
+/// Bound concurrent CPU- and allocation-heavy body/decode/enrichment work
+/// separately from lightweight keep-alive connections.
+///
+/// This is defense-in-depth for overload; it is not required by normal
+/// Hermes export.
+pub const MAX_CONCURRENT_PROCESSING_REQUESTS: usize = 4;
+const MAX_BODY_SIZE: usize = MAX_TELEMETRY_ITEM_BYTES;
 
 /// Time a client has to send request headers before the connection is closed.
 pub const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(10);
+/// Total time a client has to finish sending one request body.
+pub const BODY_READ_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Reservation for one relay connection.
 ///
@@ -53,7 +63,9 @@ pub struct OtlpConnectionServer {
     buf_tx: TelemetrySender,
     metadata: SandboxMetadata,
     enrichment_enabled: bool,
+    body_read_timeout: Duration,
     connections: Arc<Semaphore>,
+    processing: Arc<Semaphore>,
     /// `None` once shutdown has started. Watchers are minted under this lock,
     /// so none can be created after the shutdown signal is sent.
     graceful: Mutex<Option<GracefulShutdown>>,
@@ -77,12 +89,23 @@ impl OtlpConnectionServer {
         metadata: SandboxMetadata,
         enrichment_enabled: bool,
     ) -> (Arc<Self>, ReceiverHandle) {
+        Self::new_with_body_read_timeout(buf_tx, metadata, enrichment_enabled, BODY_READ_TIMEOUT)
+    }
+
+    fn new_with_body_read_timeout(
+        buf_tx: TelemetrySender,
+        metadata: SandboxMetadata,
+        enrichment_enabled: bool,
+        body_read_timeout: Duration,
+    ) -> (Arc<Self>, ReceiverHandle) {
         let (abort_tx, abort_rx) = watch::channel(false);
         let server = Arc::new(Self {
             buf_tx,
             metadata,
             enrichment_enabled,
+            body_read_timeout,
             connections: Arc::new(Semaphore::new(MAX_CONCURRENT_CONNECTIONS)),
+            processing: Arc::new(Semaphore::new(MAX_CONCURRENT_PROCESSING_REQUESTS)),
             graceful: Mutex::new(Some(GracefulShutdown::new())),
             abort_rx,
         });
@@ -128,10 +151,23 @@ impl OtlpConnectionServer {
         let buf_tx = self.buf_tx.clone();
         let metadata = self.metadata.clone();
         let enrichment_enabled = self.enrichment_enabled;
+        let body_read_timeout = self.body_read_timeout;
+        let processing = Arc::clone(&self.processing);
         let svc = service_fn(move |req| {
             let buf_tx = buf_tx.clone();
             let metadata = metadata.clone();
-            async move { handle_request(req, &buf_tx, &metadata, enrichment_enabled).await }
+            let processing = Arc::clone(&processing);
+            async move {
+                handle_request(
+                    req,
+                    &buf_tx,
+                    &metadata,
+                    enrichment_enabled,
+                    body_read_timeout,
+                    processing,
+                )
+                .await
+            }
         });
 
         let mut builder = http1::Builder::new();
@@ -185,6 +221,8 @@ async fn handle_request(
     buf_tx: &TelemetrySender,
     metadata: &SandboxMetadata,
     enrichment_enabled: bool,
+    body_read_timeout: Duration,
+    processing: Arc<Semaphore>,
 ) -> Result<Response<Full<Bytes>>, Infallible> {
     if req.method() != Method::POST || req.uri().path() != "/v1/traces" {
         return Ok(Response::builder()
@@ -202,41 +240,136 @@ async fn handle_request(
             .unwrap());
     };
 
+    // Reserve processing capacity before accepting the body into memory. Keep
+    // the permit through body collection, typed decode, and enrichment.
+    let Ok(processing_permit) = processing.try_acquire_owned() else {
+        warn!("OTLP processing capacity exhausted");
+        return Ok(Response::builder()
+            .status(StatusCode::SERVICE_UNAVAILABLE)
+            .header("retry-after", "1")
+            .body(Full::new(Bytes::from(
+                "{\"error\":\"telemetry processing unavailable\"}",
+            )))
+            .unwrap());
+    };
+
     let limited = http_body_util::Limited::new(req.into_body(), MAX_BODY_SIZE);
-    let body = match http_body_util::BodyExt::collect(limited).await {
-        Ok(collected) => collected.to_bytes(),
-        Err(e) => {
-            let status = if e.to_string().contains("length limit exceeded") {
-                warn!("OTLP request body exceeds 4 MiB limit");
-                StatusCode::PAYLOAD_TOO_LARGE
-            } else {
-                warn!(error = %e, "failed to read OTLP request body");
-                StatusCode::BAD_REQUEST
-            };
+    let body =
+        match tokio::time::timeout(body_read_timeout, http_body_util::BodyExt::collect(limited))
+            .await
+        {
+            Ok(Ok(collected)) => collected.to_bytes(),
+            Ok(Err(error))
+                if error
+                    .downcast_ref::<http_body_util::LengthLimitError>()
+                    .is_some() =>
+            {
+                warn!(
+                    max_body_bytes = MAX_BODY_SIZE,
+                    "OTLP request body too large"
+                );
+                return Ok(Response::builder()
+                    .status(StatusCode::PAYLOAD_TOO_LARGE)
+                    .body(Full::new(Bytes::from(
+                        "{\"error\":\"request body too large\"}",
+                    )))
+                    .unwrap());
+            }
+            Ok(Err(error)) => {
+                warn!(%error, "failed to read OTLP request body");
+                return Ok(Response::builder()
+                    .status(StatusCode::BAD_REQUEST)
+                    .body(Full::new(Bytes::from(
+                        "{\"error\":\"failed to read body\"}",
+                    )))
+                    .unwrap());
+            }
+            Err(_) => {
+                warn!(
+                    timeout_seconds = body_read_timeout.as_secs(),
+                    "OTLP request body timed out"
+                );
+                return Ok(Response::builder()
+                    .status(StatusCode::REQUEST_TIMEOUT)
+                    .body(Full::new(Bytes::from(
+                        "{\"error\":\"request body timed out\"}",
+                    )))
+                    .unwrap());
+            }
+        };
+
+    let metadata_for_processing = metadata.clone();
+    let processed = tokio::task::spawn_blocking(move || {
+        let _processing_permit = processing_permit;
+        enrichment::enrich_spans(
+            &body,
+            content_type,
+            &metadata_for_processing,
+            enrichment_enabled,
+        )
+    })
+    .await;
+
+    let processed = match processed {
+        Ok(processed) => processed,
+        Err(error) => {
+            warn!(%error, "OTLP processing task failed");
             return Ok(Response::builder()
-                .status(status)
+                .status(StatusCode::INTERNAL_SERVER_ERROR)
                 .body(Full::new(Bytes::from(
-                    "{\"error\":\"failed to read body\"}",
+                    "{\"error\":\"telemetry processing failed\"}",
                 )))
                 .unwrap());
         }
     };
 
-    match enrichment::enrich_spans(&body, content_type, metadata, enrichment_enabled) {
+    match processed {
         Ok(enriched) => {
-            buf_tx.send_trace(enriched);
-            let (response_content_type, response_body) = match content_type {
-                ContentType::Protobuf => ("application/x-protobuf", Bytes::new()),
-                ContentType::Json => ("application/json", Bytes::from_static(b"{}")),
+            let enriched = match admit_trace_message(&metadata.sandbox_id, enriched) {
+                Ok(enriched) => enriched,
+                Err(encoded_bytes) => {
+                    warn!(encoded_bytes, "OTLP export exceeds session message limit");
+                    return Ok(Response::builder()
+                        .status(StatusCode::PAYLOAD_TOO_LARGE)
+                        .body(Full::new(Bytes::from(
+                            "{\"error\":\"OTLP export too large\"}",
+                        )))
+                        .unwrap());
+                }
             };
-            Ok(Response::builder()
-                .status(StatusCode::OK)
-                .header("content-type", response_content_type)
-                .body(Full::new(response_body))
-                .unwrap())
+
+            match buf_tx.send_trace(enriched) {
+                Ok(()) => {
+                    let (response_content_type, response_body) = match content_type {
+                        ContentType::Protobuf => ("application/x-protobuf", Bytes::new()),
+                        ContentType::Json => ("application/json", Bytes::from_static(b"{}")),
+                    };
+                    Ok(Response::builder()
+                        .status(StatusCode::OK)
+                        .header("content-type", response_content_type)
+                        .body(Full::new(response_body))
+                        .unwrap())
+                }
+                Err(TelemetrySendError::TooLarge) => Ok(Response::builder()
+                    .status(StatusCode::PAYLOAD_TOO_LARGE)
+                    .body(Full::new(Bytes::from(
+                        "{\"error\":\"OTLP export too large\"}",
+                    )))
+                    .unwrap()),
+                Err(TelemetrySendError::Full | TelemetrySendError::Closed) => {
+                    warn!("OTLP telemetry buffer unavailable");
+                    Ok(Response::builder()
+                        .status(StatusCode::SERVICE_UNAVAILABLE)
+                        .header("retry-after", "1")
+                        .body(Full::new(Bytes::from(
+                            "{\"error\":\"telemetry buffer unavailable\"}",
+                        )))
+                        .unwrap())
+                }
+            }
         }
-        Err(EnrichmentError::ProtobufDecode(e)) => {
-            warn!(error = %e, "malformed protobuf OTLP request");
+        Err(EnrichmentError::ProtobufDecode(error)) => {
+            warn!(%error, "malformed protobuf OTLP request");
             Ok(Response::builder()
                 .status(StatusCode::BAD_REQUEST)
                 .body(Full::new(Bytes::from(
@@ -244,12 +377,21 @@ async fn handle_request(
                 )))
                 .unwrap())
         }
-        Err(EnrichmentError::JsonDecode(e)) => {
-            warn!(error = %e, "malformed JSON OTLP request");
+        Err(EnrichmentError::JsonDecode(error)) => {
+            warn!(%error, "malformed JSON OTLP request");
             Ok(Response::builder()
                 .status(StatusCode::BAD_REQUEST)
                 .body(Full::new(Bytes::from(
                     "{\"error\":\"malformed JSON request\"}",
+                )))
+                .unwrap())
+        }
+        Err(error @ EnrichmentError::StructuralLimit { .. }) => {
+            warn!(%error, "OTLP request exceeds structural limits after decode");
+            Ok(Response::builder()
+                .status(StatusCode::PAYLOAD_TOO_LARGE)
+                .body(Full::new(Bytes::from(
+                    "{\"error\":\"OTLP request exceeds structural limits\"}",
                 )))
                 .unwrap())
         }
@@ -390,7 +532,16 @@ mod tests {
     use crate::otlp::buffer::{TelemetryReceiver, new_telemetry_buffer};
 
     fn start() -> (Arc<OtlpConnectionServer>, ReceiverHandle, TelemetryReceiver) {
-        let (buf_tx, buf_rx) = new_telemetry_buffer(16);
+        let (buf_tx, buf_rx) = new_telemetry_buffer(16, crate::otlp::DEFAULT_BUFFER_BYTE_CAPACITY);
+        let (server, handle) = OtlpConnectionServer::new(buf_tx, metadata(), true);
+        (server, handle, buf_rx)
+    }
+
+    fn start_with_limits(
+        item_capacity: usize,
+        byte_capacity: usize,
+    ) -> (Arc<OtlpConnectionServer>, ReceiverHandle, TelemetryReceiver) {
+        let (buf_tx, buf_rx) = new_telemetry_buffer(item_capacity, byte_capacity);
         let (server, handle) = OtlpConnectionServer::new(buf_tx, metadata(), true);
         (server, handle, buf_rx)
     }
@@ -518,6 +669,154 @@ mod tests {
         assert!(response_text.ends_with("{}"));
         assert_eq!(buf_rx.metrics().depth(), 1);
 
+        handle.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn structurally_oversized_request_returns_payload_too_large() {
+        use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
+        use opentelemetry_proto::tonic::trace::v1::ResourceSpans;
+        use prost::Message;
+
+        let (server, handle, buf_rx) = start();
+        let body = ExportTraceServiceRequest {
+            resource_spans: vec![ResourceSpans::default(); enrichment::MAX_RESOURCE_SPANS + 1],
+        }
+        .encode_to_vec();
+
+        let mut client = connect(&server);
+        let status = send(
+            &mut client,
+            &request("POST", "/v1/traces", "application/x-protobuf", &body),
+        )
+        .await;
+
+        assert!(status.contains("413"), "unexpected status: {status}");
+        assert_eq!(buf_rx.metrics().depth(), 0);
+        handle.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn oversized_body_returns_payload_too_large() {
+        let (server, handle, buf_rx) = start();
+        let body = vec![0; MAX_BODY_SIZE + 1];
+
+        let mut client = connect(&server);
+        let status = send(
+            &mut client,
+            &request("POST", "/v1/traces", "application/x-protobuf", &body),
+        )
+        .await;
+
+        assert!(status.contains("413"), "unexpected status: {status}");
+        assert_eq!(buf_rx.metrics().depth(), 0);
+        handle.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn full_item_buffer_returns_service_unavailable() {
+        let (server, handle, buf_rx) =
+            start_with_limits(1, crate::otlp::DEFAULT_BUFFER_BYTE_CAPACITY);
+
+        let mut first = connect(&server);
+        let status = send(
+            &mut first,
+            &request(
+                "POST",
+                "/v1/traces",
+                "application/x-protobuf",
+                &sample_trace_body(),
+            ),
+        )
+        .await;
+        assert!(status.contains("200"), "unexpected status: {status}");
+
+        let mut second = connect(&server);
+        let status = send(
+            &mut second,
+            &request(
+                "POST",
+                "/v1/traces",
+                "application/x-protobuf",
+                &sample_trace_body(),
+            ),
+        )
+        .await;
+        assert!(status.contains("503"), "unexpected status: {status}");
+        assert_eq!(buf_rx.metrics().depth(), 1);
+        handle.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn full_byte_buffer_returns_service_unavailable() {
+        let (server, handle, buf_rx) = start_with_limits(16, 1);
+
+        let mut client = connect(&server);
+        let status = send(
+            &mut client,
+            &request(
+                "POST",
+                "/v1/traces",
+                "application/x-protobuf",
+                &sample_trace_body(),
+            ),
+        )
+        .await;
+
+        assert!(status.contains("503"), "unexpected status: {status}");
+        assert_eq!(buf_rx.metrics().depth(), 0);
+        assert_eq!(buf_rx.metrics().bytes(), 0);
+        handle.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn risk_control_bounds_processing_admission() {
+        let (server, handle, buf_rx) = start();
+        let held = Arc::clone(&server.processing)
+            .acquire_many_owned(
+                u32::try_from(MAX_CONCURRENT_PROCESSING_REQUESTS)
+                    .expect("processing concurrency fits in u32"),
+            )
+            .await
+            .unwrap();
+
+        let mut client = connect(&server);
+        let status = send(
+            &mut client,
+            &request(
+                "POST",
+                "/v1/traces",
+                "application/x-protobuf",
+                &sample_trace_body(),
+            ),
+        )
+        .await;
+        assert!(status.contains("503"), "unexpected status: {status}");
+        assert_eq!(buf_rx.metrics().depth(), 0);
+
+        drop(held);
+        handle.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn incomplete_body_hits_total_read_deadline() {
+        let (buf_tx, _buf_rx) = new_telemetry_buffer(16, crate::otlp::DEFAULT_BUFFER_BYTE_CAPACITY);
+        let (server, handle) = OtlpConnectionServer::new_with_body_read_timeout(
+            buf_tx,
+            metadata(),
+            true,
+            Duration::from_millis(25),
+        );
+        let mut client = connect(&server);
+        client
+            .write_all(
+                b"POST /v1/traces HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/x-protobuf\r\nContent-Length: 10\r\n\r\nx",
+            )
+            .await
+            .unwrap();
+        let status = send(&mut client, b"").await;
+
+        assert!(status.contains("408"), "unexpected status: {status}");
         handle.shutdown().await;
     }
 
