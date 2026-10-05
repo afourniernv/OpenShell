@@ -5,6 +5,42 @@
 //!
 //! This module re-exports the generated protobuf types and service definitions.
 
+/// Maximum decoded size of one gRPC message accepted by the gateway.
+///
+/// Components that place data on a streaming RPC must validate the complete
+/// encoded envelope against this limit before acknowledging the source. This
+/// keeps a large data-plane message from terminating a shared control stream.
+pub const MAX_GRPC_MESSAGE_SIZE: usize = 1_048_576;
+
+/// Maximum protobuf message nesting depth accepted for relayed OTLP payloads.
+///
+/// The sandbox receiver and gateway exporter must use the same boundary so a
+/// request acknowledged by the receiver cannot be dropped later by the
+/// gateway's structural preflight.
+pub const MAX_OTLP_PROTOBUF_NESTING_DEPTH: usize = 64;
+
+/// Return whether an OTLP protobuf message at `depth` is within the shared
+/// relay boundary.
+pub const fn otlp_protobuf_nesting_depth_allowed(depth: usize) -> bool {
+    depth < MAX_OTLP_PROTOBUF_NESTING_DEPTH
+}
+
+/// Legacy trace export capability.
+///
+/// Upgraded supervisors retain this value to negotiate with trace-only
+/// gateways. Upgraded gateways do not confirm it because it predates full
+/// `openshell.*` attribute sanitization.
+pub const OTEL_EXPORT_TRACES_CAPABILITY: &str = "otel_export";
+/// Versioned trace export capability. Peers must confirm it before traces
+/// enriched under the trusted `openshell.*` namespace are forwarded.
+pub const OTEL_EXPORT_TRACES_V1_CAPABILITY: &str = "otel_export_traces_v1";
+/// Versioned log export capability. Peers must confirm it before log payloads
+/// are placed on the shared supervisor stream.
+pub const OTEL_EXPORT_LOGS_V1_CAPABILITY: &str = "otel_export_logs_v1";
+/// Versioned metric export capability. Peers must confirm it before metric
+/// payloads are placed on the shared supervisor stream.
+pub const OTEL_EXPORT_METRICS_V1_CAPABILITY: &str = "otel_export_metrics_v1";
+
 #[allow(
     clippy::all,
     clippy::pedantic,
@@ -105,7 +141,19 @@ mod tests {
 
     use prost::Message;
 
-    use super::SandboxPolicy;
+    use super::{
+        MAX_OTLP_PROTOBUF_NESTING_DEPTH, SandboxPolicy, otlp_protobuf_nesting_depth_allowed,
+    };
+
+    #[test]
+    fn otlp_protobuf_nesting_boundary_is_shared_and_exclusive() {
+        assert!(otlp_protobuf_nesting_depth_allowed(
+            MAX_OTLP_PROTOBUF_NESTING_DEPTH - 1
+        ));
+        assert!(!otlp_protobuf_nesting_depth_allowed(
+            MAX_OTLP_PROTOBUF_NESTING_DEPTH
+        ));
+    }
 
     // SandboxPolicy payload encoded by the pre-0.1.0 schema with
     // NetworkBinary.harness=true. Keep this fixed fixture to prove that the

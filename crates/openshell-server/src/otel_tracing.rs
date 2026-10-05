@@ -297,6 +297,7 @@ mod tests {
             endpoint: "http://127.0.0.1:4317".into(),
             service_name: None,
             agent_endpoint: None,
+            agent_signals: vec![crate::config_file::OtlpAgentSignal::Traces],
         }
     }
 

@@ -208,13 +208,9 @@ macro_rules! request_id_middleware {
     }};
 }
 
-/// Maximum inbound gRPC message size (1 MB).
-///
-/// Replaces tonic's implicit 4 MB default with a conservative limit to
-/// bound memory allocation from a single request. Sandbox creation is
-/// the largest payload and well within this cap under normal use.
-const MAX_GRPC_DECODE_SIZE: usize = 1_048_576;
-const MAX_INTERCEPTED_GRPC_BODY_SIZE: usize = MAX_GRPC_DECODE_SIZE + 5;
+/// Maximum wire body accepted while gateway interceptors inspect a gRPC
+/// request: the shared decoded-message limit plus the five-byte gRPC frame.
+const MAX_INTERCEPTED_GRPC_BODY_SIZE: usize = openshell_core::proto::MAX_GRPC_MESSAGE_SIZE + 5;
 
 /// Concurrent HTTP/2 streams allowed per connection. Sits above the
 /// per-replica pending relay budget so pooled peer connections are bounded by
@@ -253,7 +249,7 @@ impl MultiplexService {
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
         let openshell = OpenShellServer::new(OpenShellService::new(self.state.clone()))
-            .max_decoding_message_size(MAX_GRPC_DECODE_SIZE);
+            .max_decoding_message_size(openshell_core::proto::MAX_GRPC_MESSAGE_SIZE);
         let openshell = GatewayInterceptorGrpcService::new(
             openshell,
             self.state.gateway_interceptors.clone(),

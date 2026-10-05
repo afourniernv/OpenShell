@@ -289,15 +289,33 @@ pub struct OtlpConfig {
     #[serde(default)]
     pub service_name: Option<String>,
 
-    /// OTLP/gRPC collector endpoint for relayed agent traces. When absent,
-    /// agent traces go to `endpoint`, so one collector serves both lanes
+    /// OTLP/gRPC collector endpoint for relayed agent telemetry. When absent,
+    /// agent signals go to `endpoint`, so one collector serves both lanes
     /// unless the operator splits them.
     #[serde(default)]
     pub agent_endpoint: Option<String>,
+
+    /// Agent signals relayed through the supervisor. Traces remain the
+    /// backwards-compatible default; logs and metrics require an explicit
+    /// coordinated-upgrade opt-in.
+    #[serde(default = "default_agent_signals")]
+    pub agent_signals: Vec<OtlpAgentSignal>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OtlpAgentSignal {
+    Traces,
+    Logs,
+    Metrics,
+}
+
+fn default_agent_signals() -> Vec<OtlpAgentSignal> {
+    vec![OtlpAgentSignal::Traces]
 }
 
 impl OtlpConfig {
-    /// The collector endpoint for the agent-trace lane.
+    /// The collector endpoint for the agent-telemetry lane.
     pub fn agent_lane_endpoint(&self) -> &str {
         self.agent_endpoint.as_deref().unwrap_or(&self.endpoint)
     }
@@ -935,6 +953,7 @@ service_name = "openshell-gateway-dev"
         );
         assert_eq!(otlp.service_name.as_deref(), Some("openshell-gateway-dev"));
         assert_eq!(otlp.agent_lane_endpoint(), otlp.endpoint);
+        assert_eq!(otlp.agent_signals, vec![OtlpAgentSignal::Traces]);
     }
 
     #[test]
@@ -949,6 +968,30 @@ agent_endpoint = "http://agent-collector:4317"
         let otlp = file.openshell.gateway.otlp.expect("otlp config");
         assert_eq!(otlp.endpoint, "http://infra-collector:4317");
         assert_eq!(otlp.agent_lane_endpoint(), "http://agent-collector:4317");
+    }
+
+    #[test]
+    fn otlp_agent_logs_and_metrics_require_explicit_opt_in() {
+        let toml = r#"
+[openshell.gateway.otlp]
+endpoint = "http://infra-collector:4317"
+agent_signals = ["traces", "logs", "metrics"]
+"#;
+        let tmp = write_tmp(toml);
+        let otlp = load(tmp.path())
+            .expect("valid agent signal list parses")
+            .openshell
+            .gateway
+            .otlp
+            .expect("otlp config");
+        assert_eq!(
+            otlp.agent_signals,
+            vec![
+                OtlpAgentSignal::Traces,
+                OtlpAgentSignal::Logs,
+                OtlpAgentSignal::Metrics,
+            ]
+        );
     }
 
     #[test]

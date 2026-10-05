@@ -256,7 +256,7 @@ Workspace storage settings cannot change after a sandbox is created. Delete and 
 
 ### Relay Agent Telemetry
 
-When the gateway has `[openshell.gateway.otlp]` configured, agents in the workload Pod export OpenTelemetry traces to `http://192.0.0.8:4318/v1/traces`. That address is never routed. The sandbox seccomp broker stages the connection for the supervisor over the existing boundary channel, and the supervisor serves the OTLP receiver on that stream, adds sandbox attributes to the spans, and forwards them to the collector through the gateway. The workload egress fence stays empty and no NetworkPolicy change is needed. See [OTLP Export](/how-it-works/gateways/configuration#otlp-export).
+When the gateway has `[openshell.gateway.otlp]` configured, agents in the workload Pod export enabled OpenTelemetry signals to signal-specific endpoints under `http://192.0.0.8:4318`. Traces are enabled by default; operators explicitly opt in to logs and metrics with `agent_signals`. That address is never routed. The sandbox seccomp broker stages the connection for the supervisor over the existing boundary channel, and the supervisor serves the OTLP receiver on that stream, adds trusted sandbox, workspace, and workload attributes when their values are available, and forwards it to the collector through the gateway. The workload egress fence stays empty and no NetworkPolicy change is needed. Delivery is at-most-once: a successful workload request means the bounded local relay admitted the batch, not that the collector accepted it. See [OTLP Export](/how-it-works/gateways/configuration#otlp-export).
 
 ### Kubernetes PVC Mounts
 

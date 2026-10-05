@@ -760,7 +760,7 @@ mod tests {
         validate_vm_sandbox_identity,
     };
     use openshell_core::UpstreamProxyConfig;
-    use openshell_server::config_file::OtlpConfig;
+    use openshell_server::config_file::{OtlpAgentSignal, OtlpConfig};
     use std::os::unix::fs::PermissionsExt;
     use std::os::unix::net::UnixListener as StdUnixListener;
     use std::path::PathBuf;
@@ -811,6 +811,7 @@ mod tests {
                 endpoint: "http://collector.internal:4317".to_string(),
                 service_name: Some("custom-gateway".to_string()),
                 agent_endpoint: None,
+                agent_signals: vec![OtlpAgentSignal::Traces],
             }),
             "production-us-west",
         );

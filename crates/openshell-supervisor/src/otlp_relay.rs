@@ -51,13 +51,13 @@ mod tests {
     use super::*;
 
     fn metadata() -> SandboxMetadata {
+        let (_workspace_tx, workspace_name) = tokio::sync::watch::channel("ws-test".into());
         SandboxMetadata {
             sandbox_id: "sb-test".into(),
-            workspace_id: "ws-test".into(),
-            policy: "policy".into(),
-            user: "1000".into(),
-            image: String::new(),
-            driver: "kubernetes".into(),
+            sandbox_name: "sandbox-test".into(),
+            workspace_name,
+            workload_unix_uid: 1000,
+            workload_image_reference: String::new(),
         }
     }
 
@@ -127,7 +127,7 @@ mod tests {
             openshell_supervisor_process::otlp::start(&RelayConfig::default(), metadata());
         let reserved = reserved_destination(server);
         let (tx, _rx) = tokio::sync::mpsc::channel(4);
-        relay.stop_and_drain("sb-test", &tx).await;
+        relay.stop_and_drain("sb-test", &tx, |_| true).await;
 
         let (_client, boundary) = tokio::io::duplex(1024);
         assert!(

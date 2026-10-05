@@ -2970,7 +2970,7 @@ message GetSandboxLogsResponse {
 // ---------------------------------------------------------------------------
 
 // OpenTelemetry export data forwarded from supervisor to gateway.
-// Contains agent trace spans and/or OCSF events from a single sandbox.
+// Contains agent telemetry and/or OCSF events from a single sandbox.
 message OtelExportData {
   // Source sandbox identifier.
   string sandbox_id = 1;
@@ -2980,8 +2980,8 @@ message OtelExportData {
   // sandbox resource attributes.
   oneof signal {
     bytes trace_data = 2;
-    // bytes metrics_data = 4;  // future
-    // bytes logs_data = 5;     // future
+    bytes metrics_data = 4;
+    bytes logs_data = 5;
   }
 
   // Serialized OCSF events (each entry is a JSON-encoded OCSF event).

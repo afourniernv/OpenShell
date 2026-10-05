@@ -270,8 +270,11 @@ server:
     endpoint: ""
     # -- Gateway OpenTelemetry service name. Empty uses openshell-gateway.
     serviceName: ""
-    # -- Separate OTLP/gRPC collector endpoint for relayed agent traces. Empty sends agent traces to `endpoint`.
+    # -- Separate OTLP/gRPC collector endpoint for relayed agent telemetry. Empty sends agent signals to `endpoint`.
     agentEndpoint: ""
+    # -- Agent signals relayed from sandboxes. Traces are enabled by default. The chart omits the trace-only default for compatibility with older gateways; add logs and metrics only when gateway and supervisor are upgraded together.
+    agentSignals:
+      - traces
   # Gateway-native OCSF JSONL output.
   ocsfLog:
     # -- Write gateway OCSF events as JSONL.
