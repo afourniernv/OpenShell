@@ -28,7 +28,7 @@ nix = { workspace = true }
 opentelemetry-proto = { workspace = true }
 prost = { workspace = true }
 rand = "0.10"
-russh = "0.62"
+russh = "0.63.1"
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 thiserror = { workspace = true }
