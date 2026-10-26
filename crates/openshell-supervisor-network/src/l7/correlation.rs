@@ -3,10 +3,16 @@
 
 //! Per-request correlation for HTTP enforcement events.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{
+    Mutex,
+    atomic::{AtomicBool, Ordering},
+};
 
 use http::{HeaderMap, HeaderValue};
-use openshell_ocsf::{OcsfEvent, ocsf_emit};
+use openshell_ocsf::{
+    ActionId, ActivityId, DispositionId, Endpoint, HttpActivityBuilder, HttpRequest, OcsfEvent,
+    SeverityId, StatusId, ocsf_emit,
+};
 
 use crate::l7::provider::L7Request;
 use crate::l7::relay::L7EvalContext;
@@ -16,6 +22,92 @@ pub struct RequestCorrelation {
     request_id: String,
     span: tracing::Span,
     completed: AtomicBool,
+    middleware_context: MiddlewareEventContext,
+    middleware: Mutex<MiddlewareState>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MiddlewarePhase {
+    Request,
+    Response,
+}
+
+impl MiddlewarePhase {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Request => "request",
+            Self::Response => "response",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MiddlewareOutcome {
+    Allowed,
+    Denied,
+    PlatformError,
+}
+
+impl MiddlewareOutcome {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Allowed => "allowed",
+            Self::Denied => "denied",
+            Self::PlatformError => "platform_error",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[allow(clippy::struct_excessive_bools)]
+pub struct MiddlewareObservation {
+    pub mutated: bool,
+    pub fail_open: bool,
+    pub fail_closed: bool,
+    pub admission_exhausted: bool,
+    pub delivery_started: bool,
+    pub partial_delivery: bool,
+}
+
+impl MiddlewareObservation {
+    fn merge(&mut self, other: Self) {
+        self.mutated |= other.mutated;
+        self.fail_open |= other.fail_open;
+        self.fail_closed |= other.fail_closed;
+        self.admission_exhausted |= other.admission_exhausted;
+        self.delivery_started |= other.delivery_started;
+        self.partial_delivery |= other.partial_delivery;
+    }
+}
+
+#[derive(Debug)]
+struct MiddlewareEventContext {
+    method: &'static str,
+    host: String,
+    port: u16,
+    policy_name: String,
+}
+
+#[derive(Debug, Default)]
+struct MiddlewareState {
+    request: MiddlewarePhaseState,
+    response: MiddlewarePhaseState,
+}
+
+impl MiddlewareState {
+    fn phase_mut(&mut self, phase: MiddlewarePhase) -> &mut MiddlewarePhaseState {
+        match phase {
+            MiddlewarePhase::Request => &mut self.request,
+            MiddlewarePhase::Response => &mut self.response,
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct MiddlewarePhaseState {
+    selected: bool,
+    completed: bool,
+    observation: MiddlewareObservation,
 }
 
 impl RequestCorrelation {
@@ -48,6 +140,18 @@ impl RequestCorrelation {
             "openshell.http.outcome" = tracing::field::Empty,
             "http.response.status_code" = tracing::field::Empty,
             "openshell.error.stage" = tracing::field::Empty,
+            "openshell.middleware.request.outcome" = tracing::field::Empty,
+            "openshell.middleware.request.mutated" = tracing::field::Empty,
+            "openshell.middleware.request.fail_open" = tracing::field::Empty,
+            "openshell.middleware.request.fail_closed" = tracing::field::Empty,
+            "openshell.middleware.request.admission_exhausted" = tracing::field::Empty,
+            "openshell.middleware.response.outcome" = tracing::field::Empty,
+            "openshell.middleware.response.mutated" = tracing::field::Empty,
+            "openshell.middleware.response.fail_open" = tracing::field::Empty,
+            "openshell.middleware.response.fail_closed" = tracing::field::Empty,
+            "openshell.middleware.response.admission_exhausted" = tracing::field::Empty,
+            "openshell.middleware.response.delivery_started" = tracing::field::Empty,
+            "openshell.middleware.response.partial_delivery" = tracing::field::Empty,
         );
         let headers = trace_headers(&request.raw_header);
         let _ = openshell_otel::set_parent_from_headers(&span, &headers);
@@ -55,6 +159,13 @@ impl RequestCorrelation {
             request_id,
             span,
             completed: AtomicBool::new(false),
+            middleware_context: MiddlewareEventContext {
+                method,
+                host: ctx.host.clone(),
+                port: ctx.port,
+                policy_name: ctx.policy_name.clone(),
+            },
+            middleware: Mutex::new(MiddlewareState::default()),
         }
     }
 
@@ -88,12 +199,190 @@ impl RequestCorrelation {
         self.span.record("openshell.error.stage", stage);
     }
 
+    pub(crate) fn record_response_delivery_started(&self) {
+        self.observe_middleware(
+            MiddlewarePhase::Response,
+            MiddlewareObservation {
+                delivery_started: true,
+                ..Default::default()
+            },
+        );
+    }
+
+    pub(crate) fn record_response_partial_delivery(&self) {
+        self.observe_middleware(
+            MiddlewarePhase::Response,
+            MiddlewareObservation {
+                delivery_started: true,
+                partial_delivery: true,
+                ..Default::default()
+            },
+        );
+    }
+
+    pub(crate) fn observe_middleware(
+        &self,
+        phase: MiddlewarePhase,
+        observation: MiddlewareObservation,
+    ) {
+        let mut middleware = self
+            .middleware
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let state = middleware.phase_mut(phase);
+        if state.completed {
+            return;
+        }
+        state.selected = true;
+        state.observation.merge(observation);
+    }
+
+    pub(crate) fn complete_middleware(&self, phase: MiddlewarePhase, outcome: MiddlewareOutcome) {
+        self.finish_middleware(phase, outcome.as_str());
+    }
+
+    fn finish_middleware(&self, phase: MiddlewarePhase, outcome: &'static str) {
+        let observation = {
+            let mut middleware = self
+                .middleware
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let state = middleware.phase_mut(phase);
+            if state.completed {
+                return;
+            }
+            state.selected = true;
+            state.completed = true;
+            state.observation
+        };
+
+        self.record_middleware_attributes(phase, outcome, observation);
+        self.emit(middleware_aggregate_event(
+            &self.middleware_context,
+            phase,
+            outcome,
+            observation,
+        ));
+    }
+
+    fn record_middleware_attributes(
+        &self,
+        phase: MiddlewarePhase,
+        outcome: &'static str,
+        observation: MiddlewareObservation,
+    ) {
+        match phase {
+            MiddlewarePhase::Request => {
+                let fields = (
+                    "openshell.middleware.request.outcome",
+                    "openshell.middleware.request.mutated",
+                    "openshell.middleware.request.fail_open",
+                    "openshell.middleware.request.fail_closed",
+                    "openshell.middleware.request.admission_exhausted",
+                );
+                self.span.record(fields.0, outcome);
+                self.span.record(fields.1, observation.mutated);
+                self.span.record(fields.2, observation.fail_open);
+                self.span.record(fields.3, observation.fail_closed);
+                self.span.record(fields.4, observation.admission_exhausted);
+            }
+            MiddlewarePhase::Response => {
+                let fields = (
+                    "openshell.middleware.response.outcome",
+                    "openshell.middleware.response.mutated",
+                    "openshell.middleware.response.fail_open",
+                    "openshell.middleware.response.fail_closed",
+                    "openshell.middleware.response.admission_exhausted",
+                    "openshell.middleware.response.delivery_started",
+                    "openshell.middleware.response.partial_delivery",
+                );
+                self.span.record(fields.0, outcome);
+                self.span.record(fields.1, observation.mutated);
+                self.span.record(fields.2, observation.fail_open);
+                self.span.record(fields.3, observation.fail_closed);
+                self.span.record(fields.4, observation.admission_exhausted);
+                self.span.record(fields.5, observation.delivery_started);
+                self.span.record(fields.6, observation.partial_delivery);
+            }
+        }
+    }
+
     pub(crate) fn emit(&self, mut event: OcsfEvent) {
         event.set_correlation_uid(self.request_id.clone());
         openshell_otel::with_span_context(&self.span, || {
             self.span.in_scope(|| ocsf_emit!(event));
         });
     }
+}
+
+fn middleware_aggregate_event(
+    context: &MiddlewareEventContext,
+    phase: MiddlewarePhase,
+    outcome: &'static str,
+    observation: MiddlewareObservation,
+) -> OcsfEvent {
+    let (action, mut disposition, mut severity, status) = match outcome {
+        "allowed" => (
+            ActionId::Allowed,
+            DispositionId::Allowed,
+            SeverityId::Informational,
+            StatusId::Success,
+        ),
+        "denied" => (
+            ActionId::Denied,
+            DispositionId::Blocked,
+            SeverityId::Medium,
+            StatusId::Failure,
+        ),
+        "platform_error" => (
+            ActionId::Unknown,
+            DispositionId::Error,
+            SeverityId::Medium,
+            StatusId::Failure,
+        ),
+        _ => (
+            ActionId::Unknown,
+            DispositionId::Unknown,
+            SeverityId::Low,
+            StatusId::Unknown,
+        ),
+    };
+    if observation.admission_exhausted {
+        severity = SeverityId::Medium;
+    } else if observation.fail_open && severity == SeverityId::Informational {
+        severity = SeverityId::Low;
+    }
+    if observation.partial_delivery {
+        disposition = DispositionId::Other;
+    }
+    let message = match (outcome, observation.partial_delivery) {
+        ("denied", true) => "Supervisor middleware stopped a partially delivered response",
+        ("platform_error", true) => "Supervisor middleware failed after response delivery started",
+        ("incomplete", true) => "Supervisor middleware response ended after delivery started",
+        _ => "Supervisor middleware phase completed",
+    };
+    HttpActivityBuilder::new(openshell_ocsf::ctx::ctx())
+        .activity(ActivityId::for_http_method(context.method))
+        .action(action)
+        .disposition(disposition)
+        .severity(severity)
+        .status(status)
+        .http_request(HttpRequest {
+            http_method: context.method.parse().expect("bounded HTTP method"),
+            url: None,
+        })
+        .dst_endpoint(Endpoint::from_domain(&context.host, context.port))
+        .firewall_rule(&context.policy_name, "middleware-correlation")
+        .unmapped("middleware_phase", phase.as_str())
+        .unmapped("middleware_outcome", outcome)
+        .unmapped("mutated", observation.mutated)
+        .unmapped("fail_open", observation.fail_open)
+        .unmapped("fail_closed", observation.fail_closed)
+        .unmapped("admission_exhausted", observation.admission_exhausted)
+        .unmapped("delivery_started", observation.delivery_started)
+        .unmapped("partial_delivery", observation.partial_delivery)
+        .message(message)
+        .build()
 }
 
 fn bounded_http_method(method: &str) -> &'static str {
@@ -107,6 +396,19 @@ fn bounded_http_method(method: &str) -> &'static str {
 
 impl Drop for RequestCorrelation {
     fn drop(&mut self) {
+        for phase in [MiddlewarePhase::Request, MiddlewarePhase::Response] {
+            let selected_and_unfinished = {
+                let mut middleware = self
+                    .middleware
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let state = middleware.phase_mut(phase);
+                state.selected && !state.completed
+            };
+            if selected_and_unfinished {
+                self.finish_middleware(phase, "incomplete");
+            }
+        }
         if !self.completed.load(Ordering::Acquire) {
             self.span.record("openshell.http.outcome", "incomplete");
             self.span.record("openshell.error.stage", "unclassified");
@@ -352,5 +654,280 @@ mod tests {
     fn malformed_or_incomplete_header_block_has_no_trace_context() {
         assert!(trace_headers(b"GET / HTTP/1.1\r\ntraceparent: value").is_empty());
         assert!(trace_headers(&[0xff, b'\r', b'\n', b'\r', b'\n']).is_empty());
+    }
+
+    #[test]
+    fn middleware_observations_are_bounded_aggregated_and_emitted_once() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        const SENTINEL: &str = "SENTINEL_SECRET_MIDDLEWARE_VALUE";
+        let exporter = opentelemetry_sdk::trace::InMemorySpanExporterBuilder::new().build();
+        let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+            .with_simple_exporter(exporter.clone())
+            .build();
+        let ocsf = openshell_ocsf::test_support::OcsfCapture::default();
+        let subscriber = tracing_subscriber::registry()
+            .with(openshell_otel::layer(&provider, "correlation-test"))
+            .with(ocsf.clone());
+        let ctx = L7EvalContext {
+            host: "api.example.test".into(),
+            port: 443,
+            policy_name: "api-policy".into(),
+            ..Default::default()
+        };
+        let mut sensitive_request = request();
+        sensitive_request.target = format!("/data?token={SENTINEL}");
+        sensitive_request.raw_header = format!(
+            "GET /data?token={SENTINEL} HTTP/1.1\r\nHost: api.example.test\r\nX-Secret: {SENTINEL}\r\n\r\n"
+        )
+        .into_bytes();
+
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::callsite::rebuild_interest_cache();
+            let correlation = RequestCorrelation::with_request_id(
+                &sensitive_request,
+                &ctx,
+                "00000000-0000-4000-8000-000000000003".into(),
+            );
+            correlation.observe_middleware(
+                MiddlewarePhase::Request,
+                MiddlewareObservation {
+                    mutated: true,
+                    fail_open: true,
+                    ..Default::default()
+                },
+            );
+            correlation.observe_middleware(
+                MiddlewarePhase::Request,
+                MiddlewareObservation {
+                    fail_closed: true,
+                    ..Default::default()
+                },
+            );
+            correlation.complete_middleware(MiddlewarePhase::Request, MiddlewareOutcome::Denied);
+            correlation
+                .complete_middleware(MiddlewarePhase::Request, MiddlewareOutcome::PlatformError);
+            correlation.record_final_http_outcome("denied");
+        });
+        provider.force_flush().expect("flush spans");
+
+        let span = exporter
+            .get_finished_spans()
+            .expect("finished spans")
+            .into_iter()
+            .find(|span| span.name == "openshell.http.enforcement")
+            .expect("HTTP enforcement span");
+        let attributes = span
+            .attributes
+            .into_iter()
+            .map(|attribute| {
+                (
+                    attribute.key.as_str().to_string(),
+                    attribute.value.to_string(),
+                )
+            })
+            .collect::<std::collections::BTreeMap<_, _>>();
+        assert_eq!(attributes["openshell.middleware.request.outcome"], "denied");
+        assert_eq!(attributes["openshell.middleware.request.mutated"], "true");
+        assert_eq!(attributes["openshell.middleware.request.fail_open"], "true");
+        assert_eq!(
+            attributes["openshell.middleware.request.fail_closed"],
+            "true"
+        );
+        assert_eq!(
+            attributes["openshell.middleware.request.admission_exhausted"],
+            "false"
+        );
+
+        let events = ocsf
+            .json_events()
+            .into_iter()
+            .filter(|event| event["firewall_rule"]["type"] == "middleware-correlation")
+            .collect::<Vec<_>>();
+        assert_eq!(events.len(), 1, "one aggregate event per completed phase");
+        let event = &events[0];
+        assert_eq!(event["metadata"]["correlation_uid"], correlation_id(3));
+        assert_eq!(event["unmapped"]["middleware_phase"], "request");
+        assert_eq!(event["unmapped"]["middleware_outcome"], "denied");
+        assert_eq!(event["unmapped"]["mutated"], true);
+        assert_eq!(event["unmapped"]["fail_open"], true);
+        assert_eq!(event["unmapped"]["fail_closed"], true);
+        assert_eq!(event["unmapped"]["admission_exhausted"], false);
+        assert!(!serde_json::to_string(event).unwrap().contains(SENTINEL));
+    }
+
+    #[test]
+    fn unfinished_selected_middleware_phase_is_emitted_once_as_incomplete() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let exporter = opentelemetry_sdk::trace::InMemorySpanExporterBuilder::new().build();
+        let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+            .with_simple_exporter(exporter.clone())
+            .build();
+        let ocsf = openshell_ocsf::test_support::OcsfCapture::default();
+        let subscriber = tracing_subscriber::registry()
+            .with(openshell_otel::layer(&provider, "correlation-test"))
+            .with(ocsf.clone());
+
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::callsite::rebuild_interest_cache();
+            let correlation = RequestCorrelation::with_request_id(
+                &request(),
+                &L7EvalContext {
+                    host: "example.test".into(),
+                    port: 443,
+                    policy_name: "api-policy".into(),
+                    ..Default::default()
+                },
+                correlation_id(4),
+            );
+            correlation.observe_middleware(
+                MiddlewarePhase::Response,
+                MiddlewareObservation {
+                    admission_exhausted: true,
+                    ..Default::default()
+                },
+            );
+        });
+        provider.force_flush().expect("flush spans");
+
+        let span = exporter
+            .get_finished_spans()
+            .expect("finished spans")
+            .into_iter()
+            .find(|span| span.name == "openshell.http.enforcement")
+            .expect("HTTP enforcement span");
+        let attributes = span
+            .attributes
+            .into_iter()
+            .map(|attribute| {
+                (
+                    attribute.key.as_str().to_string(),
+                    attribute.value.to_string(),
+                )
+            })
+            .collect::<std::collections::BTreeMap<_, _>>();
+        assert_eq!(
+            attributes["openshell.middleware.response.outcome"],
+            "incomplete"
+        );
+        assert_eq!(
+            attributes["openshell.middleware.response.admission_exhausted"],
+            "true"
+        );
+        let events = ocsf
+            .json_events()
+            .into_iter()
+            .filter(|event| event["firewall_rule"]["type"] == "middleware-correlation")
+            .collect::<Vec<_>>();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["unmapped"]["middleware_phase"], "response");
+        assert_eq!(events[0]["unmapped"]["middleware_outcome"], "incomplete");
+        assert_eq!(events[0]["severity"], "Medium");
+    }
+
+    #[test]
+    fn partial_response_denial_is_not_reported_as_fully_blocked() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let exporter = opentelemetry_sdk::trace::InMemorySpanExporterBuilder::new().build();
+        let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+            .with_simple_exporter(exporter.clone())
+            .build();
+        let ocsf = openshell_ocsf::test_support::OcsfCapture::default();
+        let subscriber = tracing_subscriber::registry()
+            .with(openshell_otel::layer(&provider, "correlation-test"))
+            .with(ocsf.clone());
+
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::callsite::rebuild_interest_cache();
+            let correlation = RequestCorrelation::with_request_id(
+                &request(),
+                &L7EvalContext {
+                    host: "example.test".into(),
+                    port: 443,
+                    policy_name: "api-policy".into(),
+                    ..Default::default()
+                },
+                correlation_id(5),
+            );
+            correlation.observe_middleware(
+                MiddlewarePhase::Response,
+                MiddlewareObservation {
+                    delivery_started: true,
+                    partial_delivery: true,
+                    ..Default::default()
+                },
+            );
+            correlation.complete_middleware(MiddlewarePhase::Response, MiddlewareOutcome::Denied);
+            correlation.record_final_http_outcome("denied");
+        });
+        provider.force_flush().expect("flush spans");
+
+        let span = exporter
+            .get_finished_spans()
+            .expect("finished spans")
+            .into_iter()
+            .find(|span| span.name == "openshell.http.enforcement")
+            .expect("HTTP enforcement span");
+        let attributes = span
+            .attributes
+            .into_iter()
+            .map(|attribute| {
+                (
+                    attribute.key.as_str().to_string(),
+                    attribute.value.to_string(),
+                )
+            })
+            .collect::<std::collections::BTreeMap<_, _>>();
+        assert_eq!(
+            attributes["openshell.middleware.response.delivery_started"],
+            "true"
+        );
+        assert_eq!(
+            attributes["openshell.middleware.response.partial_delivery"],
+            "true"
+        );
+
+        let events = ocsf
+            .json_events()
+            .into_iter()
+            .filter(|event| event["firewall_rule"]["type"] == "middleware-correlation")
+            .collect::<Vec<_>>();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["action"], "Denied");
+        assert_eq!(events[0]["disposition"], "Other");
+        assert_eq!(events[0]["unmapped"]["delivery_started"], true);
+        assert_eq!(events[0]["unmapped"]["partial_delivery"], true);
+        assert_eq!(
+            events[0]["message"],
+            "Supervisor middleware stopped a partially delivered response"
+        );
+    }
+
+    #[test]
+    fn allowed_fail_open_aggregate_is_elevated_above_informational() {
+        let event = middleware_aggregate_event(
+            &MiddlewareEventContext {
+                method: "GET",
+                host: "example.test".into(),
+                port: 443,
+                policy_name: "api-policy".into(),
+            },
+            MiddlewarePhase::Response,
+            "allowed",
+            MiddlewareObservation {
+                fail_open: true,
+                ..Default::default()
+            },
+        )
+        .to_json()
+        .expect("serialize aggregate event");
+
+        assert_eq!(event["severity"], "Low");
+    }
+
+    fn correlation_id(suffix: u8) -> String {
+        format!("00000000-0000-4000-8000-{suffix:012}")
     }
 }

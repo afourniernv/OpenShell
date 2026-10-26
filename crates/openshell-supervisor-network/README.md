@@ -64,3 +64,12 @@ final outcome, such as a local denial, an allowed response, or an upstream or
 platform failure. An unfinished request is reported as incomplete. The
 attributes never include credentials, query values, or request and response
 bodies.
+
+When Supervisor Middleware is selected, the same span records separate bounded
+request- and response-phase outcomes. Each phase reports whether middleware
+allowed or denied the exchange, failed internally, mutated traffic, followed a
+fail-open or fail-closed path, or exhausted admission capacity. OpenShell emits
+one correlated OCSF aggregate for each completed phase. Middleware names,
+configuration, findings, failure reasons, headers, and bodies remain outside
+the correlated aggregate; existing detailed middleware events retain their
+independent security-log lifecycle.

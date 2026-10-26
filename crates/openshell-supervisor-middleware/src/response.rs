@@ -100,10 +100,18 @@ pub struct HttpResponseInvocation {
     pub sequence: Option<u64>,
     pub input_size: usize,
     pub output_size: Option<usize>,
+    pub transformed: bool,
     pub failed: bool,
     pub stage_disabled: bool,
     pub reason_code: Option<String>,
     pub failure_category: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum HttpResponseMiddlewareFailureKind {
+    #[default]
+    Processing,
+    AdmissionExhausted,
 }
 
 pub struct HttpResponsePreflightOutcome {
@@ -122,6 +130,7 @@ pub struct HttpResponsePreflightOutcome {
 pub struct HttpResponseMiddlewareFailure {
     pub reason: String,
     pub denial: Option<super::MiddlewareDenial>,
+    kind: HttpResponseMiddlewareFailureKind,
     /// Exchange diagnostics collected before a consuming operation failed.
     pub diagnostics: HttpResponseDiagnostics,
 }
@@ -138,6 +147,11 @@ impl HttpResponseMiddlewareFailure {
     fn with_diagnostics(mut self, diagnostics: HttpResponseDiagnostics) -> Self {
         self.diagnostics = diagnostics;
         self
+    }
+
+    #[must_use]
+    pub fn admission_exhausted(&self) -> bool {
+        self.kind == HttpResponseMiddlewareFailureKind::AdmissionExhausted
     }
 }
 
@@ -325,6 +339,7 @@ impl HttpResponseSession {
             return Err(HttpResponseMiddlewareFailure {
                 reason: "response_stream_unit_over_capacity".into(),
                 denial: None,
+                kind: HttpResponseMiddlewareFailureKind::Processing,
                 diagnostics: HttpResponseDiagnostics::default(),
             });
         }
@@ -335,6 +350,14 @@ impl HttpResponseSession {
             .map_err(|error| HttpResponseMiddlewareFailure {
                 reason: format!("middleware_failed: {error}"),
                 denial: None,
+                kind: if error
+                    .downcast_ref::<crate::MiddlewareAdmissionExhausted>()
+                    .is_some()
+                {
+                    HttpResponseMiddlewareFailureKind::AdmissionExhausted
+                } else {
+                    HttpResponseMiddlewareFailureKind::Processing
+                },
                 diagnostics: HttpResponseDiagnostics::default(),
             })?;
         let deadline = Instant::now() + MAX_MIDDLEWARE_CHAIN_TIMEOUT;
@@ -373,6 +396,14 @@ impl HttpResponseSession {
                 return Err(HttpResponseMiddlewareFailure {
                     reason: format!("middleware_failed: {error}"),
                     denial: None,
+                    kind: if error
+                        .downcast_ref::<crate::MiddlewareAdmissionExhausted>()
+                        .is_some()
+                    {
+                        HttpResponseMiddlewareFailureKind::AdmissionExhausted
+                    } else {
+                        HttpResponseMiddlewareFailureKind::Processing
+                    },
                     diagnostics: self.take_diagnostics(),
                 });
             }
@@ -635,6 +666,7 @@ impl HttpResponseSession {
                     sequence,
                     input_size,
                     output_size,
+                    false,
                     reason_code,
                 ));
                 Ok((!original.is_empty())
@@ -650,6 +682,7 @@ impl HttpResponseSession {
                     sequence,
                     input_size,
                     replacement.len(),
+                    true,
                     reason_code,
                 ));
                 Ok((!replacement.is_empty())
@@ -658,6 +691,7 @@ impl HttpResponseSession {
                     .collect())
             }
             BodyAction::SkipRemaining(action) => {
+                let transformed = matches!(&action, CurrentBodyAction::Transform(_));
                 let output = match action {
                     CurrentBodyAction::PassThrough => original,
                     CurrentBodyAction::Transform(replacement) => {
@@ -672,6 +706,7 @@ impl HttpResponseSession {
                     sequence,
                     input_size,
                     output.len(),
+                    transformed,
                     reason_code,
                 ));
                 stage.end(MiddlewareSessionEndReason::Normal).await;
@@ -687,6 +722,7 @@ impl HttpResponseSession {
                     sequence,
                     input_size,
                     0,
+                    false,
                     reason_code.clone(),
                 ));
                 self.end_all(MiddlewareSessionEndReason::MiddlewareDenial)
@@ -697,6 +733,7 @@ impl HttpResponseSession {
                         config_name,
                         reason_code,
                     }),
+                    kind: HttpResponseMiddlewareFailureKind::Processing,
                     diagnostics: HttpResponseDiagnostics::default(),
                 })
             }
@@ -724,6 +761,7 @@ impl HttpResponseSession {
             sequence,
             input_size: original.len(),
             output_size: None,
+            transformed: false,
             failed: true,
             stage_disabled: true,
             reason_code: None,
@@ -743,6 +781,7 @@ impl HttpResponseSession {
             Err(HttpResponseMiddlewareFailure {
                 reason: format!("middleware_failed: {reason}"),
                 denial: None,
+                kind: HttpResponseMiddlewareFailureKind::Processing,
                 diagnostics: HttpResponseDiagnostics::default(),
             })
         }
@@ -833,6 +872,7 @@ impl HttpResponseSession {
                 sequence: None,
                 input_size,
                 output_size: Some(output_size),
+                transformed: false,
                 failed: false,
                 stage_disabled: false,
                 reason_code,
@@ -861,6 +901,7 @@ impl HttpResponseSession {
             sequence: None,
             input_size: encoded_header_bytes(&original),
             output_size: None,
+            transformed: false,
             failed: true,
             stage_disabled: true,
             reason_code: None,
@@ -876,6 +917,7 @@ impl HttpResponseSession {
             Err(HttpResponseMiddlewareFailure {
                 reason: format!("middleware_failed: {reason}"),
                 denial: None,
+                kind: HttpResponseMiddlewareFailureKind::Processing,
                 diagnostics: HttpResponseDiagnostics::default(),
             })
         }
@@ -951,6 +993,7 @@ fn body_invocation_with_reason(
     sequence: u64,
     input_size: usize,
     output_size: usize,
+    transformed: bool,
     reason_code: Option<String>,
 ) -> HttpResponseInvocation {
     HttpResponseInvocation {
@@ -960,6 +1003,7 @@ fn body_invocation_with_reason(
         sequence: Some(sequence),
         input_size,
         output_size: Some(output_size),
+        transformed,
         failed: false,
         stage_disabled: false,
         reason_code,
@@ -1034,6 +1078,7 @@ fn collect_preflight_failure(
         sequence: None,
         input_size: 0,
         output_size: None,
+        transformed: false,
         failed: true,
         stage_disabled: true,
         reason_code: None,

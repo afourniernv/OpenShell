@@ -3,6 +3,9 @@
 
 //! Supervisor middleware application for L7 requests.
 
+use crate::l7::correlation::{
+    MiddlewareObservation, MiddlewareOutcome, MiddlewarePhase, RequestCorrelation,
+};
 use crate::l7::relay::L7EvalContext;
 use crate::opa::PolicyGenerationGuard;
 use miette::{Result, miette};
@@ -17,12 +20,30 @@ pub enum MiddlewareApplyResult {
     Allowed(crate::l7::provider::L7Request),
     Denied {
         denial: Option<openshell_supervisor_middleware::MiddlewareDenial>,
+        termination: openshell_supervisor_middleware::ChainTermination,
     },
     /// The platform's shared active-work and waiter capacities were both full.
     ///
     /// This is platform load shedding, not a selected middleware-stage failure,
     /// so callers must not apply a stage's `on_error` policy.
     AdmissionExhausted,
+}
+
+pub fn request_rejection_correlation(
+    termination: openshell_supervisor_middleware::ChainTermination,
+) -> (&'static str, &'static str) {
+    use openshell_supervisor_middleware::ChainTermination;
+
+    match termination {
+        ChainTermination::MiddlewareDenied => ("denied", "request_middleware"),
+        ChainTermination::TransformedBodyPolicyDenied => ("denied", "post_middleware_policy"),
+        ChainTermination::TransformedBodyPolicyEvaluationFailed => {
+            ("platform_error", "post_middleware_policy")
+        }
+        ChainTermination::Completed | ChainTermination::MiddlewareFailure => {
+            ("platform_error", "request_middleware")
+        }
+    }
 }
 
 /// One destination-selected middleware chain shared by an HTTP request and
@@ -58,6 +79,7 @@ impl HttpMiddlewareExchange {
         ctx: &L7EvalContext,
         scheme: &str,
         transformed_body_policy: openshell_supervisor_middleware::TransformedBodyPolicy<'_>,
+        correlation: Option<&RequestCorrelation>,
     ) -> Result<MiddlewareApplyResult>
     where
         C: AsyncRead + AsyncWrite + Unpin + Send,
@@ -72,6 +94,7 @@ impl HttpMiddlewareExchange {
             &self.generation_guard,
             transformed_body_policy,
             &self.request_id,
+            correlation,
         )
         .await
     }
@@ -515,6 +538,7 @@ pub async fn apply_middleware_chain_with_request_id<C: AsyncRead + AsyncWrite + 
     generation_guard: &PolicyGenerationGuard,
     transformed_body_policy: openshell_supervisor_middleware::TransformedBodyPolicy<'_>,
     request_id: &str,
+    correlation: Option<&RequestCorrelation>,
 ) -> Result<MiddlewareApplyResult> {
     apply_middleware_chain_for_scheme_with_request_id(
         req,
@@ -526,6 +550,7 @@ pub async fn apply_middleware_chain_with_request_id<C: AsyncRead + AsyncWrite + 
         generation_guard,
         transformed_body_policy,
         request_id,
+        correlation,
     )
     .await
 }
@@ -543,11 +568,18 @@ pub async fn apply_middleware_chain_for_scheme_with_request_id<
     generation_guard: &PolicyGenerationGuard,
     transformed_body_policy: openshell_supervisor_middleware::TransformedBodyPolicy<'_>,
     request_id: &str,
+    correlation: Option<&RequestCorrelation>,
 ) -> Result<MiddlewareApplyResult> {
     if chain.is_empty() {
         return Ok(MiddlewareApplyResult::Allowed(req));
     }
     let chain = runner.describe_chain(&chain).await?;
+    if chain.is_empty() {
+        return Ok(MiddlewareApplyResult::Allowed(req));
+    }
+    if let Some(correlation) = correlation {
+        correlation.observe_middleware(MiddlewarePhase::Request, MiddlewareObservation::default());
+    }
     let admission = if chain.is_empty() {
         None
     } else {
@@ -558,6 +590,19 @@ pub async fn apply_middleware_chain_for_scheme_with_request_id<
             ) => Some(admission),
             openshell_supervisor_middleware::MiddlewareWorkAdmissionOutcome::QueueExhausted => {
                 emit_middleware_admission_exhausted(ctx);
+                if let Some(correlation) = correlation {
+                    correlation.observe_middleware(
+                        MiddlewarePhase::Request,
+                        MiddlewareObservation {
+                            admission_exhausted: true,
+                            ..Default::default()
+                        },
+                    );
+                    correlation.complete_middleware(
+                        MiddlewarePhase::Request,
+                        MiddlewareOutcome::PlatformError,
+                    );
+                }
                 return Ok(MiddlewareApplyResult::AdmissionExhausted);
             }
         }
@@ -586,12 +631,14 @@ pub async fn apply_middleware_chain_for_scheme_with_request_id<
                 admission,
             )
             .await?;
+        observe_request_chain_outcome(correlation, &outcome);
         emit_middleware_events(ctx, &req, &outcome);
         return Ok(if outcome.allowed {
             MiddlewareApplyResult::Allowed(req)
         } else {
             MiddlewareApplyResult::Denied {
                 denial: outcome.denial,
+                termination: outcome.termination,
             }
         });
     };
@@ -609,7 +656,9 @@ pub async fn apply_middleware_chain_for_scheme_with_request_id<
     {
         crate::l7::rest::BufferResult::Buffered(buffered) => buffered,
         crate::l7::rest::BufferResult::OverCapacity { recoverable } => {
-            return Ok(resolve_unbuffered_body(ctx, req, &chain, recoverable));
+            let result = resolve_unbuffered_body(ctx, req, &chain, recoverable);
+            observe_unbuffered_request_outcome(correlation, &chain, &result);
+            return Ok(result);
         }
     };
     let headers = safe_middleware_headers(&buffered.headers)?;
@@ -636,10 +685,12 @@ pub async fn apply_middleware_chain_for_scheme_with_request_id<
             Some(admission),
         )
         .await?;
+    observe_request_chain_outcome(correlation, &outcome);
     emit_middleware_events(ctx, &req, &outcome);
     if !outcome.allowed {
         return Ok(MiddlewareApplyResult::Denied {
             denial: outcome.denial,
+            termination: outcome.termination,
         });
     }
     let rebuilt = crate::l7::rest::rebuild_request_with_buffered_body(
@@ -649,6 +700,84 @@ pub async fn apply_middleware_chain_for_scheme_with_request_id<
         &outcome.header_mutations,
     )?;
     Ok(MiddlewareApplyResult::Allowed(rebuilt))
+}
+
+fn observe_request_chain_outcome(
+    correlation: Option<&RequestCorrelation>,
+    outcome: &openshell_supervisor_middleware::ChainOutcome,
+) {
+    let Some(correlation) = correlation else {
+        return;
+    };
+    let (observation, middleware_outcome) = request_chain_observation(outcome);
+    correlation.observe_middleware(MiddlewarePhase::Request, observation);
+    correlation.complete_middleware(MiddlewarePhase::Request, middleware_outcome);
+}
+
+fn request_chain_observation(
+    outcome: &openshell_supervisor_middleware::ChainOutcome,
+) -> (MiddlewareObservation, MiddlewareOutcome) {
+    let observation = MiddlewareObservation {
+        mutated: outcome
+            .applied
+            .iter()
+            .any(|invocation| invocation.transformed),
+        fail_open: outcome.applied.iter().any(|invocation| {
+            invocation.failed && invocation.decision == openshell_core::proto::Decision::Allow
+        }),
+        fail_closed: outcome.applied.iter().any(|invocation| {
+            invocation.failed && invocation.decision == openshell_core::proto::Decision::Deny
+        }),
+        admission_exhausted: false,
+        ..Default::default()
+    };
+    let middleware_outcome = match outcome.termination {
+        openshell_supervisor_middleware::ChainTermination::Completed
+        | openshell_supervisor_middleware::ChainTermination::TransformedBodyPolicyDenied
+        | openshell_supervisor_middleware::ChainTermination::TransformedBodyPolicyEvaluationFailed => {
+            MiddlewareOutcome::Allowed
+        }
+        openshell_supervisor_middleware::ChainTermination::MiddlewareDenied => {
+            MiddlewareOutcome::Denied
+        }
+        openshell_supervisor_middleware::ChainTermination::MiddlewareFailure => {
+            MiddlewareOutcome::PlatformError
+        }
+    };
+    (observation, middleware_outcome)
+}
+
+fn observe_unbuffered_request_outcome(
+    correlation: Option<&RequestCorrelation>,
+    chain: &[openshell_supervisor_middleware::DescribedChainEntry],
+    result: &MiddlewareApplyResult,
+) {
+    let Some(correlation) = correlation else {
+        return;
+    };
+    let fail_open = chain
+        .iter()
+        .any(|entry| entry.on_error() == openshell_supervisor_middleware::OnError::FailOpen);
+    let fail_closed = chain
+        .iter()
+        .any(|entry| entry.on_error() == openshell_supervisor_middleware::OnError::FailClosed);
+    correlation.observe_middleware(
+        MiddlewarePhase::Request,
+        MiddlewareObservation {
+            fail_open,
+            fail_closed,
+            ..Default::default()
+        },
+    );
+    let outcome = match result {
+        MiddlewareApplyResult::Allowed(_) => MiddlewareOutcome::Allowed,
+        MiddlewareApplyResult::Denied {
+            denial: Some(_), ..
+        } => MiddlewareOutcome::Denied,
+        MiddlewareApplyResult::Denied { denial: None, .. }
+        | MiddlewareApplyResult::AdmissionExhausted => MiddlewareOutcome::PlatformError,
+    };
+    correlation.complete_middleware(MiddlewarePhase::Request, outcome);
 }
 
 pub async fn send_middleware_rejection_response<C: AsyncRead + AsyncWrite + Unpin + Send>(
@@ -792,7 +921,10 @@ pub(super) fn resolve_unbuffered_body(
         return MiddlewareApplyResult::Allowed(req);
     }
     emit_middleware_body_unavailable(ctx, true);
-    MiddlewareApplyResult::Denied { denial: None }
+    MiddlewareApplyResult::Denied {
+        denial: None,
+        termination: openshell_supervisor_middleware::ChainTermination::MiddlewareFailure,
+    }
 }
 
 fn emit_middleware_body_unavailable(ctx: &L7EvalContext, denied: bool) {
@@ -1013,10 +1145,12 @@ fn emit_middleware_events(
 #[cfg(test)]
 mod tests {
     use super::{
-        middleware_admission_exhausted_event, safe_middleware_headers,
-        send_middleware_rejection_response, websocket_coverage_events,
-        websocket_message_finding_events, websocket_preflight_finding_events,
+        middleware_admission_exhausted_event, request_chain_observation,
+        request_rejection_correlation, safe_middleware_headers, send_middleware_rejection_response,
+        websocket_coverage_events, websocket_message_finding_events,
+        websocket_preflight_finding_events,
     };
+    use crate::l7::correlation::{MiddlewareObservation, MiddlewareOutcome};
     use crate::l7::relay::L7EvalContext;
     use tokio::io::AsyncReadExt;
 
@@ -1396,5 +1530,128 @@ mod tests {
                 "middleware must reject malformed header fields"
             );
         }
+    }
+
+    #[test]
+    fn request_chain_observation_maps_only_bounded_aggregate_state() {
+        use openshell_core::proto::Decision;
+        use openshell_supervisor_middleware::{
+            ChainOutcome, ChainTermination, MiddlewareDenial, MiddlewareInvocation,
+        };
+
+        let outcome = |allowed, denial, termination, applied| ChainOutcome {
+            allowed,
+            reason: "SENTINEL_UNTRUSTED_REASON".into(),
+            body: b"SENTINEL_UNTRUSTED_BODY".to_vec(),
+            header_mutations: Vec::new(),
+            findings: Vec::new(),
+            metadata: std::collections::BTreeMap::new(),
+            applied,
+            denial,
+            termination,
+        };
+        let invocation = |decision, transformed, failed| MiddlewareInvocation {
+            name: "SENTINEL_UNTRUSTED_NAME".into(),
+            implementation: "SENTINEL_UNTRUSTED_IMPLEMENTATION".into(),
+            decision,
+            transformed,
+            failed,
+        };
+
+        assert_eq!(
+            request_chain_observation(&outcome(
+                true,
+                None,
+                ChainTermination::Completed,
+                vec![invocation(Decision::Allow, true, false)],
+            )),
+            (
+                MiddlewareObservation {
+                    mutated: true,
+                    ..Default::default()
+                },
+                MiddlewareOutcome::Allowed,
+            )
+        );
+        assert_eq!(
+            request_rejection_correlation(ChainTermination::TransformedBodyPolicyDenied),
+            ("denied", "post_middleware_policy")
+        );
+        assert_eq!(
+            request_rejection_correlation(ChainTermination::TransformedBodyPolicyEvaluationFailed),
+            ("platform_error", "post_middleware_policy")
+        );
+        assert_eq!(
+            request_chain_observation(&outcome(
+                true,
+                None,
+                ChainTermination::Completed,
+                vec![invocation(Decision::Allow, false, true)],
+            )),
+            (
+                MiddlewareObservation {
+                    fail_open: true,
+                    ..Default::default()
+                },
+                MiddlewareOutcome::Allowed,
+            )
+        );
+        assert_eq!(
+            request_chain_observation(&outcome(
+                false,
+                Some(MiddlewareDenial {
+                    config_name: "SENTINEL_UNTRUSTED_NAME".into(),
+                    reason_code: Some("SENTINEL_UNTRUSTED_REASON".into()),
+                }),
+                ChainTermination::MiddlewareDenied,
+                vec![invocation(Decision::Deny, false, false)],
+            )),
+            (MiddlewareObservation::default(), MiddlewareOutcome::Denied)
+        );
+        assert_eq!(
+            request_chain_observation(&outcome(
+                false,
+                None,
+                ChainTermination::MiddlewareFailure,
+                vec![invocation(Decision::Deny, false, true)],
+            )),
+            (
+                MiddlewareObservation {
+                    fail_closed: true,
+                    ..Default::default()
+                },
+                MiddlewareOutcome::PlatformError,
+            )
+        );
+        assert_eq!(
+            request_chain_observation(&outcome(
+                false,
+                None,
+                ChainTermination::TransformedBodyPolicyDenied,
+                vec![invocation(Decision::Allow, true, false)],
+            )),
+            (
+                MiddlewareObservation {
+                    mutated: true,
+                    ..Default::default()
+                },
+                MiddlewareOutcome::Allowed,
+            )
+        );
+        assert_eq!(
+            request_chain_observation(&outcome(
+                false,
+                None,
+                ChainTermination::TransformedBodyPolicyEvaluationFailed,
+                vec![invocation(Decision::Allow, true, false)],
+            )),
+            (
+                MiddlewareObservation {
+                    mutated: true,
+                    ..Default::default()
+                },
+                MiddlewareOutcome::Allowed,
+            )
+        );
     }
 }

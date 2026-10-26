@@ -227,6 +227,7 @@ impl ChainRunner {
                         sequence: None,
                         input_size: 0,
                         output_size: None,
+                        transformed: false,
                         failed: false,
                         stage_disabled: false,
                         reason_code,
@@ -293,6 +294,7 @@ impl ChainRunner {
                             continue;
                         }
                     };
+                    let transformed = updated != headers;
                     headers = updated;
                     if mode == StageMode::Stream {
                         strip_stale_integrity(&mut headers);
@@ -315,6 +317,7 @@ impl ChainRunner {
                         sequence: None,
                         input_size: 0,
                         output_size: None,
+                        transformed,
                         failed: false,
                         stage_disabled: false,
                         reason_code,
@@ -342,6 +345,7 @@ impl ChainRunner {
                         sequence: None,
                         input_size: 0,
                         output_size: None,
+                        transformed: false,
                         failed: false,
                         stage_disabled: false,
                         reason_code: reason_code.clone(),
