@@ -3,9 +3,12 @@
 
 //! Per-request correlation for HTTP enforcement events.
 
-use std::sync::{
-    Mutex,
-    atomic::{AtomicBool, Ordering},
+use std::{
+    collections::BTreeSet,
+    sync::{
+        Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use http::{HeaderMap, HeaderValue};
@@ -24,6 +27,210 @@ pub struct RequestCorrelation {
     completed: AtomicBool,
     middleware_context: MiddlewareEventContext,
     middleware: Mutex<MiddlewareState>,
+    credential: Mutex<CredentialState>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum CredentialMechanism {
+    StaticPlaceholder,
+    TokenGrant,
+    SigV4,
+}
+
+impl CredentialMechanism {
+    const ALL: [Self; 3] = [Self::StaticPlaceholder, Self::TokenGrant, Self::SigV4];
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::StaticPlaceholder => "static_placeholder",
+            Self::TokenGrant => "token_grant",
+            Self::SigV4 => "sigv4",
+        }
+    }
+
+    fn span_outcome_field(self) -> &'static str {
+        match self {
+            Self::StaticPlaceholder => "openshell.credential.static_placeholder.outcome",
+            Self::TokenGrant => "openshell.credential.token_grant.outcome",
+            Self::SigV4 => "openshell.credential.sigv4.outcome",
+        }
+    }
+
+    fn ocsf_outcome_field(self) -> &'static str {
+        match self {
+            Self::StaticPlaceholder => "credential_static_placeholder_outcome",
+            Self::TokenGrant => "credential_token_grant_outcome",
+            Self::SigV4 => "credential_sigv4_outcome",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum CredentialSurface {
+    Path,
+    Query,
+    Header,
+    Body,
+    Signature,
+}
+
+impl CredentialSurface {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Path => "path",
+            Self::Query => "query",
+            Self::Header => "header",
+            Self::Body => "body",
+            Self::Signature => "signature",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CredentialOutcome {
+    Prepared,
+    Withheld,
+    Denied,
+    Unavailable,
+    Stale,
+    Incomplete,
+}
+
+impl CredentialOutcome {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Prepared => "prepared",
+            Self::Withheld => "withheld",
+            Self::Denied => "denied",
+            Self::Unavailable => "unavailable",
+            Self::Stale => "stale",
+            Self::Incomplete => "incomplete",
+        }
+    }
+
+    fn precedence(self) -> u8 {
+        match self {
+            Self::Incomplete => 0,
+            Self::Withheld => 1,
+            Self::Prepared => 2,
+            Self::Unavailable => 3,
+            Self::Stale => 4,
+            Self::Denied => 5,
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct CredentialState {
+    selected: bool,
+    mechanisms: BTreeSet<CredentialMechanism>,
+    surfaces: BTreeSet<CredentialSurface>,
+    outcome: Option<CredentialOutcome>,
+    mechanism_outcomes: std::collections::BTreeMap<CredentialMechanism, CredentialOutcome>,
+}
+
+impl CredentialState {
+    fn observe(&mut self, mechanism: CredentialMechanism, surface: CredentialSurface) {
+        self.selected = true;
+        self.mechanisms.insert(mechanism);
+        self.surfaces.insert(surface);
+    }
+
+    fn complete(&mut self, outcome: CredentialOutcome) {
+        if !self.selected && outcome != CredentialOutcome::Stale {
+            return;
+        }
+        self.selected = true;
+
+        merge_optional_credential_outcome(&mut self.outcome, outcome);
+        if outcome == CredentialOutcome::Stale {
+            for mechanism in &self.mechanisms {
+                merge_credential_outcome(
+                    self.mechanism_outcomes.entry(*mechanism).or_insert(outcome),
+                    outcome,
+                );
+            }
+        }
+    }
+
+    fn complete_mechanism(&mut self, mechanism: CredentialMechanism, outcome: CredentialOutcome) {
+        if !self.mechanisms.contains(&mechanism) {
+            return;
+        }
+
+        merge_optional_credential_outcome(&mut self.outcome, outcome);
+        merge_credential_outcome(
+            self.mechanism_outcomes.entry(mechanism).or_insert(outcome),
+            outcome,
+        );
+    }
+
+    fn snapshot(&self) -> Option<CredentialSnapshot> {
+        self.selected.then(|| {
+            let mechanism_outcomes = self
+                .mechanisms
+                .iter()
+                .map(|mechanism| {
+                    (
+                        *mechanism,
+                        self.mechanism_outcomes
+                            .get(mechanism)
+                            .copied()
+                            .unwrap_or(CredentialOutcome::Incomplete),
+                    )
+                })
+                .collect::<std::collections::BTreeMap<_, _>>();
+            let has_incomplete = mechanism_outcomes
+                .values()
+                .any(|outcome| *outcome == CredentialOutcome::Incomplete);
+            let outcome = match self.outcome {
+                Some(
+                    outcome @ (CredentialOutcome::Denied
+                    | CredentialOutcome::Stale
+                    | CredentialOutcome::Unavailable),
+                ) => outcome,
+                _ if has_incomplete => CredentialOutcome::Incomplete,
+                Some(outcome) => outcome,
+                None => CredentialOutcome::Incomplete,
+            };
+
+            CredentialSnapshot {
+                mechanisms: sorted_values(&self.mechanisms, CredentialMechanism::as_str),
+                surfaces: sorted_values(&self.surfaces, CredentialSurface::as_str),
+                outcome,
+                mechanism_outcomes,
+            }
+        })
+    }
+}
+
+fn merge_credential_outcome(current: &mut CredentialOutcome, outcome: CredentialOutcome) {
+    if outcome.precedence() > current.precedence() {
+        *current = outcome;
+    }
+}
+
+fn merge_optional_credential_outcome(
+    current: &mut Option<CredentialOutcome>,
+    outcome: CredentialOutcome,
+) {
+    if current.is_none_or(|current| outcome.precedence() > current.precedence()) {
+        *current = Some(outcome);
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct CredentialSnapshot {
+    mechanisms: String,
+    surfaces: String,
+    outcome: CredentialOutcome,
+    mechanism_outcomes: std::collections::BTreeMap<CredentialMechanism, CredentialOutcome>,
+}
+
+fn sorted_values<T: Copy + Ord>(values: &BTreeSet<T>, as_str: fn(T) -> &'static str) -> String {
+    let mut values = values.iter().copied().map(as_str).collect::<Vec<_>>();
+    values.sort_unstable();
+    values.join(",")
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -135,6 +342,7 @@ impl RequestCorrelation {
             "server.address" = %ctx.host,
             "server.port" = ctx.port,
             "openshell.target.reached" = false,
+            "openshell.request.delivery_started" = false,
             "openshell.policy.decision" = tracing::field::Empty,
             "openshell.enforcement.action" = tracing::field::Empty,
             "openshell.http.outcome" = tracing::field::Empty,
@@ -152,6 +360,12 @@ impl RequestCorrelation {
             "openshell.middleware.response.admission_exhausted" = tracing::field::Empty,
             "openshell.middleware.response.delivery_started" = tracing::field::Empty,
             "openshell.middleware.response.partial_delivery" = tracing::field::Empty,
+            "openshell.credential.outcome" = tracing::field::Empty,
+            "openshell.credential.mechanisms" = tracing::field::Empty,
+            "openshell.credential.surfaces" = tracing::field::Empty,
+            "openshell.credential.static_placeholder.outcome" = tracing::field::Empty,
+            "openshell.credential.token_grant.outcome" = tracing::field::Empty,
+            "openshell.credential.sigv4.outcome" = tracing::field::Empty,
         );
         let headers = trace_headers(&request.raw_header);
         let _ = openshell_otel::set_parent_from_headers(&span, &headers);
@@ -166,6 +380,7 @@ impl RequestCorrelation {
                 policy_name: ctx.policy_name.clone(),
             },
             middleware: Mutex::new(MiddlewareState::default()),
+            credential: Mutex::new(CredentialState::default()),
         }
     }
 
@@ -195,8 +410,50 @@ impl RequestCorrelation {
         self.span.record("openshell.target.reached", true);
     }
 
+    pub(crate) fn record_request_delivery_started(&self) {
+        self.span.record("openshell.request.delivery_started", true);
+    }
+
     pub(crate) fn record_error_stage(&self, stage: &str) {
         self.span.record("openshell.error.stage", stage);
+    }
+
+    pub(crate) fn observe_credential(
+        &self,
+        mechanism: CredentialMechanism,
+        surface: CredentialSurface,
+    ) {
+        self.credential
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .observe(mechanism, surface);
+    }
+
+    #[must_use]
+    pub(crate) fn has_credential_mechanism(&self, mechanism: CredentialMechanism) -> bool {
+        self.credential
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .mechanisms
+            .contains(&mechanism)
+    }
+
+    pub(crate) fn complete_credential(&self, outcome: CredentialOutcome) {
+        self.credential
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .complete(outcome);
+    }
+
+    pub(crate) fn complete_credential_mechanism(
+        &self,
+        mechanism: CredentialMechanism,
+        outcome: CredentialOutcome,
+    ) {
+        self.credential
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .complete_mechanism(mechanism, outcome);
     }
 
     pub(crate) fn record_response_delivery_started(&self) {
@@ -307,6 +564,27 @@ impl RequestCorrelation {
         }
     }
 
+    fn record_credential_attributes(&self, snapshot: &CredentialSnapshot) {
+        self.span
+            .record("openshell.credential.outcome", snapshot.outcome.as_str());
+        if !snapshot.mechanisms.is_empty() {
+            self.span.record(
+                "openshell.credential.mechanisms",
+                snapshot.mechanisms.as_str(),
+            );
+        }
+        if !snapshot.surfaces.is_empty() {
+            self.span
+                .record("openshell.credential.surfaces", snapshot.surfaces.as_str());
+        }
+        for mechanism in CredentialMechanism::ALL {
+            if let Some(outcome) = snapshot.mechanism_outcomes.get(&mechanism) {
+                self.span
+                    .record(mechanism.span_outcome_field(), outcome.as_str());
+            }
+        }
+    }
+
     pub(crate) fn emit(&self, mut event: OcsfEvent) {
         event.set_correlation_uid(self.request_id.clone());
         openshell_otel::with_span_context(&self.span, || {
@@ -385,6 +663,69 @@ fn middleware_aggregate_event(
         .build()
 }
 
+fn credential_aggregate_event(
+    context: &MiddlewareEventContext,
+    snapshot: &CredentialSnapshot,
+) -> OcsfEvent {
+    let (severity, status, message) = match snapshot.outcome {
+        CredentialOutcome::Prepared => (
+            SeverityId::Informational,
+            StatusId::Success,
+            "Credential preparation completed",
+        ),
+        CredentialOutcome::Withheld => (
+            SeverityId::Medium,
+            StatusId::Success,
+            "Credential use was withheld",
+        ),
+        CredentialOutcome::Denied => (
+            SeverityId::Medium,
+            StatusId::Failure,
+            "Credential use was denied",
+        ),
+        CredentialOutcome::Unavailable => (
+            SeverityId::Medium,
+            StatusId::Failure,
+            "Credential material was unavailable",
+        ),
+        CredentialOutcome::Stale => (
+            SeverityId::Medium,
+            StatusId::Failure,
+            "Credential preparation became stale",
+        ),
+        CredentialOutcome::Incomplete => (
+            SeverityId::Low,
+            StatusId::Unknown,
+            "Credential preparation did not complete",
+        ),
+    };
+    let mut event = HttpActivityBuilder::new(openshell_ocsf::ctx::ctx())
+        .activity(ActivityId::for_http_method(context.method))
+        .action(ActionId::Observed)
+        .disposition(DispositionId::Logged)
+        .severity(severity)
+        .status(status)
+        .http_request(HttpRequest {
+            http_method: context.method.parse().expect("bounded HTTP method"),
+            url: None,
+        })
+        .dst_endpoint(Endpoint::from_domain(&context.host, context.port))
+        .firewall_rule(&context.policy_name, "credential-correlation")
+        .unmapped("credential_outcome", snapshot.outcome.as_str());
+    if !snapshot.mechanisms.is_empty() {
+        event = event.unmapped("credential_mechanisms", snapshot.mechanisms.clone());
+    }
+    if !snapshot.surfaces.is_empty() {
+        event = event.unmapped("credential_surfaces", snapshot.surfaces.clone());
+    }
+    for mechanism in CredentialMechanism::ALL {
+        if let Some(outcome) = snapshot.mechanism_outcomes.get(&mechanism) {
+            event = event.unmapped(mechanism.ocsf_outcome_field(), outcome.as_str());
+        }
+    }
+    event.message(message).build()
+}
+
 fn bounded_http_method(method: &str) -> &'static str {
     [
         "CONNECT", "DELETE", "GET", "HEAD", "OPTIONS", "PATCH", "POST", "PUT", "TRACE",
@@ -408,6 +749,18 @@ impl Drop for RequestCorrelation {
             if selected_and_unfinished {
                 self.finish_middleware(phase, "incomplete");
             }
+        }
+        let credential = self
+            .credential
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .snapshot();
+        if let Some(snapshot) = credential {
+            self.record_credential_attributes(&snapshot);
+            self.emit(credential_aggregate_event(
+                &self.middleware_context,
+                &snapshot,
+            ));
         }
         if !self.completed.load(Ordering::Acquire) {
             self.span.record("openshell.http.outcome", "incomplete");
@@ -925,6 +1278,358 @@ mod tests {
         .expect("serialize aggregate event");
 
         assert_eq!(event["severity"], "Low");
+    }
+
+    #[test]
+    fn unrelated_requests_omit_credential_correlation() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let exporter = opentelemetry_sdk::trace::InMemorySpanExporterBuilder::new().build();
+        let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+            .with_simple_exporter(exporter.clone())
+            .build();
+        let ocsf = openshell_ocsf::test_support::OcsfCapture::default();
+        let subscriber = tracing_subscriber::registry()
+            .with(openshell_otel::layer(&provider, "correlation-test"))
+            .with(ocsf.clone());
+
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::callsite::rebuild_interest_cache();
+            let correlation = RequestCorrelation::with_request_id(
+                &request(),
+                &L7EvalContext {
+                    host: "example.test".into(),
+                    port: 443,
+                    policy_name: "api-policy".into(),
+                    ..Default::default()
+                },
+                correlation_id(6),
+            );
+            correlation.record_final_http_outcome("allowed");
+        });
+        provider.force_flush().expect("flush spans");
+
+        let span = exporter
+            .get_finished_spans()
+            .expect("finished spans")
+            .into_iter()
+            .find(|span| span.name == "openshell.http.enforcement")
+            .expect("HTTP enforcement span");
+        assert!(
+            span.attributes
+                .iter()
+                .all(|attribute| { !attribute.key.as_str().starts_with("openshell.credential.") })
+        );
+        assert!(
+            ocsf.json_events()
+                .into_iter()
+                .all(|event| { event["firewall_rule"]["type"] != "credential-correlation" })
+        );
+    }
+
+    #[test]
+    fn credential_mechanism_query_reflects_observations() {
+        let correlation = RequestCorrelation::with_request_id(
+            &request(),
+            &L7EvalContext {
+                host: "example.test".into(),
+                port: 443,
+                ..Default::default()
+            },
+            correlation_id(9),
+        );
+
+        assert!(!correlation.has_credential_mechanism(CredentialMechanism::StaticPlaceholder));
+        correlation.observe_credential(
+            CredentialMechanism::StaticPlaceholder,
+            CredentialSurface::Path,
+        );
+        assert!(correlation.has_credential_mechanism(CredentialMechanism::StaticPlaceholder));
+        assert!(!correlation.has_credential_mechanism(CredentialMechanism::TokenGrant));
+        assert!(!correlation.has_credential_mechanism(CredentialMechanism::SigV4));
+        correlation.record_final_http_outcome("denied");
+    }
+
+    #[test]
+    fn credential_state_orders_sets_and_preserves_authoritative_outcome() {
+        let mut state = CredentialState::default();
+        assert_eq!(state.snapshot(), None);
+        state.complete(CredentialOutcome::Unavailable);
+        state.complete_mechanism(
+            CredentialMechanism::StaticPlaceholder,
+            CredentialOutcome::Prepared,
+        );
+        assert_eq!(state.snapshot(), None);
+        state.observe(CredentialMechanism::TokenGrant, CredentialSurface::Query);
+        state.observe(CredentialMechanism::SigV4, CredentialSurface::Signature);
+        state.observe(
+            CredentialMechanism::StaticPlaceholder,
+            CredentialSurface::Header,
+        );
+        assert_eq!(
+            state.snapshot(),
+            Some(CredentialSnapshot {
+                mechanisms: "sigv4,static_placeholder,token_grant".into(),
+                surfaces: "header,query,signature".into(),
+                outcome: CredentialOutcome::Incomplete,
+                mechanism_outcomes: std::collections::BTreeMap::from([
+                    (
+                        CredentialMechanism::StaticPlaceholder,
+                        CredentialOutcome::Incomplete,
+                    ),
+                    (
+                        CredentialMechanism::TokenGrant,
+                        CredentialOutcome::Incomplete,
+                    ),
+                    (CredentialMechanism::SigV4, CredentialOutcome::Incomplete),
+                ]),
+            })
+        );
+        state.complete_mechanism(CredentialMechanism::TokenGrant, CredentialOutcome::Withheld);
+        state.complete_mechanism(
+            CredentialMechanism::StaticPlaceholder,
+            CredentialOutcome::Prepared,
+        );
+        state.complete_mechanism(CredentialMechanism::SigV4, CredentialOutcome::Unavailable);
+        assert_eq!(
+            state.snapshot().expect("selected credential work").outcome,
+            CredentialOutcome::Unavailable
+        );
+        state.complete(CredentialOutcome::Stale);
+        state.complete_mechanism(CredentialMechanism::SigV4, CredentialOutcome::Denied);
+        state.complete_mechanism(
+            CredentialMechanism::StaticPlaceholder,
+            CredentialOutcome::Prepared,
+        );
+        state.observe(
+            CredentialMechanism::StaticPlaceholder,
+            CredentialSurface::Body,
+        );
+
+        assert_eq!(
+            state.snapshot(),
+            Some(CredentialSnapshot {
+                mechanisms: "sigv4,static_placeholder,token_grant".into(),
+                surfaces: "body,header,query,signature".into(),
+                outcome: CredentialOutcome::Denied,
+                mechanism_outcomes: std::collections::BTreeMap::from([
+                    (
+                        CredentialMechanism::StaticPlaceholder,
+                        CredentialOutcome::Stale,
+                    ),
+                    (CredentialMechanism::TokenGrant, CredentialOutcome::Stale),
+                    (CredentialMechanism::SigV4, CredentialOutcome::Denied),
+                ]),
+            })
+        );
+    }
+
+    #[test]
+    fn credential_aggregate_is_bounded_correlated_and_private() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        const SENTINEL: &str = "SENTINEL_CREDENTIAL_VALUE";
+        let exporter = opentelemetry_sdk::trace::InMemorySpanExporterBuilder::new().build();
+        let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+            .with_simple_exporter(exporter.clone())
+            .build();
+        let ocsf = openshell_ocsf::test_support::OcsfCapture::default();
+        let subscriber = tracing_subscriber::registry()
+            .with(openshell_otel::layer(&provider, "correlation-test"))
+            .with(ocsf.clone());
+        let mut sensitive_request = request();
+        sensitive_request.target = format!("/data?credential={SENTINEL}");
+        sensitive_request.raw_header = format!(
+            "GET /data?credential={SENTINEL} HTTP/1.1\r\nHost: api.example.test\r\nX-Credential: {SENTINEL}\r\n\r\n"
+        )
+        .into_bytes();
+
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::callsite::rebuild_interest_cache();
+            let correlation = RequestCorrelation::with_request_id(
+                &sensitive_request,
+                &L7EvalContext {
+                    host: "api.example.test".into(),
+                    port: 443,
+                    policy_name: "api-policy".into(),
+                    ..Default::default()
+                },
+                correlation_id(7),
+            );
+            correlation
+                .observe_credential(CredentialMechanism::TokenGrant, CredentialSurface::Header);
+            correlation.observe_credential(
+                CredentialMechanism::StaticPlaceholder,
+                CredentialSurface::Body,
+            );
+            correlation
+                .observe_credential(CredentialMechanism::SigV4, CredentialSurface::Signature);
+            correlation.observe_credential(
+                CredentialMechanism::StaticPlaceholder,
+                CredentialSurface::Path,
+            );
+            correlation.record_request_delivery_started();
+            correlation.complete_credential_mechanism(
+                CredentialMechanism::TokenGrant,
+                CredentialOutcome::Withheld,
+            );
+            correlation.complete_credential_mechanism(
+                CredentialMechanism::StaticPlaceholder,
+                CredentialOutcome::Prepared,
+            );
+            correlation.record_final_http_outcome("allowed");
+        });
+        provider.force_flush().expect("flush spans");
+
+        let span = exporter
+            .get_finished_spans()
+            .expect("finished spans")
+            .into_iter()
+            .find(|span| span.name == "openshell.http.enforcement")
+            .expect("HTTP enforcement span");
+        let attributes = span
+            .attributes
+            .into_iter()
+            .map(|attribute| {
+                (
+                    attribute.key.as_str().to_string(),
+                    attribute.value.to_string(),
+                )
+            })
+            .collect::<std::collections::BTreeMap<_, _>>();
+        assert_eq!(attributes["openshell.credential.outcome"], "incomplete");
+        assert_eq!(
+            attributes["openshell.credential.mechanisms"],
+            "sigv4,static_placeholder,token_grant"
+        );
+        assert_eq!(
+            attributes["openshell.credential.surfaces"],
+            "body,header,path,signature"
+        );
+        assert_eq!(
+            attributes["openshell.credential.static_placeholder.outcome"],
+            "prepared"
+        );
+        assert_eq!(
+            attributes["openshell.credential.token_grant.outcome"],
+            "withheld"
+        );
+        assert_eq!(
+            attributes["openshell.credential.sigv4.outcome"],
+            "incomplete"
+        );
+        assert_eq!(attributes["openshell.request.delivery_started"], "true");
+        assert!(!format!("{attributes:?}").contains(SENTINEL));
+
+        let events = ocsf
+            .json_events()
+            .into_iter()
+            .filter(|event| event["firewall_rule"]["type"] == "credential-correlation")
+            .collect::<Vec<_>>();
+        assert_eq!(events.len(), 1);
+        let event = &events[0];
+        assert_eq!(event["metadata"]["correlation_uid"], correlation_id(7));
+        assert_eq!(event["action"], "Observed");
+        assert_eq!(event["disposition"], "Logged");
+        assert_eq!(event["status"], "Unknown");
+        assert_eq!(event["unmapped"]["credential_outcome"], "incomplete");
+        assert_eq!(
+            event["unmapped"]["credential_mechanisms"],
+            "sigv4,static_placeholder,token_grant"
+        );
+        assert_eq!(
+            event["unmapped"]["credential_surfaces"],
+            "body,header,path,signature"
+        );
+        assert_eq!(
+            event["unmapped"]["credential_static_placeholder_outcome"],
+            "prepared"
+        );
+        assert_eq!(
+            event["unmapped"]["credential_token_grant_outcome"],
+            "withheld"
+        );
+        assert_eq!(event["unmapped"]["credential_sigv4_outcome"], "incomplete");
+        assert!(!serde_json::to_string(event).unwrap().contains(SENTINEL));
+    }
+
+    #[test]
+    fn stale_credential_can_omit_mechanism_and_surface() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let exporter = opentelemetry_sdk::trace::InMemorySpanExporterBuilder::new().build();
+        let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+            .with_simple_exporter(exporter.clone())
+            .build();
+        let ocsf = openshell_ocsf::test_support::OcsfCapture::default();
+        let subscriber = tracing_subscriber::registry()
+            .with(openshell_otel::layer(&provider, "correlation-test"))
+            .with(ocsf.clone());
+
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::callsite::rebuild_interest_cache();
+            let correlation = RequestCorrelation::with_request_id(
+                &request(),
+                &L7EvalContext {
+                    host: "example.test".into(),
+                    port: 443,
+                    policy_name: "api-policy".into(),
+                    ..Default::default()
+                },
+                correlation_id(8),
+            );
+            correlation.complete_credential(CredentialOutcome::Stale);
+            correlation.record_final_http_outcome("platform_error");
+        });
+        provider.force_flush().expect("flush spans");
+
+        let span = exporter
+            .get_finished_spans()
+            .expect("finished spans")
+            .into_iter()
+            .find(|span| span.name == "openshell.http.enforcement")
+            .expect("HTTP enforcement span");
+        let attributes = span
+            .attributes
+            .into_iter()
+            .map(|attribute| {
+                (
+                    attribute.key.as_str().to_string(),
+                    attribute.value.to_string(),
+                )
+            })
+            .collect::<std::collections::BTreeMap<_, _>>();
+        assert_eq!(attributes["openshell.credential.outcome"], "stale");
+        assert!(!attributes.contains_key("openshell.credential.mechanisms"));
+        assert!(!attributes.contains_key("openshell.credential.surfaces"));
+        assert!(!attributes.contains_key("openshell.credential.static_placeholder.outcome"));
+        assert!(!attributes.contains_key("openshell.credential.token_grant.outcome"));
+        assert!(!attributes.contains_key("openshell.credential.sigv4.outcome"));
+
+        let events = ocsf
+            .json_events()
+            .into_iter()
+            .filter(|event| event["firewall_rule"]["type"] == "credential-correlation")
+            .collect::<Vec<_>>();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["unmapped"]["credential_outcome"], "stale");
+        assert!(events[0]["unmapped"].get("credential_mechanisms").is_none());
+        assert!(events[0]["unmapped"].get("credential_surfaces").is_none());
+        assert!(
+            events[0]["unmapped"]
+                .get("credential_static_placeholder_outcome")
+                .is_none()
+        );
+        assert!(
+            events[0]["unmapped"]
+                .get("credential_token_grant_outcome")
+                .is_none()
+        );
+        assert!(
+            events[0]["unmapped"]
+                .get("credential_sigv4_outcome")
+                .is_none()
+        );
     }
 
     fn correlation_id(suffix: u8) -> String {

@@ -26,6 +26,9 @@ use openshell_ocsf::{
 };
 use tracing::warn;
 
+use crate::l7::correlation::{
+    CredentialMechanism, CredentialOutcome, CredentialSurface, RequestCorrelation,
+};
 use crate::l7::provider::L7Request;
 use crate::l7::relay::L7EvalContext;
 
@@ -179,9 +182,19 @@ pub async fn inject_for_selectors(
     snapshot: &ProviderCredentialSnapshot,
     request_id: &str,
     observation_context: Option<&EndpointObservationContext>,
+    correlation: Option<&RequestCorrelation>,
 ) -> Result<L7Request, TokenGrantInjectionError> {
     let selected = select_scoped(snapshot, ctx, request_path(&req.target), None);
-    inject_or_report(req, ctx, selected, request_id, observation_context).await
+    inject_or_report(
+        req,
+        ctx,
+        selected,
+        false,
+        request_id,
+        observation_context,
+        correlation,
+    )
+    .await
 }
 
 /// Inject only grants owned by endpoints that admitted the inspected request.
@@ -198,8 +211,11 @@ pub(super) async fn inject_for_admitted_owners(
     admitted_owners: &HashSet<String>,
     request_id: &str,
     observation_context: Option<&EndpointObservationContext>,
+    correlation: Option<&RequestCorrelation>,
 ) -> Result<L7Request, TokenGrantInjectionError> {
     let request_path = request_path(&req.target);
+    let matching_withheld =
+        has_matching_withheld_grant(snapshot, ctx, request_path, admitted_owners);
     let unowned = snapshot
         .dynamic_credentials
         .iter()
@@ -219,7 +235,40 @@ pub(super) async fn inject_for_admitted_owners(
     } else {
         select_scoped(snapshot, ctx, request_path, Some(admitted_owners))
     };
-    inject_or_report(req, ctx, selected, request_id, observation_context).await
+    inject_or_report(
+        req,
+        ctx,
+        selected,
+        matching_withheld,
+        request_id,
+        observation_context,
+        correlation,
+    )
+    .await
+}
+
+/// Whether a valid endpoint-bound grant matched but none of its owners admitted
+/// this request. This intentionally returns only a boolean so callers cannot
+/// expose provider, credential, or endpoint configuration in telemetry.
+pub(super) fn has_matching_withheld_grant(
+    snapshot: &ProviderCredentialSnapshot,
+    ctx: &L7EvalContext,
+    request_path: &str,
+    admitted_owners: &HashSet<String>,
+) -> bool {
+    snapshot
+        .dynamic_credentials
+        .iter()
+        .any(|(key, credential)| {
+            credential.token_grant.is_some()
+                && !credential.token_grant_owners.is_empty()
+                && !credential
+                    .token_grant_owners
+                    .iter()
+                    .any(|owner| admitted_owners.contains(owner))
+                && dynamic_credential_key_match_score(key, &ctx.host, ctx.port, request_path)
+                    .is_some()
+        })
 }
 
 fn select_scoped(
@@ -248,12 +297,20 @@ async fn inject_or_report(
     req: L7Request,
     ctx: &L7EvalContext,
     selected: Result<Vec<(String, ProviderProfileCredential)>, TokenGrantInjectionError>,
+    matching_withheld: bool,
     request_id: &str,
     observation_context: Option<&EndpointObservationContext>,
+    correlation: Option<&RequestCorrelation>,
 ) -> Result<L7Request, TokenGrantInjectionError> {
     if selected.as_ref().is_ok_and(Vec::is_empty) {
+        if matching_withheld {
+            observe_token_grant(correlation, CredentialOutcome::Withheld);
+        }
         // Most requests need no grant; keep that path free of allocation.
         return Ok(req);
+    }
+    if let Some(correlation) = correlation {
+        correlation.observe_credential(CredentialMechanism::TokenGrant, CredentialSurface::Header);
     }
     let method = req.action.clone();
     let request_path = request_path(&req.target).to_string();
@@ -280,6 +337,21 @@ async fn inject_or_report(
     };
     if let Err(error) = &result {
         report_refused_grant(ctx, &method, &request_path, request_id, error);
+    }
+    if let Some(correlation) = correlation {
+        correlation.complete_credential_mechanism(
+            CredentialMechanism::TokenGrant,
+            match &result {
+                Ok(_) => CredentialOutcome::Prepared,
+                Err(error)
+                    if error.failure().kind()
+                        == TokenGrantFailureKind::WorkloadIdentityRejected =>
+                {
+                    CredentialOutcome::Denied
+                }
+                Err(_) => CredentialOutcome::Unavailable,
+            },
+        );
     }
     if let Some((sender, context)) = ctx
         .endpoint_observation_tx
@@ -308,6 +380,13 @@ async fn inject_or_report(
         }
     }
     result
+}
+
+fn observe_token_grant(correlation: Option<&RequestCorrelation>, outcome: CredentialOutcome) {
+    if let Some(correlation) = correlation {
+        correlation.observe_credential(CredentialMechanism::TokenGrant, CredentialSurface::Header);
+        correlation.complete_credential_mechanism(CredentialMechanism::TokenGrant, outcome);
+    }
 }
 
 /// Record a refused grant.
@@ -1077,6 +1156,7 @@ pub mod test_support {
             &snapshot,
             request_id,
             observation_context.as_ref(),
+            None,
         )
         .await
     }
@@ -1091,8 +1171,11 @@ mod tests {
         EndpointConfigVersion, EndpointObservationSender, EndpointStatusReceiver,
         EndpointStatusTracker, endpoint_status_channel,
     };
+    use tracing::instrument::WithSubscriber;
+    use tracing_subscriber::layer::SubscriberExt as _;
 
     const REQUEST_ID: &str = "6a1f0e2d-3c4b-4a59-8e7f-0123456789ab";
+    const CORRELATION_ID: &str = "00000000-0000-4000-8000-000000000004";
 
     fn credential(auth_style: &str, header_name: &str) -> ProviderProfileCredential {
         ProviderProfileCredential {
@@ -1450,13 +1533,238 @@ mod tests {
     }
 
     fn grant_request() -> L7Request {
+        grant_request_for("/v1/projects")
+    }
+
+    fn grant_request_for(target: &str) -> L7Request {
         L7Request {
             action: "GET".to_string(),
-            target: "/v1/projects".to_string(),
+            target: target.to_string(),
             query_params: HashMap::new(),
-            raw_header: b"GET /v1/projects HTTP/1.1\r\nHost: api.example.com\r\n\r\n".to_vec(),
+            raw_header: format!("GET {target} HTTP/1.1\r\nHost: api.example.com\r\n\r\n")
+                .into_bytes(),
             body_length: BodyLength::None,
         }
+    }
+
+    enum GrantAdmission<'a> {
+        Selectors,
+        Owners(&'a HashSet<String>),
+    }
+
+    async fn capture_correlated_grant(
+        fixture: &TokenGrantTestFixture,
+        target: &str,
+        admission: GrantAdmission<'_>,
+    ) -> (
+        Result<L7Request, TokenGrantInjectionError>,
+        BTreeMap<String, String>,
+        Vec<serde_json::Value>,
+    ) {
+        let exporter = opentelemetry_sdk::trace::InMemorySpanExporterBuilder::new().build();
+        let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+            .with_simple_exporter(exporter.clone())
+            .build();
+        let ocsf = openshell_ocsf::test_support::OcsfCapture::default();
+        let subscriber = tracing_subscriber::registry()
+            .with(openshell_otel::layer(
+                &provider,
+                "token-grant-correlation-test",
+            ))
+            .with(ocsf.clone());
+        let mut ctx = grant_context(fixture);
+        let snapshot = pin_live_credentials(&mut ctx).expect("provider credentials");
+        let request = grant_request_for(target);
+
+        let operation = async {
+            tracing::callsite::rebuild_interest_cache();
+            let correlation =
+                RequestCorrelation::with_request_id(&request, &ctx, CORRELATION_ID.into());
+            let result = match admission {
+                GrantAdmission::Selectors => {
+                    inject_for_selectors(
+                        request,
+                        &ctx,
+                        &snapshot,
+                        correlation.request_id(),
+                        None,
+                        Some(&correlation),
+                    )
+                    .await
+                }
+                GrantAdmission::Owners(owners) => {
+                    inject_for_admitted_owners(
+                        request,
+                        &ctx,
+                        &snapshot,
+                        owners,
+                        correlation.request_id(),
+                        None,
+                        Some(&correlation),
+                    )
+                    .await
+                }
+            };
+            correlation.record_final_http_outcome(if result.is_ok() {
+                "allowed"
+            } else {
+                "platform_error"
+            });
+            drop(correlation);
+            result
+        }
+        .with_subscriber(subscriber)
+        .await;
+        provider.force_flush().expect("flush spans");
+
+        let attributes = exporter
+            .get_finished_spans()
+            .expect("finished spans")
+            .into_iter()
+            .find(|span| span.name == "openshell.http.enforcement")
+            .expect("HTTP enforcement span")
+            .attributes
+            .into_iter()
+            .map(|attribute| {
+                (
+                    attribute.key.as_str().to_string(),
+                    attribute.value.to_string(),
+                )
+            })
+            .collect();
+        let events = ocsf
+            .json_events()
+            .into_iter()
+            .filter(|event| event["firewall_rule"]["type"] == "credential-correlation")
+            .collect();
+        (operation, attributes, events)
+    }
+
+    #[tokio::test]
+    async fn correlation_records_prepared_token_grant_without_configuration_details() {
+        const SENSITIVE_KEY: &str =
+            "api.example.com\t443\t/v1/**\tSENTINEL_PROVIDER:SENTINEL_CREDENTIAL";
+        let fixture = TokenGrantTestFixture::success(SENSITIVE_KEY, "grant-token");
+
+        let (result, attributes, events) =
+            capture_correlated_grant(&fixture, "/v1/projects", GrantAdmission::Selectors).await;
+
+        assert!(result.is_ok());
+        assert_eq!(attributes["openshell.credential.outcome"], "prepared");
+        assert_eq!(attributes["openshell.credential.mechanisms"], "token_grant");
+        assert_eq!(attributes["openshell.credential.surfaces"], "header");
+        assert_eq!(fixture.requested_ids(), [CORRELATION_ID]);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["metadata"]["correlation_uid"], CORRELATION_ID);
+        let event = serde_json::to_string(&events[0]).unwrap();
+        assert!(event.contains("credential-correlation"));
+        for sensitive in [
+            "SENTINEL_PROVIDER",
+            "SENTINEL_CREDENTIAL",
+            "Authorization",
+            "api://example",
+            "auth.example.com",
+            "grant-token",
+        ] {
+            assert!(!event.contains(sensitive), "aggregate leaked {sensitive}");
+        }
+    }
+
+    #[tokio::test]
+    async fn correlation_records_unavailable_token_grant() {
+        let fixture = TokenGrantTestFixture::failure(KEY, refusal());
+
+        let (result, attributes, events) =
+            capture_correlated_grant(&fixture, "/v1/projects", GrantAdmission::Selectors).await;
+
+        assert!(result.is_err());
+        assert_eq!(attributes["openshell.credential.outcome"], "unavailable");
+        assert_eq!(attributes["openshell.credential.mechanisms"], "token_grant");
+        assert_eq!(attributes["openshell.credential.surfaces"], "header");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["unmapped"]["credential_outcome"], "unavailable");
+    }
+
+    #[tokio::test]
+    async fn correlation_records_workload_identity_rejection_as_denied() {
+        let fixture = TokenGrantTestFixture::failure(
+            KEY,
+            TokenGrantFailure::new(
+                TokenGrantFailureKind::WorkloadIdentityRejected,
+                TokenGrantStage::WorkloadIdentity,
+            ),
+        );
+
+        let (result, attributes, _) =
+            capture_correlated_grant(&fixture, "/v1/projects", GrantAdmission::Selectors).await;
+
+        assert!(result.is_err());
+        assert_eq!(attributes["openshell.credential.outcome"], "denied");
+    }
+
+    #[tokio::test]
+    async fn correlation_records_matching_owner_filtered_grant_as_withheld() {
+        let fixture = TokenGrantTestFixture::success(KEY, "grant-token");
+        let admitted_owners = HashSet::from(["different-owner".to_string()]);
+
+        let (result, attributes, events) = capture_correlated_grant(
+            &fixture,
+            "/v1/projects",
+            GrantAdmission::Owners(&admitted_owners),
+        )
+        .await;
+
+        assert!(result.is_ok());
+        fixture.assert_no_requests();
+        assert_eq!(attributes["openshell.credential.outcome"], "withheld");
+        assert_eq!(attributes["openshell.credential.mechanisms"], "token_grant");
+        assert_eq!(attributes["openshell.credential.surfaces"], "header");
+        assert_eq!(events.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn correlation_records_ownerless_matching_grant_as_unavailable() {
+        let fixture = TokenGrantTestFixture::success(KEY, "grant-token");
+        fixture
+            .dynamic_credentials()
+            .write()
+            .unwrap()
+            .get_mut(KEY)
+            .unwrap()
+            .token_grant_owners
+            .clear();
+        let admitted_owners = HashSet::new();
+
+        let (result, attributes, _) = capture_correlated_grant(
+            &fixture,
+            "/v1/projects",
+            GrantAdmission::Owners(&admitted_owners),
+        )
+        .await;
+
+        assert!(result.is_err());
+        fixture.assert_no_requests();
+        assert_eq!(attributes["openshell.credential.outcome"], "unavailable");
+    }
+
+    #[tokio::test]
+    async fn correlation_omits_unrelated_grant() {
+        let fixture = TokenGrantTestFixture::success(KEY, "grant-token");
+        let admitted_owners = HashSet::new();
+
+        let (result, attributes, events) = capture_correlated_grant(
+            &fixture,
+            "/unrelated",
+            GrantAdmission::Owners(&admitted_owners),
+        )
+        .await;
+
+        assert!(result.is_ok());
+        fixture.assert_no_requests();
+        assert!(!attributes.contains_key("openshell.credential.outcome"));
+        assert!(!attributes.contains_key("openshell.credential.mechanisms"));
+        assert!(!attributes.contains_key("openshell.credential.surfaces"));
+        assert!(events.is_empty());
     }
 
     async fn installed_status(
@@ -1520,7 +1828,15 @@ mod tests {
         authority: &EndpointObservationContext,
     ) -> Result<L7Request, TokenGrantInjectionError> {
         let snapshot = pin_live_credentials(ctx).expect("live provider credentials");
-        inject_for_selectors(grant_request(), ctx, &snapshot, REQUEST_ID, Some(authority)).await
+        inject_for_selectors(
+            grant_request(),
+            ctx,
+            &snapshot,
+            REQUEST_ID,
+            Some(authority),
+            None,
+        )
+        .await
     }
 
     #[tokio::test]

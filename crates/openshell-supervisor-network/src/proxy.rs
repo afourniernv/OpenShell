@@ -5134,6 +5134,7 @@ fn canonicalize_forward_host_header(raw: &[u8], authority: &str) -> Result<Vec<u
 /// strips proxy hop-by-hop headers, injects `Connection: close` and `Via`.
 ///
 /// Returns the rewritten request bytes (headers + any overflow body bytes).
+#[cfg(test)]
 fn rewrite_forward_request(
     raw: &[u8],
     used: usize,
@@ -5141,16 +5142,23 @@ fn rewrite_forward_request(
     canonical_authority: &str,
     secret_resolver: Option<&SecretResolver>,
 ) -> Result<Vec<u8>, secrets::UnresolvedPlaceholderError> {
+    rewrite_forward_request_correlated(raw, used, path, canonical_authority, secret_resolver, None)
+        .map(|(bytes, _)| bytes)
+}
+
+fn rewrite_forward_request_correlated(
+    raw: &[u8],
+    used: usize,
+    path: &str,
+    canonical_authority: &str,
+    secret_resolver: Option<&SecretResolver>,
+    correlation: Option<&crate::l7::correlation::RequestCorrelation>,
+) -> Result<(Vec<u8>, bool), secrets::UnresolvedPlaceholderError> {
     let header_end = raw[..used]
         .windows(4)
         .position(|w| w == b"\r\n\r\n")
         .map_or(used, |p| p + 4);
     let websocket_upgrade = crate::l7::rest::request_is_websocket_upgrade(&raw[..header_end]);
-    let upstream_path = match secret_resolver {
-        Some(resolver) => secrets::rewrite_target_for_eval(path, resolver)?.resolved,
-        None => path.to_string(),
-    };
-
     let header_str = String::from_utf8_lossy(&raw[..header_end]);
     let lines = header_str.split("\r\n").collect::<Vec<_>>();
     let connection_nominated: std::collections::HashSet<String> = lines
@@ -5162,6 +5170,54 @@ fn rewrite_forward_request(
         .map(|token| token.trim().to_ascii_lowercase())
         .filter(|token| !token.is_empty())
         .collect();
+    let header_is_stripped = |field_name: &str| {
+        field_name == "host"
+            || matches!(
+                field_name,
+                "proxy-connection" | "proxy-authorization" | "proxy-authenticate"
+            )
+            || connection_nominated.contains(field_name)
+            || matches!(field_name, "connection" | "upgrade")
+    };
+    let mut static_credential_selected = false;
+    if let Some(correlation) = correlation {
+        let (path_component, query) = path
+            .split_once('?')
+            .map_or((path, None), |(path, query)| (path, Some(query)));
+        if secrets::contains_reserved_credential_marker(path_component) {
+            correlation.observe_credential(
+                crate::l7::correlation::CredentialMechanism::StaticPlaceholder,
+                crate::l7::correlation::CredentialSurface::Path,
+            );
+            static_credential_selected = true;
+        }
+        if query.is_some_and(secrets::contains_reserved_credential_marker) {
+            correlation.observe_credential(
+                crate::l7::correlation::CredentialMechanism::StaticPlaceholder,
+                crate::l7::correlation::CredentialSurface::Query,
+            );
+            static_credential_selected = true;
+        }
+        for line in lines.iter().skip(1).take_while(|line| !line.is_empty()) {
+            let (field_name, field_value) = line
+                .split_once(':')
+                .expect("forward request passed strict ingress header validation");
+            let field_name = field_name.to_ascii_lowercase();
+            if !header_is_stripped(&field_name)
+                && secrets::header_value_contains_reserved_credential_marker(field_value)
+            {
+                correlation.observe_credential(
+                    crate::l7::correlation::CredentialMechanism::StaticPlaceholder,
+                    crate::l7::correlation::CredentialSurface::Header,
+                );
+                static_credential_selected = true;
+            }
+        }
+    }
+    let upstream_path = match secret_resolver {
+        Some(resolver) => secrets::rewrite_target_for_eval(path, resolver)?.resolved,
+        None => path.to_string(),
+    };
 
     // Rebuild headers, stripping hop-by-hop and adding proxy headers
     let mut output = Vec::with_capacity(header_end + 128);
@@ -5193,26 +5249,7 @@ fn rewrite_forward_request(
             .expect("forward request passed strict ingress header validation");
         let field_name = field_name.to_ascii_lowercase();
 
-        // RFC 9112 section 3.2.2 requires proxies to replace every received
-        // Host field with one generated from the absolute request-target.
-        if field_name == "host" {
-            continue;
-        }
-
-        // Strip proxy hop-by-hop headers
-        if matches!(
-            field_name.as_str(),
-            "proxy-connection" | "proxy-authorization" | "proxy-authenticate"
-        ) {
-            continue;
-        }
-
-        if connection_nominated.contains(&field_name) {
-            continue;
-        }
-
-        // Reconstruct hop-by-hop upgrade fields after processing the originals.
-        if field_name == "connection" || field_name == "upgrade" {
+        if header_is_stripped(&field_name) {
             continue;
         }
 
@@ -5268,7 +5305,7 @@ fn rewrite_forward_request(
         return Err(secrets::UnresolvedPlaceholderError::unavailable("header"));
     }
 
-    Ok(output)
+    Ok((output, static_credential_selected))
 }
 
 fn initial_forward_body_prefix_len(header_str: &str, overflow: &[u8]) -> usize {
@@ -5425,6 +5462,7 @@ where
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn inject_token_grant_for_forward_request(
     method: &str,
     upstream_target: &str,
@@ -5433,6 +5471,7 @@ async fn inject_token_grant_for_forward_request(
     inspection: Option<ForwardL7Reevaluation<'_>>,
     request_id: &str,
     observation_context: Option<&EndpointObservationContext>,
+    correlation: Option<&crate::l7::correlation::RequestCorrelation>,
 ) -> Result<Vec<u8>> {
     let (path, _) = crate::l7::rest::parse_target_query(upstream_target)?;
     let request = crate::l7::rest::request_from_buffered_http(
@@ -5450,6 +5489,7 @@ async fn inject_token_grant_for_forward_request(
             inspection.request_info,
             request_id,
             observation_context,
+            correlation,
         )
         .await?;
         *l7_ctx = prepared_ctx;
@@ -5467,6 +5507,7 @@ async fn inject_token_grant_for_forward_request(
         &snapshot,
         request_id,
         observation_context,
+        correlation,
     )
     .await?
     .raw_header)
@@ -6702,6 +6743,7 @@ async fn handle_forward_proxy(
             }),
         &request_id,
         endpoint_observation_context.as_ref(),
+        Some(&correlation),
     )
     .await
     {
@@ -6784,6 +6826,7 @@ async fn handle_forward_proxy(
                 .end(openshell_core::proto::MiddlewareSessionEndReason::Cancellation)
                 .await;
         }
+        correlation.complete_credential(crate::l7::correlation::CredentialOutcome::Stale);
         correlation.record_enforcement_action("block");
         correlation.record_response_status(500);
         correlation.record_final_http_outcome("platform_error");
@@ -6803,14 +6846,23 @@ async fn handle_forward_proxy(
     }
 
     // 9. Rewrite request and forward to upstream
-    let rewritten = match rewrite_forward_request(
+    let rewritten = match rewrite_forward_request_correlated(
         &forward_request_bytes,
         forward_request_bytes.len(),
         &upstream_target,
         &canonical_authority,
         secret_resolver.as_deref(),
+        Some(&correlation),
     ) {
-        Ok(bytes) => bytes,
+        Ok((bytes, static_credential_selected)) => {
+            if static_credential_selected {
+                correlation.complete_credential_mechanism(
+                    crate::l7::correlation::CredentialMechanism::StaticPlaceholder,
+                    crate::l7::correlation::CredentialOutcome::Prepared,
+                );
+            }
+            bytes
+        }
         Err(e) => {
             warn!(
                 dst_host = %host_lc,
@@ -6823,6 +6875,14 @@ async fn handle_forward_proxy(
                     .end(openshell_core::proto::MiddlewareSessionEndReason::Cancellation)
                     .await;
             }
+            correlation.complete_credential_mechanism(
+                crate::l7::correlation::CredentialMechanism::StaticPlaceholder,
+                if e.is_endpoint_mismatch() {
+                    crate::l7::correlation::CredentialOutcome::Denied
+                } else {
+                    crate::l7::correlation::CredentialOutcome::Unavailable
+                },
+            );
             if e.is_endpoint_mismatch() {
                 correlation.record_policy_decision("deny");
                 correlation.record_enforcement_action("block");
@@ -7105,6 +7165,26 @@ async fn handle_forward_proxy(
                 )
                 .await?;
                 return Ok(());
+            }
+            if let Some(error) =
+                report.downcast_ref::<crate::l7::rest::CredentialUnavailableError>()
+            {
+                if error.generation_is_stale() {
+                    correlation
+                        .complete_credential(crate::l7::correlation::CredentialOutcome::Stale);
+                } else {
+                    correlation.complete_credential_mechanism(
+                        crate::l7::correlation::CredentialMechanism::SigV4,
+                        crate::l7::correlation::CredentialOutcome::Unavailable,
+                    );
+                }
+                correlation.record_enforcement_action("block");
+                correlation.record_final_http_outcome("platform_error");
+                correlation.record_error_stage(if error.generation_is_stale() {
+                    "credential_generation"
+                } else {
+                    "credential_availability"
+                });
             }
             Err(report)
         }
@@ -12038,6 +12118,7 @@ network_policies:
             None,
             FORWARD_REQUEST_ID,
             None,
+            None,
         )
         .await
     }
@@ -14574,6 +14655,164 @@ network_policies:
         assert!(!lower.contains("keep-alive:"));
         assert!(result_str.contains("Connection: close\r\n"));
         assert!(result_str.contains("X-Visible: yes\r\n"));
+    }
+
+    #[test]
+    fn forward_credential_correlation_ignores_stripped_headers() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        const MARKER: &str = "openshell:resolve:env:SENTINEL_KEY";
+        let stripped_raw = format!(
+            "GET http://host/p HTTP/1.1\r\nHost: {MARKER}\r\nProxy-Authorization: Bearer {MARKER}\r\nConnection: x-drop\r\nX-Drop: {MARKER}\r\n\r\n"
+        )
+        .into_bytes();
+        let selected_raw =
+            format!("GET http://host/p HTTP/1.1\r\nHost: host\r\nX-Keep: {MARKER}\r\n\r\n")
+                .into_bytes();
+        let unresolved_marker = "openshell:resolve:env:MISSING_KEY";
+        let combined_raw = format!(
+            "GET http://host/{unresolved_marker} HTTP/1.1\r\nHost: host\r\nX-Keep: {unresolved_marker}\r\n\r\n"
+        )
+        .into_bytes();
+        let request = |raw_header: Vec<u8>| crate::l7::provider::L7Request {
+            action: "GET".into(),
+            target: "/p".into(),
+            query_params: std::collections::HashMap::new(),
+            raw_header,
+            body_length: crate::l7::provider::BodyLength::None,
+        };
+        let ctx = crate::l7::relay::L7EvalContext {
+            host: "host".into(),
+            port: 80,
+            policy_name: "credential-test".into(),
+            ..Default::default()
+        };
+        let exporter = opentelemetry_sdk::trace::InMemorySpanExporterBuilder::new().build();
+        let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+            .with_simple_exporter(exporter.clone())
+            .build();
+        let subscriber = tracing_subscriber::registry().with(openshell_otel::layer(
+            &provider,
+            "forward-credential-correlation-test",
+        ));
+        let (_, resolver) = SecretResolver::from_provider_env(
+            [("SENTINEL_KEY".to_string(), "resolved-value".to_string())]
+                .into_iter()
+                .collect(),
+        );
+        let resolver = resolver.expect("credential resolver");
+
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::callsite::rebuild_interest_cache();
+            let stripped = request(stripped_raw);
+            let correlation = crate::l7::correlation::RequestCorrelation::with_request_id(
+                &stripped,
+                &ctx,
+                "00000000-0000-4000-8000-000000000021".into(),
+            );
+            let (_, selected) = rewrite_forward_request_correlated(
+                &stripped.raw_header,
+                stripped.raw_header.len(),
+                "/p",
+                "host",
+                None,
+                Some(&correlation),
+            )
+            .expect("stripped placeholders never reach credential rewriting");
+            assert!(!selected);
+            correlation.record_final_http_outcome("allowed");
+
+            let selected = request(selected_raw);
+            let correlation = crate::l7::correlation::RequestCorrelation::with_request_id(
+                &selected,
+                &ctx,
+                "00000000-0000-4000-8000-000000000022".into(),
+            );
+            let (rewritten, selected) = rewrite_forward_request_correlated(
+                &selected.raw_header,
+                selected.raw_header.len(),
+                "/p",
+                "host",
+                Some(&resolver),
+                Some(&correlation),
+            )
+            .expect("eligible placeholder resolves");
+            assert!(selected);
+            assert!(String::from_utf8_lossy(&rewritten).contains("X-Keep: resolved-value"));
+            correlation.complete_credential_mechanism(
+                crate::l7::correlation::CredentialMechanism::StaticPlaceholder,
+                crate::l7::correlation::CredentialOutcome::Prepared,
+            );
+            correlation.record_final_http_outcome("allowed");
+
+            let combined = request(combined_raw);
+            let correlation = crate::l7::correlation::RequestCorrelation::with_request_id(
+                &combined,
+                &ctx,
+                "00000000-0000-4000-8000-000000000023".into(),
+            );
+            rewrite_forward_request_correlated(
+                &combined.raw_header,
+                combined.raw_header.len(),
+                &format!("/{unresolved_marker}"),
+                "host",
+                Some(&resolver),
+                Some(&correlation),
+            )
+            .expect_err("unresolved path must fail after all surfaces are observed");
+            correlation.complete_credential_mechanism(
+                crate::l7::correlation::CredentialMechanism::StaticPlaceholder,
+                crate::l7::correlation::CredentialOutcome::Unavailable,
+            );
+            correlation.record_final_http_outcome("platform_error");
+        });
+        provider.force_flush().expect("flush spans");
+
+        let spans = exporter.get_finished_spans().expect("finished spans");
+        let attributes_for = |request_id: &str| {
+            spans
+                .iter()
+                .find(|span| {
+                    span.attributes.iter().any(|attribute| {
+                        attribute.key.as_str() == "openshell.request.id"
+                            && attribute.value.to_string() == request_id
+                    })
+                })
+                .expect("enforcement span")
+                .attributes
+                .iter()
+                .map(|attribute| {
+                    (
+                        attribute.key.as_str().to_string(),
+                        attribute.value.to_string(),
+                    )
+                })
+                .collect::<std::collections::BTreeMap<_, _>>()
+        };
+        let stripped = attributes_for("00000000-0000-4000-8000-000000000021");
+        assert!(
+            stripped
+                .keys()
+                .all(|key| !key.starts_with("openshell.credential."))
+        );
+        let selected = attributes_for("00000000-0000-4000-8000-000000000022");
+        assert_eq!(selected["openshell.credential.outcome"], "prepared");
+        assert_eq!(
+            selected["openshell.credential.mechanisms"],
+            "static_placeholder"
+        );
+        assert_eq!(selected["openshell.credential.surfaces"], "header");
+        assert!(!format!("{selected:?}").contains("SENTINEL_KEY"));
+        assert!(!format!("{selected:?}").contains("resolved-value"));
+
+        let combined = attributes_for("00000000-0000-4000-8000-000000000023");
+        assert_eq!(combined["openshell.credential.outcome"], "unavailable");
+        assert_eq!(
+            combined["openshell.credential.mechanisms"],
+            "static_placeholder"
+        );
+        assert_eq!(combined["openshell.credential.surfaces"], "header,path");
+        assert!(!format!("{combined:?}").contains("MISSING_KEY"));
     }
 
     #[test]
