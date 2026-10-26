@@ -18,6 +18,7 @@ openshell-crypto = { workspace = true }
 openshell-core = { path = "../openshell-core", features = ["oauth"] }
 openshell-isolation-interface = { path = "../openshell-isolation-interface" }
 openshell-ocsf = { path = "../openshell-ocsf" }
+openshell-otel = { path = "../openshell-otel" }
 openshell-policy = { path = "../openshell-policy" }
 openshell-policy-schema = { path = "../openshell-policy-schema" }
 openshell-supervisor-middleware = { path = "../openshell-supervisor-middleware" }
@@ -69,7 +70,6 @@ openshell-sandbox-backend = { path = "../openshell-sandbox-backend", features = 
 openshell-driver-vm = { path = "../openshell-driver-vm", default-features = false, features = ["allocation-tracking"] }
 openshell-ocsf = { path = "../openshell-ocsf", features = ["test-support"] }
 openshell-ocsf-validate = { path = "../openshell-ocsf-validate" }
-openshell-otel = { path = "../openshell-otel" }
 openshell-supervisor-middleware-builtins = { path = "../openshell-supervisor-middleware-builtins" }
 opentelemetry_sdk = { workspace = true, features = ["testing"] }
 temp-env = "0.3"

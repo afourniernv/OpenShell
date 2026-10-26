@@ -41,3 +41,26 @@ at debug, and emits no OCSF denial event: a standard OpenTelemetry SDK retries
 for the life of the agent, and one event per retry would flood the OCSF log.
 The supervisor installs its OTLP relay receiver as the handler while the agent
 trace relay is active.
+
+## HTTP enforcement correlation
+
+Inspected HTTP requests create an `openshell.http.enforcement` span. A single
+valid, sampled W3C `traceparent` becomes its parent. OpenShell treats incoming
+trace context as an untrusted correlation hint: malformed or duplicate values
+are ignored, `tracestate` is not adopted into the enforcement span, and an
+unsampled context becomes a link so a caller cannot suppress local enforcement
+telemetry.
+
+The network supervisor assigns each inspected request a UUID. It stores that
+value in the enforcement span, in correlated OCSF events, and in the
+`x-openshell-request-id` response header. OpenShell removes workload,
+middleware, and upstream attempts to set that header on inspected HTTP paths.
+The header is a correlation handle, not proof of an enforcement decision. A
+consumer must match it to trusted OpenShell OTLP or OCSF output for the same
+sandbox and trace, and must never authorize from the header alone. L4 and
+passthrough traffic do not provide this anti-spoofing guarantee. Span
+attributes distinguish the policy decision from the enforcement action and
+final outcome, such as a local denial, an allowed response, or an upstream or
+platform failure. An unfinished request is reported as incomplete. The
+attributes never include credentials, query values, or request and response
+bodies.

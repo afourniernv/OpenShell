@@ -244,16 +244,22 @@ fn build_credential_endpoint_mismatch_event(
         .build()
 }
 
-fn emit_credential_endpoint_mismatch(method: &str, host: &str, port: u16, policy_name: &str) {
+fn emit_credential_endpoint_mismatch(
+    method: &str,
+    host: &str,
+    port: u16,
+    policy_name: &str,
+    correlation: &crate::l7::correlation::RequestCorrelation,
+) {
     let event = build_credential_endpoint_mismatch_event(method, host, port, policy_name);
-    ocsf_emit!(event);
+    correlation.emit(event);
     let finding = crate::l7::build_credential_endpoint_mismatch_finding(
         policy_name,
         host,
         None,
         "Provider credential endpoint binding mismatch; request denied",
     );
-    ocsf_emit!(finding);
+    correlation.emit(finding);
 }
 
 /// Hostnames injected by compute drivers as `/etc/hosts` aliases for the host
@@ -2369,12 +2375,18 @@ async fn deny_forward_destination<C>(
     decision: &EgressDecision,
     denial_tx: Option<&mpsc::UnboundedSender<DenialEvent>>,
     activity_tx: Option<&ActivitySender>,
+    correlation: &crate::l7::correlation::RequestCorrelation,
 ) -> Result<()>
 where
     C: TokioAsyncWrite + Unpin,
 {
     let detail = destination_denial_detail(denial.kind);
-    ocsf_emit!(build_forward_destination_deny_ocsf_event(
+    correlation.record_policy_decision("deny");
+    correlation.record_enforcement_action("block");
+    correlation.record_final_http_outcome("denied");
+    correlation.record_response_status(403);
+    correlation.record_error_stage("destination_policy");
+    correlation.emit(build_forward_destination_deny_ocsf_event(
         denial, peer_addr, method, host, port, path, binary, pid, ancestors, cmdline, policy,
     ));
 
@@ -2394,11 +2406,12 @@ where
     }
     respond(
         client,
-        &build_json_error_response(
+        &build_correlated_json_error_response(
             403,
             "Forbidden",
             "ssrf_denied",
             &format!("{method} {host}:{port} blocked: {detail}"),
+            correlation.request_id(),
         ),
     )
     .await
@@ -5331,6 +5344,7 @@ struct ForwardResponseMiddleware<'a> {
     exchange: &'a crate::l7::middleware::HttpMiddlewareExchange,
 }
 
+#[cfg(test)]
 async fn relay_rewritten_forward_request<C, U>(
     method: &str,
     path: &str,
@@ -5338,6 +5352,25 @@ async fn relay_rewritten_forward_request<C, U>(
     client: &mut C,
     upstream: &mut U,
     options: ForwardRelayOptions<'_>,
+) -> Result<crate::l7::provider::RelayOutcome>
+where
+    C: TokioAsyncRead + TokioAsyncWrite + Unpin,
+    U: TokioAsyncRead + TokioAsyncWrite + Unpin,
+{
+    relay_rewritten_forward_request_correlated(
+        method, path, rewritten, client, upstream, options, None,
+    )
+    .await
+}
+
+async fn relay_rewritten_forward_request_correlated<C, U>(
+    method: &str,
+    path: &str,
+    rewritten: Vec<u8>,
+    client: &mut C,
+    upstream: &mut U,
+    options: ForwardRelayOptions<'_>,
+    correlation: Option<&crate::l7::correlation::RequestCorrelation>,
 ) -> Result<crate::l7::provider::RelayOutcome>
 where
     C: TokioAsyncRead + TokioAsyncWrite + Unpin,
@@ -5364,7 +5397,7 @@ where
             .response_relay(&req, middleware.ctx, middleware.scheme)
     });
 
-    crate::l7::rest::relay_http_request_with_response_middleware_guarded_observed(
+    crate::l7::rest::relay_http_request_with_response_middleware_guarded_observed_correlated(
         &req,
         client,
         upstream,
@@ -5385,6 +5418,7 @@ where
         },
         response_middleware,
         options.endpoint_observer,
+        correlation,
     )
     .await
 }
@@ -5801,6 +5835,17 @@ async fn handle_forward_proxy(
         "https" => Some(443),
         _ => None,
     };
+    let correlation_request = crate::l7::rest::request_from_buffered_http(
+        method,
+        path.clone(),
+        &upstream_target,
+        forward_request_bytes,
+    )?;
+    let correlation =
+        crate::l7::correlation::RequestCorrelation::new(&correlation_request, &l7_ctx);
+    correlation.record_policy_decision("allow");
+    correlation.record_enforcement_action("allow");
+    forward_request_bytes = correlation_request.raw_header;
     if let Some(route) = decision
         .endpoint
         .l7_route
@@ -5827,13 +5872,18 @@ async fn handle_forward_proxy(
                 ),
             );
             emit_activity_simple(activity_tx, true, "policy_stale");
+            correlation.record_enforcement_action("block");
+            correlation.record_final_http_outcome("denied");
+            correlation.record_response_status(403);
+            correlation.record_error_stage("policy_generation");
             respond(
                 client,
-                &build_json_error_response(
+                &build_correlated_json_error_response(
                     403,
                     "Forbidden",
                     "policy_denied",
                     &format!("{method} {host_lc}:{port}{telemetry_path} not permitted by policy"),
+                    correlation.request_id(),
                 ),
             )
             .await?;
@@ -5852,15 +5902,20 @@ async fn handle_forward_proxy(
                 );
                 emit_l7_tunnel_close_after_policy_change(&host_lc, port, e);
                 emit_activity_simple(activity_tx, true, "policy_stale");
+                correlation.record_enforcement_action("block");
+                correlation.record_final_http_outcome("denied");
+                correlation.record_response_status(403);
+                correlation.record_error_stage("policy_generation");
                 respond(
                     client,
-                    &build_json_error_response(
+                    &build_correlated_json_error_response(
                         403,
                         "Forbidden",
                         "policy_denied",
                         &format!(
                             "{method} {host_lc}:{port}{telemetry_path} not permitted by policy"
                         ),
+                        correlation.request_id(),
                     ),
                 )
                 .await?;
@@ -5869,29 +5924,64 @@ async fn handle_forward_proxy(
         };
 
         let Ok(redacted_path) = secrets::redact_target_for_policy(&path) else {
+            correlation.record_final_http_outcome("platform_error");
+            correlation.record_response_status(400);
+            correlation.record_error_stage("credential_placeholder");
             respond(
                 client,
-                &build_json_error_response(
+                &build_correlated_json_error_response(
                     400,
                     "Bad Request",
                     "invalid_credential_placeholder",
                     "request-target contains an invalid credential placeholder",
+                    correlation.request_id(),
                 ),
             )
             .await?;
             return Ok(());
         };
         let Some(l7_config) = select_l7_config_for_path(&route.configs, &redacted_path) else {
+            let reason = "no L7 endpoint path matched request";
+            correlation.record_policy_decision("deny");
+            correlation.record_enforcement_action("block");
+            correlation.record_final_http_outcome("denied");
+            correlation.record_response_status(403);
+            correlation.emit(
+                HttpActivityBuilder::new(openshell_ocsf::ctx::ctx())
+                    .activity(ActivityId::for_http_method(method))
+                    .action(ActionId::Denied)
+                    .disposition(DispositionId::Blocked)
+                    .severity(SeverityId::Medium)
+                    .status(StatusId::Failure)
+                    .http_request(HttpRequest::new(
+                        method,
+                        OcsfUrl::new("http", &host_lc, &telemetry_path, port),
+                    ))
+                    .http_response(HttpResponse { code: 403 })
+                    .dst_endpoint(Endpoint::from_domain(&host_lc, port))
+                    .src_endpoint(Endpoint::from_ip(workload_addr.ip(), workload_addr.port()))
+                    .actor_process(
+                        Process::from_bypass(&binary_str, &pid_str, &ancestors_str)
+                            .with_cmd_line(&cmdline_str),
+                    )
+                    .firewall_rule(policy_str, "l7")
+                    .message(format!(
+                        "FORWARD_L7 denied {method} {host_lc}:{port}{telemetry_path}"
+                    ))
+                    .status_detail(reason)
+                    .build(),
+            );
             emit_activity_simple(activity_tx, true, "l7_policy");
             respond(
                 client,
-                &build_json_error_response(
+                &build_correlated_json_error_response(
                     403,
                     "Forbidden",
                     "policy_denied",
                     &format!(
                         "{method} {host_lc}:{port}{telemetry_path} did not match an L7 endpoint path"
                     ),
+                    correlation.request_id(),
                 ),
             )
             .await?;
@@ -5914,7 +6004,12 @@ async fn handle_forward_proxy(
         if !l7_config.config.allow_encoded_slash
             && crate::l7::path::canonical_path_has_encoded_slash(&path)
         {
-            ocsf_emit!(build_forward_l7_parse_rejection_ocsf_event(
+            correlation.record_policy_decision("deny");
+            correlation.record_enforcement_action("block");
+            correlation.record_final_http_outcome("denied");
+            correlation.record_response_status(400);
+            correlation.record_error_stage("request_target");
+            correlation.emit(build_forward_l7_parse_rejection_ocsf_event(
                 workload_addr,
                 method,
                 &host_lc,
@@ -5930,11 +6025,12 @@ async fn handle_forward_proxy(
             emit_activity_simple(activity_tx, true, "forward_parse_rejection");
             respond(
                 client,
-                &build_json_error_response(
+                &build_correlated_json_error_response(
                     400,
                     "Bad Request",
                     "invalid_request_target",
                     "request-target must be canonical",
+                    correlation.request_id(),
                 ),
             )
             .await?;
@@ -5946,6 +6042,11 @@ async fn handle_forward_proxy(
             &forward_request_bytes,
             l7_config.config.protocol,
         ) {
+            correlation.record_policy_decision("deny");
+            correlation.record_enforcement_action("block");
+            correlation.record_final_http_outcome("denied");
+            correlation.record_response_status(403);
+            correlation.record_error_stage("protocol_upgrade");
             if let Some(observer) = endpoint_observer.as_ref() {
                 observer.observe(EndpointResult::PolicyDenied);
             }
@@ -5971,7 +6072,7 @@ async fn handle_forward_proxy(
                 ))
                 .status_detail(upgrade_detail)
                 .build();
-            ocsf_emit!(event);
+            correlation.emit(event);
             emit_activity_simple(activity_tx, true, "l7_parse_rejection");
             emit_denial_simple(
                 denial_tx,
@@ -5984,11 +6085,12 @@ async fn handle_forward_proxy(
             );
             respond(
                 client,
-                &build_json_error_response(
+                &build_correlated_json_error_response(
                     403,
                     "Forbidden",
                     "unsupported_l7_protocol",
                     upgrade_detail,
+                    correlation.request_id(),
                 ),
             )
             .await?;
@@ -6029,6 +6131,11 @@ async fn handle_forward_proxy(
             {
                 Ok(info) => info,
                 Err(e) => {
+                    correlation.record_policy_decision("deny");
+                    correlation.record_enforcement_action("block");
+                    correlation.record_final_http_outcome("denied");
+                    correlation.record_response_status(400);
+                    correlation.record_error_stage("graphql_inspection");
                     let event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
                         .activity(ActivityId::Fail)
                         .severity(SeverityId::Medium)
@@ -6036,15 +6143,16 @@ async fn handle_forward_proxy(
                         .dst_endpoint(Endpoint::from_domain(&host_lc, port))
                         .message(format!("FORWARD_GRAPHQL_L7 request rejected: {e}"))
                         .build();
-                    ocsf_emit!(event);
+                    correlation.emit(event);
                     emit_activity_simple(activity_tx, true, "l7_parse_rejection");
                     respond(
                         client,
-                        &build_json_error_response(
+                        &build_correlated_json_error_response(
                             400,
                             "Bad Request",
                             "invalid_graphql_request",
                             &format!("GraphQL request rejected before policy evaluation: {e}"),
+                            correlation.request_id(),
                         ),
                     )
                     .await?;
@@ -6083,6 +6191,11 @@ async fn handle_forward_proxy(
                 {
                     Ok(body) => body,
                     Err(e) => {
+                        correlation.record_policy_decision("deny");
+                        correlation.record_enforcement_action("block");
+                        correlation.record_final_http_outcome("denied");
+                        correlation.record_response_status(400);
+                        correlation.record_error_stage("jsonrpc_inspection");
                         let event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
                             .activity(ActivityId::Fail)
                             .severity(SeverityId::Medium)
@@ -6090,15 +6203,16 @@ async fn handle_forward_proxy(
                             .dst_endpoint(Endpoint::from_domain(&host_lc, port))
                             .message(format!("FORWARD_JSONRPC_L7 request rejected: {e}"))
                             .build();
-                        ocsf_emit!(event);
+                        correlation.emit(event);
                         emit_activity_simple(activity_tx, true, "l7_parse_rejection");
                         respond(
                             client,
-                            &build_json_error_response(
+                            &build_correlated_json_error_response(
                                 400,
                                 "Bad Request",
                                 "invalid_jsonrpc_request",
                                 &format!("JSON-RPC request rejected before policy evaluation: {e}"),
+                                correlation.request_id(),
                             ),
                         )
                         .await?;
@@ -6112,7 +6226,7 @@ async fn handle_forward_proxy(
             };
             // Policy evaluation must use the selected revision's inspection,
             // including method classification, just as the CONNECT relays do.
-            let Some(info) = crate::l7::relay::enforce_mcp_protocol_version(
+            let Some(info) = crate::l7::relay::enforce_mcp_protocol_version_correlated(
                 &l7_config.config,
                 &jsonrpc_request,
                 info,
@@ -6120,6 +6234,7 @@ async fn handle_forward_proxy(
                 &l7_ctx,
                 &telemetry_path,
                 endpoint_observer.as_ref(),
+                Some(&correlation),
             )
             .await?
             else {
@@ -6165,6 +6280,14 @@ async fn handle_forward_proxy(
             (false, crate::l7::EnforcementMode::Audit) => "audit",
             (false, crate::l7::EnforcementMode::Enforce) => "deny",
         };
+        correlation.record_policy_decision(if allowed { "allow" } else { "deny" });
+        correlation.record_enforcement_action(if allowed {
+            "allow"
+        } else if l7_config.config.enforcement == crate::l7::EnforcementMode::Audit && !force_deny {
+            "audit"
+        } else {
+            "block"
+        });
 
         {
             let (action_id, disposition_id, severity) = match decision_str {
@@ -6228,13 +6351,15 @@ async fn handle_forward_proxy(
                 .firewall_rule(policy_str, engine_type)
                 .message(log_message)
                 .build();
-            ocsf_emit!(event);
+            correlation.emit(event);
         }
 
         let effectively_denied = force_deny
             || (!allowed && l7_config.config.enforcement == crate::l7::EnforcementMode::Enforce);
 
         if effectively_denied {
+            correlation.record_final_http_outcome("denied");
+            correlation.record_response_status(403);
             emit_activity_simple(activity_tx, true, "l7_policy");
             emit_denial_simple(
                 denial_tx,
@@ -6247,13 +6372,14 @@ async fn handle_forward_proxy(
             );
             respond(
                 client,
-                &build_json_error_response(
+                &build_correlated_json_error_response(
                     403,
                     "Forbidden",
                     "policy_denied",
                     &format!(
                         "{method} {host_lc}:{port}{telemetry_path} denied by L7 policy: {reason}"
                     ),
+                    correlation.request_id(),
                 ),
             )
             .await?;
@@ -6293,6 +6419,7 @@ async fn handle_forward_proxy(
                 &decision,
                 denial_tx,
                 activity_tx,
+                &correlation,
             )
             .await?;
             return Ok(());
@@ -6331,6 +6458,7 @@ async fn handle_forward_proxy(
                 &decision,
                 denial_tx,
                 activity_tx,
+                &correlation,
             )
             .await?;
             return Ok(());
@@ -6348,13 +6476,18 @@ async fn handle_forward_proxy(
         );
         emit_l7_tunnel_close_after_policy_change(&host_lc, port, e);
         emit_activity_simple(activity_tx, true, "policy_stale");
+        correlation.record_enforcement_action("block");
+        correlation.record_final_http_outcome("denied");
+        correlation.record_response_status(403);
+        correlation.record_error_stage("policy_generation");
         respond(
             client,
-            &build_json_error_response(
+            &build_correlated_json_error_response(
                 403,
                 "Forbidden",
                 "policy_denied",
                 &format!("{method} {host_lc}:{port}{telemetry_path} not permitted by policy"),
+                correlation.request_id(),
             ),
         )
         .await?;
@@ -6382,19 +6515,24 @@ async fn handle_forward_proxy(
                 generation,
             ),
         );
+        correlation.record_enforcement_action("block");
+        correlation.record_final_http_outcome("denied");
+        correlation.record_response_status(403);
+        correlation.record_error_stage("policy_generation");
         respond(
             client,
-            &build_json_error_response(
+            &build_correlated_json_error_response(
                 403,
                 "Forbidden",
                 "policy_denied",
                 &format!("{method} {host_lc}:{port}{telemetry_path} not permitted by policy"),
+                correlation.request_id(),
             ),
         )
         .await?;
         return Ok(());
     }
-    let request_id = uuid::Uuid::new_v4().to_string();
+    let request_id = correlation.request_id().to_string();
     let websocket_chain = forward_websocket_request.then(|| chain.clone());
     let response_selection = if chain.is_empty() {
         None
@@ -6430,16 +6568,42 @@ async fn handle_forward_proxy(
             crate::l7::middleware::MiddlewareApplyResult::Allowed(request) => request.raw_header,
             crate::l7::middleware::MiddlewareApplyResult::Denied { denial, .. } => {
                 emit_activity_simple(activity_tx, true, "middleware");
+                correlation.record_enforcement_action("block");
+                correlation.record_response_status(403);
+                correlation.record_final_http_outcome(if denial.is_some() {
+                    "denied"
+                } else {
+                    "platform_error"
+                });
+                correlation.record_error_stage("request_middleware");
                 let response = denial.as_ref().map_or_else(
-                    || build_middleware_failure_response(&l7_ctx.policy_name),
-                    |denial| build_middleware_deny_response(&l7_ctx.policy_name, denial),
+                    || {
+                        build_middleware_failure_response(
+                            &l7_ctx.policy_name,
+                            Some(correlation.request_id()),
+                        )
+                    },
+                    |denial| {
+                        build_middleware_deny_response(
+                            &l7_ctx.policy_name,
+                            denial,
+                            Some(correlation.request_id()),
+                        )
+                    },
                 );
                 respond(client, &response).await?;
                 return Ok(());
             }
             crate::l7::middleware::MiddlewareApplyResult::AdmissionExhausted => {
                 emit_activity_simple(activity_tx, true, "middleware");
-                let response = build_middleware_unavailable_response(&l7_ctx.policy_name);
+                correlation.record_enforcement_action("block");
+                correlation.record_response_status(503);
+                correlation.record_final_http_outcome("platform_error");
+                correlation.record_error_stage("middleware_admission");
+                let response = build_middleware_unavailable_response(
+                    &l7_ctx.policy_name,
+                    Some(correlation.request_id()),
+                );
                 respond(client, &response).await?;
                 return Ok(());
             }
@@ -6466,13 +6630,18 @@ async fn handle_forward_proxy(
             Ok(preflight) => preflight,
             Err(error) => {
                 warn!(error = %error, "Plaintext WebSocket middleware preflight failed");
+                correlation.record_enforcement_action("block");
+                correlation.record_response_status(502);
+                correlation.record_final_http_outcome("platform_error");
+                correlation.record_error_stage("websocket_middleware");
                 respond(
                     client,
-                    &build_json_error_response(
+                    &build_correlated_json_error_response(
                         502,
                         "Bad Gateway",
                         "middleware_failed",
                         "WebSocket middleware preflight failed",
+                        correlation.request_id(),
                     ),
                 )
                 .await?;
@@ -6481,9 +6650,28 @@ async fn handle_forward_proxy(
         };
         crate::l7::middleware::emit_websocket_preflight_events(&l7_ctx, &preflight);
         if preflight.terminal_reason.is_some() {
+            correlation.record_enforcement_action("block");
+            correlation.record_response_status(403);
+            correlation.record_final_http_outcome(if preflight.denial.is_some() {
+                "denied"
+            } else {
+                "platform_error"
+            });
+            correlation.record_error_stage("websocket_middleware");
             let response = preflight.denial.as_ref().map_or_else(
-                || build_middleware_failure_response(&l7_ctx.policy_name),
-                |denial| build_middleware_deny_response(&l7_ctx.policy_name, denial),
+                || {
+                    build_middleware_failure_response(
+                        &l7_ctx.policy_name,
+                        Some(correlation.request_id()),
+                    )
+                },
+                |denial| {
+                    build_middleware_deny_response(
+                        &l7_ctx.policy_name,
+                        denial,
+                        Some(correlation.request_id()),
+                    )
+                },
             );
             respond(client, &response).await?;
             return Ok(());
@@ -6517,6 +6705,10 @@ async fn handle_forward_proxy(
         Err(e) => {
             let refusal =
                 e.downcast_ref::<crate::l7::token_grant_injection::TokenGrantInjectionError>();
+            correlation.record_enforcement_action("block");
+            correlation.record_response_status(502);
+            correlation.record_final_http_outcome("platform_error");
+            correlation.record_error_stage("credential_preparation");
             if refusal.is_none() {
                 warn!(
                     dst_host = %host_lc,
@@ -6530,23 +6722,13 @@ async fn handle_forward_proxy(
                     .end(openshell_core::proto::MiddlewareSessionEndReason::Cancellation)
                     .await;
             }
-            let response = refusal.map_or_else(
-                || {
-                    build_json_error_response(
-                        502,
-                        "Bad Gateway",
-                        "token_grant_failed",
-                        "dynamic token grant failed",
-                    )
-                },
-                |refusal| {
-                    // The refusal event already names the credential and request ID.
-                    if let Some(observer) = endpoint_observer.as_ref() {
-                        observer.observe_token_grant_refusal(refusal, &request_id);
-                    }
-                    build_token_grant_failure_response(&request_id)
-                },
-            );
+            if let Some(refusal) = refusal {
+                // The refusal event already names the credential and request ID.
+                if let Some(observer) = endpoint_observer.as_ref() {
+                    observer.observe_token_grant_refusal(refusal, &request_id);
+                }
+            }
+            let response = build_token_grant_failure_response(&request_id);
             respond(client, &response).await?;
             return Ok(());
         }
@@ -6581,8 +6763,39 @@ async fn handle_forward_proxy(
         ),
         _ => None,
     };
-    if let Some(guard) = credential_generation {
-        guard.ensure_current()?;
+    if let Some(guard) = credential_generation
+        && let Err(error) = guard.ensure_current()
+    {
+        warn!(
+            dst_host = %host_lc,
+            dst_port = port,
+            error = %error,
+            "provider credential generation changed before forward proxy write"
+        );
+        if let Some(observer) = endpoint_observer.as_ref() {
+            observer.observe_credential_failure(false);
+        }
+        if let Some(session) = middleware_session.take() {
+            session
+                .end(openshell_core::proto::MiddlewareSessionEndReason::Cancellation)
+                .await;
+        }
+        correlation.record_enforcement_action("block");
+        correlation.record_response_status(500);
+        correlation.record_final_http_outcome("platform_error");
+        correlation.record_error_stage("credential_generation");
+        respond(
+            client,
+            &build_correlated_json_error_response(
+                500,
+                "Internal Server Error",
+                "credential_unavailable",
+                "credential material is unavailable for this request",
+                correlation.request_id(),
+            ),
+        )
+        .await?;
+        return Ok(());
     }
 
     // 9. Rewrite request and forward to upstream
@@ -6607,17 +6820,23 @@ async fn handle_forward_proxy(
                     .await;
             }
             if e.is_endpoint_mismatch() {
+                correlation.record_policy_decision("deny");
+                correlation.record_enforcement_action("block");
+                correlation.record_response_status(403);
+                correlation.record_final_http_outcome("denied");
+                correlation.record_error_stage("credential_injection");
                 if let Some(observer) = endpoint_observer.as_ref() {
                     observer.observe_credential_failure(true);
                 }
-                emit_credential_endpoint_mismatch(method, &host_lc, port, policy_str);
+                emit_credential_endpoint_mismatch(method, &host_lc, port, policy_str, &correlation);
                 respond(
                     client,
-                    &build_json_error_response(
+                    &build_correlated_json_error_response(
                         403,
                         "Forbidden",
                         "credential_endpoint_mismatch",
                         "credential is not authorized for this request endpoint",
+                        correlation.request_id(),
                     ),
                 )
                 .await?;
@@ -6633,13 +6852,18 @@ async fn handle_forward_proxy(
                 })
                 .await;
             } else {
+                correlation.record_enforcement_action("block");
+                correlation.record_response_status(500);
+                correlation.record_final_http_outcome("platform_error");
+                correlation.record_error_stage("credential_injection");
                 respond(
                     client,
-                    &build_json_error_response(
+                    &build_correlated_json_error_response(
                         500,
                         "Internal Server Error",
                         "credential_injection_failed",
                         "unresolved credential placeholder in request",
+                        correlation.request_id(),
                     ),
                 )
                 .await?;
@@ -6659,13 +6883,14 @@ async fn handle_forward_proxy(
                 &upstream_target,
                 rewritten,
             )?;
-            if !crate::l7::relay::enforce_final_mcp_protocol_version(
+            if !crate::l7::relay::enforce_final_mcp_protocol_version_correlated(
                 config,
                 &request,
                 client,
                 &l7_ctx,
                 &telemetry_path,
                 endpoint_observer.as_ref(),
+                Some(&correlation),
             )
             .await?
             {
@@ -6696,13 +6921,18 @@ async fn handle_forward_proxy(
                 .end(openshell_core::proto::MiddlewareSessionEndReason::PolicyReload)
                 .await;
         }
+        correlation.record_enforcement_action("block");
+        correlation.record_final_http_outcome("denied");
+        correlation.record_response_status(403);
+        correlation.record_error_stage("policy_generation");
         respond(
             client,
-            &build_json_error_response(
+            &build_correlated_json_error_response(
                 403,
                 "Forbidden",
                 "policy_denied",
                 &format!("{method} {host_lc}:{port}{telemetry_path} not permitted by policy"),
+                correlation.request_id(),
             ),
         )
         .await?;
@@ -6737,19 +6967,23 @@ async fn handle_forward_proxy(
                     "FORWARD upstream connect failed for {host_lc}:{port}: {e}"
                 ))
                 .build();
-            ocsf_emit!(event);
+            correlation.emit(event);
             if let Some(session) = middleware_session.take() {
                 session
                     .end(openshell_core::proto::MiddlewareSessionEndReason::UpstreamFailure)
                     .await;
             }
+            correlation.record_response_status(502);
+            correlation.record_final_http_outcome("upstream_error");
+            correlation.record_error_stage("upstream_connect");
             respond(
                 client,
-                &build_json_error_response(
+                &build_correlated_json_error_response(
                     502,
                     "Bad Gateway",
                     "upstream_unreachable",
                     &format!("connection to {host_lc}:{port} failed"),
+                    correlation.request_id(),
                 ),
             )
             .await?;
@@ -6774,13 +7008,18 @@ async fn handle_forward_proxy(
                 .end(openshell_core::proto::MiddlewareSessionEndReason::PolicyReload)
                 .await;
         }
+        correlation.record_enforcement_action("block");
+        correlation.record_final_http_outcome("denied");
+        correlation.record_response_status(403);
+        correlation.record_error_stage("policy_generation");
         respond(
             client,
-            &build_json_error_response(
+            &build_correlated_json_error_response(
                 403,
                 "Forbidden",
                 "policy_denied",
                 &format!("{method} {host_lc}:{port}{path} not permitted by policy"),
+                correlation.request_id(),
             ),
         )
         .await?;
@@ -6798,7 +7037,7 @@ async fn handle_forward_proxy(
     let signing_region = forward_upgrade_config
         .as_ref()
         .map_or("", |config| config.signing_region.as_str());
-    let outcome_result = relay_rewritten_forward_request(
+    let outcome_result = relay_rewritten_forward_request_correlated(
         method,
         &upstream_target,
         rewritten,
@@ -6826,6 +7065,7 @@ async fn handle_forward_proxy(
             }),
             endpoint_observer: endpoint_observer.as_ref(),
         },
+        Some(&correlation),
     )
     .await;
     let outcome_result = match outcome_result {
@@ -6837,7 +7077,13 @@ async fn handle_forward_proxy(
                         .await;
                 }
                 let _ = upstream.shutdown().await;
-                crate::l7::relay::reject_body_credential(client, *error).await?;
+                crate::l7::relay::reject_body_credential(
+                    client,
+                    *error,
+                    &l7_ctx,
+                    Some(&correlation),
+                )
+                .await?;
                 return Ok(());
             }
             if let Some(error) = report.downcast_ref::<secrets::UnresolvedPlaceholderError>() {
@@ -6846,8 +7092,14 @@ async fn handle_forward_proxy(
                         .end(openshell_core::proto::MiddlewareSessionEndReason::Cancellation)
                         .await;
                 }
-                crate::l7::relay::reject_credential_resolution(client, &l7_ctx, method, error)
-                    .await?;
+                crate::l7::relay::reject_credential_resolution(
+                    client,
+                    &l7_ctx,
+                    method,
+                    error,
+                    Some(&correlation),
+                )
+                .await?;
                 return Ok(());
             }
             Err(report)
@@ -6867,7 +7119,7 @@ async fn handle_forward_proxy(
     // The request has now survived middleware, token grant, credential
     // rewriting, generation checks, and the HTTP relay. Only now record the
     // final allowed outcome.
-    ocsf_emit!(build_forward_allow_ocsf_event(
+    correlation.emit(build_forward_allow_ocsf_event(
         workload_addr,
         method,
         &host_lc,
@@ -7017,6 +7269,34 @@ fn build_json_error_response(status: u16, status_text: &str, error: &str, detail
     .into_bytes()
 }
 
+fn build_correlated_json_error_response(
+    status: u16,
+    status_text: &str,
+    error: &str,
+    detail: &str,
+    request_id: &str,
+) -> Vec<u8> {
+    let body = serde_json::json!({
+        "error": error,
+        "detail": detail,
+        "request_id": request_id,
+    })
+    .to_string();
+    format!(
+        "HTTP/1.1 {status} {status_text}\r\n\
+         Content-Type: application/json\r\n\
+         {}: {request_id}\r\n\
+         Content-Length: {}\r\n\
+         Connection: close\r\n\
+         \r\n\
+         {}",
+        openshell_core::token_grant_failure::REQUEST_ID_HEADER,
+        body.len(),
+        body,
+    )
+    .into_bytes()
+}
+
 /// Build the forward proxy's refusal for a failed dynamic token grant.
 ///
 /// This is the generic grant refusal plus a request ID header, which lets the
@@ -7071,6 +7351,7 @@ fn build_json_error_response_with_reason(
 fn build_middleware_deny_response(
     policy_name: &str,
     denial: &openshell_supervisor_middleware::MiddlewareDenial,
+    request_id: Option<&str>,
 ) -> Vec<u8> {
     let mut body = serde_json::Map::new();
     body.insert("error".to_string(), serde_json::json!("middleware_denied"));
@@ -7086,11 +7367,21 @@ fn build_middleware_deny_response(
     if let Some(reason_code) = &denial.reason_code {
         body.insert("reason_code".to_string(), serde_json::json!(reason_code));
     }
+    if let Some(request_id) = request_id {
+        body.insert("request_id".to_string(), serde_json::json!(request_id));
+    }
     let body_str = serde_json::Value::Object(body).to_string();
+    let request_id_header = request_id.map_or_else(String::new, |request_id| {
+        format!(
+            "{}: {request_id}\r\n",
+            openshell_core::token_grant_failure::REQUEST_ID_HEADER
+        )
+    });
     format!(
         "HTTP/1.1 403 Forbidden\r\n\
          Content-Type: application/json\r\n\
          Content-Length: {}\r\n\
+         {request_id_header}\
          Connection: close\r\n\
          \r\n\
          {}",
@@ -7100,25 +7391,39 @@ fn build_middleware_deny_response(
     .into_bytes()
 }
 
-fn build_middleware_failure_response(policy_name: &str) -> Vec<u8> {
-    build_middleware_platform_response(policy_name, "403 Forbidden")
+fn build_middleware_failure_response(policy_name: &str, request_id: Option<&str>) -> Vec<u8> {
+    build_middleware_platform_response(policy_name, "403 Forbidden", request_id)
 }
 
-fn build_middleware_unavailable_response(policy_name: &str) -> Vec<u8> {
-    build_middleware_platform_response(policy_name, "503 Service Unavailable")
+fn build_middleware_unavailable_response(policy_name: &str, request_id: Option<&str>) -> Vec<u8> {
+    build_middleware_platform_response(policy_name, "503 Service Unavailable", request_id)
 }
 
-fn build_middleware_platform_response(policy_name: &str, status: &str) -> Vec<u8> {
-    let body = serde_json::json!({
+fn build_middleware_platform_response(
+    policy_name: &str,
+    status: &str,
+    request_id: Option<&str>,
+) -> Vec<u8> {
+    let mut body = serde_json::json!({
         "error": "middleware_failed",
         "detail": "Request could not be processed by configured middleware",
         "policy": policy_name,
     });
+    if let (Some(request_id), serde_json::Value::Object(fields)) = (request_id, &mut body) {
+        fields.insert("request_id".to_string(), serde_json::json!(request_id));
+    }
     let body_str = body.to_string();
+    let request_id_header = request_id.map_or_else(String::new, |request_id| {
+        format!(
+            "{}: {request_id}\r\n",
+            openshell_core::token_grant_failure::REQUEST_ID_HEADER
+        )
+    });
     format!(
         "HTTP/1.1 {status}\r\n\
          Content-Type: application/json\r\n\
          Content-Length: {}\r\n\
+         {request_id_header}\
          Connection: close\r\n\
          \r\n\
          {}",
@@ -10405,7 +10710,7 @@ network_policies:
 
     #[test]
     fn middleware_failure_response_uses_platform_text_without_policy_guidance() {
-        let response = build_middleware_failure_response("api-policy");
+        let response = build_middleware_failure_response("api-policy", None);
         let response = String::from_utf8(response).expect("UTF-8 error response");
         let (_, body) = response.split_once("\r\n\r\n").expect("HTTP response");
         let body: serde_json::Value = serde_json::from_str(body).expect("JSON response");
@@ -10423,7 +10728,7 @@ network_policies:
 
     #[test]
     fn middleware_unavailable_response_is_complete_and_has_no_retry_hint() {
-        let response = build_middleware_unavailable_response("api-policy");
+        let response = build_middleware_unavailable_response("api-policy", None);
         let response = String::from_utf8(response).expect("UTF-8 error response");
         assert!(response.starts_with("HTTP/1.1 503 Service Unavailable\r\n"));
         assert!(!response.to_ascii_lowercase().contains("retry-after"));
@@ -14999,6 +15304,7 @@ network_policies:
                 config_name: "prototype-content-guard".into(),
                 reason_code: Some("content_match".into()),
             },
+            None,
         );
         let resp_str = String::from_utf8(resp).unwrap();
         let body_start = resp_str.find("\r\n\r\n").unwrap() + 4;
