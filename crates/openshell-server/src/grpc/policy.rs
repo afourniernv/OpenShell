@@ -57,11 +57,11 @@ use openshell_core::proto::{
     AddAllowRules as ProtoAddAllowRules, AddDenyRules as ProtoAddDenyRules,
     ApproveAllDraftChunksRequest, ApproveAllDraftChunksResponse, ApproveDraftChunkRequest,
     ApproveDraftChunkResponse, ClearDraftChunksRequest, ClearDraftChunksResponse,
-    DraftHistoryEntry, EditDraftChunkRequest, EditDraftChunkResponse, EffectiveSetting,
-    GetDraftHistoryRequest, GetDraftHistoryResponse, GetDraftPolicyRequest, GetDraftPolicyResponse,
-    GetGatewayConfigRequest, GetGatewayConfigResponse, GetSandboxConfigRequest,
-    GetSandboxConfigResponse, GetSandboxLogsRequest, GetSandboxLogsResponse,
-    GetSandboxPolicyStatusRequest, GetSandboxPolicyStatusResponse,
+    DraftChunkApproval, DraftHistoryEntry, EditDraftChunkRequest, EditDraftChunkResponse,
+    EffectiveSetting, GetDraftHistoryRequest, GetDraftHistoryResponse, GetDraftPolicyRequest,
+    GetDraftPolicyResponse, GetGatewayConfigRequest, GetGatewayConfigResponse,
+    GetSandboxConfigRequest, GetSandboxConfigResponse, GetSandboxLogsRequest,
+    GetSandboxLogsResponse, GetSandboxPolicyStatusRequest, GetSandboxPolicyStatusResponse,
     L7RuleTarget as ProtoL7RuleTarget, ListSandboxPoliciesRequest, ListSandboxPoliciesResponse,
     PolicyChunk, PolicyMergeOperation, PolicySource, PolicyStatus, ProviderEnvironmentSnapshot,
     ProviderEnvironmentValue, ProviderEnvironmentValueClassification, ProviderReadinessReason,
@@ -74,9 +74,11 @@ use openshell_core::proto::{
 use openshell_core::proto::{
     GetSandboxProviderEnvironmentRequest, GetSandboxProviderEnvironmentResponse,
 };
+#[cfg(test)]
+use openshell_core::proto::{L7DenyRule, L7Rule, NetworkBinary};
 use openshell_core::proto::{
-    L7DenyRule, L7Rule, NetworkBinary, NetworkEndpoint, NetworkPolicyRule, Provider, Sandbox,
-    SandboxPolicy as ProtoSandboxPolicy, StaticCredentialEndpointBinding,
+    NetworkEndpoint, NetworkPolicyRule, Provider, Sandbox, SandboxPolicy as ProtoSandboxPolicy,
+    StaticCredentialEndpointBinding,
 };
 use openshell_core::telemetry::{
     LifecycleOperation, LifecycleResource, PolicyDecisionOperation, TelemetryOutcome,
@@ -86,9 +88,7 @@ use openshell_core::{
     host_pattern::{host_matches, host_patterns_overlap},
     settings::{self, SettingValueKind},
 };
-use openshell_ocsf::{
-    ConfigStateChangeBuilder, OcsfEvent, SeverityId, StateId, StatusId, sanitize_reason_for_audit,
-};
+use openshell_ocsf::{ConfigStateChangeBuilder, OcsfEvent, SeverityId, StateId, StatusId};
 use openshell_policy::{
     L7BinaryScope, L7RuleTarget, PolicyMergeOp, ProviderPolicyLayer, canonicalize_advisor_add_rule,
     compose_effective_policy, merge_policy, policy_covers_rule, serialize_sandbox_policy,
@@ -139,6 +139,12 @@ const STORED_POLICY_SOURCE_SPEC: &str = "sandbox spec policy";
 const STORED_POLICY_SOURCE_GLOBAL: &str = "global policy setting";
 /// Maximum number of optimistic retry attempts for policy version conflicts.
 const MERGE_RETRY_LIMIT: usize = 5;
+/// Agent-authored policy fields may be arbitrarily large. Keep audit messages
+/// useful without allowing one proposal to create unbounded telemetry.
+const MAX_TELEMETRY_SUMMARY_CHARS: usize = 512;
+const MAX_TELEMETRY_FIELD_CHARS: usize = 96;
+/// Keep one proposal submission from monopolizing the sandbox mutation lock.
+const MAX_SUBMIT_POLICY_ANALYSIS_CHUNKS: usize = 64;
 
 /// Push a committed sandbox-scoped change to the sandbox's supervisor.
 fn publish_sandbox_config_update(state: &Arc<ServerState>, sandbox_id: &str) {
@@ -299,17 +305,129 @@ fn emit_gateway_policy_audit_log(
     ));
 }
 
+struct GatewayPolicyDecision<'a> {
+    chunk_id: Option<&'a str>,
+    action: &'static str,
+    reason: GatewayPolicyDecisionReason,
+    actor_class: &'static str,
+    actor: &'a str,
+    version: i64,
+    policy_hash: &'a str,
+}
+
+#[derive(Clone, Copy)]
+enum GatewayPolicyDecisionReason {
+    Approval,
+    Covered,
+    Redundant,
+    Reviewer,
+    Superseded,
+    Undo,
+}
+
+impl GatewayPolicyDecisionReason {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Approval => "approval",
+            Self::Covered => "covered",
+            Self::Redundant => "redundant",
+            Self::Reviewer => "reviewer",
+            Self::Superseded => "superseded",
+            Self::Undo => "undo",
+        }
+    }
+}
+
+fn emit_gateway_policy_decision_audit_log(
+    sandbox_id: &str,
+    sandbox_name: &str,
+    state_label: &str,
+    decision: GatewayPolicyDecision<'_>,
+    extra_fields: &[(&str, String)],
+) {
+    let mut audit_fields = Vec::with_capacity(extra_fields.len() + 6);
+    if let Some(chunk_id) = decision.chunk_id {
+        audit_fields.push(("chunk_id", chunk_id.to_string()));
+    }
+    audit_fields.push(("actor", decision.actor.to_string()));
+    audit_fields.push(("actor_class", decision.actor_class.to_string()));
+    audit_fields.push(("action", decision.action.to_string()));
+    audit_fields.push(("decision_reason", decision.reason.as_str().to_string()));
+    audit_fields.push(("outcome", "success".to_string()));
+    audit_fields.extend(extra_fields.iter().cloned());
+
+    let event = build_gateway_policy_audit_event(
+        sandbox_id,
+        sandbox_name,
+        state_label,
+        format!("gateway policy {} decision", decision.action),
+        decision.version,
+        decision.policy_hash,
+        &audit_fields,
+    );
+    let span = tracing::info_span!(
+        "openshell.policy.decision",
+        "openshell.sandbox.id" = %sandbox_id,
+        "openshell.policy.proposal.chunk_id" = tracing::field::Empty,
+        "openshell.policy.action" = decision.action,
+        "openshell.policy.decision_reason" = decision.reason.as_str(),
+        "openshell.policy.actor_class" = decision.actor_class,
+        "openshell.policy.outcome" = "success",
+        "openshell.policy.version" = tracing::field::Empty,
+        "openshell.policy.hash" = tracing::field::Empty,
+    );
+    if let Some(chunk_id) = decision.chunk_id {
+        span.record("openshell.policy.proposal.chunk_id", chunk_id);
+    }
+    if decision.version > 0 {
+        span.record("openshell.policy.version", decision.version);
+    }
+    if !decision.policy_hash.is_empty() {
+        span.record("openshell.policy.hash", decision.policy_hash);
+    }
+    openshell_otel::with_span_context(&span, || {
+        span.in_scope(|| openshell_ocsf::ocsf_emit!(event));
+    });
+}
+
+fn emit_gateway_policy_approve_audit_log(
+    sandbox_id: &str,
+    sandbox_name: &str,
+    chunk_id: &str,
+    version: i64,
+    policy_hash: &str,
+    actor: &str,
+    actor_class: &'static str,
+) {
+    emit_gateway_policy_decision_audit_log(
+        sandbox_id,
+        sandbox_name,
+        "approved",
+        GatewayPolicyDecision {
+            chunk_id: Some(chunk_id),
+            action: "approve",
+            reason: GatewayPolicyDecisionReason::Approval,
+            actor_class,
+            actor,
+            version,
+            policy_hash,
+        },
+        &[],
+    );
+}
+
 /// Emit a `CONFIG:APPROVED` audit event for an auto-approval — same event
 /// class as a human approval, with extra unmapped fields carrying the
 /// safety reasoning so the audit is reconstructable. `source` records the
 /// proposer (`mechanistic` or `agent_authored`) for provenance.
 /// `resolved_from` records the scope that supplied the `auto` mode setting
 /// (`gateway`, `sandbox`, or `default`) so operators can see why a given
-/// approval was auto vs manual.
+/// approval was auto vs manual. The message remains structural; proposal
+/// content stays in the governed chunk record instead of telemetry.
 fn emit_gateway_policy_auto_approve_audit_log(
     sandbox_id: &str,
     sandbox_name: &str,
-    detail: impl Into<String>,
+    chunk_id: &str,
     version: i64,
     policy_hash: &str,
     source: &str,
@@ -317,49 +435,221 @@ fn emit_gateway_policy_auto_approve_audit_log(
 ) {
     let extra = [
         ("auto", "true".to_string()),
-        ("source", source.to_string()),
+        ("source", canonical_analysis_mode(source).to_string()),
         ("prover_delta", "empty".to_string()),
         ("resolved_from", resolved_from.to_string()),
     ];
-    openshell_ocsf::ocsf_emit!(build_gateway_policy_audit_event(
+    emit_gateway_policy_decision_audit_log(
         sandbox_id,
         sandbox_name,
         "approved",
-        detail,
-        version,
-        policy_hash,
+        GatewayPolicyDecision {
+            chunk_id: Some(chunk_id),
+            action: "auto_approve",
+            reason: GatewayPolicyDecisionReason::Approval,
+            actor_class: "gateway",
+            actor: "gateway:auto",
+            version,
+            policy_hash,
+        },
         &extra,
-    ));
+    );
 }
 
 /// Actor recorded when the gateway rejects a chunk without a reviewer.
 const AUTO_REJECT_ACTOR: &str = "gateway:auto";
 
+struct GatewayPolicyRejectDecision<'a> {
+    rejection_reason: &'a str,
+    decision_reason: GatewayPolicyDecisionReason,
+    actor: &'a str,
+    actor_class: &'static str,
+    version: i64,
+    policy_hash: &'a str,
+}
+
 /// Emit `CONFIG:REJECTED` once a chunk is durably rejected, whether a
-/// reviewer or the gateway decided. Unlike the sandbox `/wait` event, this
-/// fires whether or not anyone is watching the chunk.
+/// reviewer or the gateway decided. This gateway event is the authoritative
+/// lifecycle record; sandbox status reads do not emit a duplicate.
 fn emit_gateway_policy_reject_audit_log(
     sandbox: &Sandbox,
     chunk: &DraftChunkRecord,
-    reason: &str,
-    actor: &str,
+    decision: GatewayPolicyRejectDecision<'_>,
 ) {
-    let summary = summarize_draft_chunk_rule(chunk)
-        .unwrap_or_else(|_| format!("rule_name:{}", chunk.rule_name));
-    let extra = [
-        ("chunk_id", chunk.id.clone()),
-        ("rejection_reason", sanitize_reason_for_audit(reason)),
-        ("actor", actor.to_string()),
-    ];
-    openshell_ocsf::ocsf_emit!(build_gateway_policy_audit_event(
+    let extra = [(
+        "rejection_reason_present",
+        (!decision.rejection_reason.trim().is_empty()).to_string(),
+    )];
+    emit_gateway_policy_decision_audit_log(
         sandbox.object_id(),
         sandbox.object_name(),
         "rejected",
-        format!("gateway rejected draft chunk {}: {summary}", chunk.id),
-        0,
-        "",
+        GatewayPolicyDecision {
+            chunk_id: Some(&chunk.id),
+            action: "reject",
+            reason: decision.decision_reason,
+            actor_class: decision.actor_class,
+            actor: decision.actor,
+            version: decision.version,
+            policy_hash: decision.policy_hash,
+        },
         &extra,
-    ));
+    );
+}
+
+fn emit_gateway_policy_undo_audit_log(
+    sandbox: &Sandbox,
+    chunk_id: &str,
+    actor: &str,
+    actor_class: &'static str,
+    version: i64,
+    policy_hash: &str,
+) {
+    emit_gateway_policy_decision_audit_log(
+        sandbox.object_id(),
+        sandbox.object_name(),
+        "pending",
+        GatewayPolicyDecision {
+            chunk_id: Some(chunk_id),
+            action: "undo",
+            reason: GatewayPolicyDecisionReason::Undo,
+            actor_class,
+            actor,
+            version,
+            policy_hash,
+        },
+        &[("previous_status", "approved".to_string())],
+    );
+}
+
+fn emit_gateway_policy_edit_audit_log(
+    sandbox: &Sandbox,
+    chunk_id: &str,
+    actor: &str,
+    actor_class: &'static str,
+) {
+    emit_gateway_policy_decision_audit_log(
+        sandbox.object_id(),
+        sandbox.object_name(),
+        "pending",
+        GatewayPolicyDecision {
+            chunk_id: Some(chunk_id),
+            action: "edit",
+            reason: GatewayPolicyDecisionReason::Reviewer,
+            actor_class,
+            actor,
+            version: 0,
+            policy_hash: "",
+        },
+        &[],
+    );
+}
+
+fn emit_gateway_policy_clear_audit_log(
+    sandbox: &Sandbox,
+    actor: &str,
+    actor_class: &'static str,
+    cleared_count: u64,
+) {
+    emit_gateway_policy_decision_audit_log(
+        sandbox.object_id(),
+        sandbox.object_name(),
+        "cancelled",
+        GatewayPolicyDecision {
+            chunk_id: None,
+            action: "cancel_pending",
+            reason: GatewayPolicyDecisionReason::Reviewer,
+            actor_class,
+            actor,
+            version: 0,
+            policy_hash: "",
+        },
+        &[("operation_count", cleared_count.to_string())],
+    );
+}
+
+fn policy_actor_class(principal: &Principal) -> &'static str {
+    match principal {
+        Principal::User(_) => "user",
+        Principal::Operator(_) => "operator",
+        Principal::Sandbox(_) => "sandbox",
+        Principal::Peer(_) => "peer",
+        Principal::Supervisor(_) => "supervisor",
+        Principal::Anonymous => "anonymous",
+    }
+}
+
+/// Collapse the untrusted protobuf string to the only provenance labels the
+/// gateway understands. Unknown/future values retain conservative proposal
+/// behavior, but never become arbitrary tracing or OCSF attributes.
+fn canonical_analysis_mode(analysis_mode: &str) -> &'static str {
+    match analysis_mode {
+        "mechanistic" => "mechanistic",
+        "agent_authored" => "agent_authored",
+        _ => "unknown",
+    }
+}
+
+fn validate_submit_policy_analysis_chunk_count(chunk_count: usize) -> Result<(), Status> {
+    if chunk_count > MAX_SUBMIT_POLICY_ANALYSIS_CHUNKS {
+        return Err(Status::invalid_argument(format!(
+            "proposed_chunks exceeds the maximum of {MAX_SUBMIT_POLICY_ANALYSIS_CHUNKS}"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_unique_bulk_approval_chunk_ids(approvals: &[DraftChunkApproval]) -> Result<(), Status> {
+    let mut seen = HashSet::with_capacity(approvals.len());
+    if let Some(duplicate) = approvals
+        .iter()
+        .map(|approval| approval.chunk_id.as_str())
+        .find(|chunk_id| !seen.insert(*chunk_id))
+    {
+        return Err(Status::invalid_argument(format!(
+            "duplicate chunk_id '{duplicate}' in bulk approval"
+        )));
+    }
+    Ok(())
+}
+
+#[derive(Default)]
+struct MergeOperationKindCounts {
+    add_rule: usize,
+    remove_endpoint: usize,
+    remove_rule: usize,
+    add_deny_rules: usize,
+    add_allow_rules: usize,
+    remove_binary: usize,
+}
+
+impl MergeOperationKindCounts {
+    fn from_operations(operations: &[PolicyMergeOp]) -> Self {
+        let mut counts = Self::default();
+        for operation in operations {
+            match operation {
+                PolicyMergeOp::AddRule { .. } => counts.add_rule += 1,
+                PolicyMergeOp::RemoveEndpoint { .. } => counts.remove_endpoint += 1,
+                PolicyMergeOp::RemoveRule { .. } => counts.remove_rule += 1,
+                PolicyMergeOp::AddDenyRules { .. } => counts.add_deny_rules += 1,
+                PolicyMergeOp::AddAllowRules { .. } => counts.add_allow_rules += 1,
+                PolicyMergeOp::RemoveBinary { .. } => counts.remove_binary += 1,
+            }
+        }
+        counts
+    }
+
+    fn summary(&self) -> String {
+        format!(
+            "add_rule={},remove_endpoint={},remove_rule={},add_deny_rules={},add_allow_rules={},remove_binary={}",
+            self.add_rule,
+            self.remove_endpoint,
+            self.remove_rule,
+            self.add_deny_rules,
+            self.add_allow_rules,
+            self.remove_binary,
+        )
+    }
 }
 
 fn build_gateway_policy_audit_event(
@@ -376,7 +666,10 @@ fn build_gateway_policy_audit_event(
         .state(StateId::Other, state_label)
         .severity(SeverityId::Informational)
         .status(StatusId::Success)
-        .message(detail.into());
+        .message(sanitize_telemetry_text(
+            &detail.into(),
+            MAX_TELEMETRY_SUMMARY_CHARS,
+        ));
     if version > 0 {
         builder = builder.unmapped("policy_version", format!("v{version}"));
     }
@@ -384,69 +677,60 @@ fn build_gateway_policy_audit_event(
         builder = builder.unmapped("policy_hash", policy_hash.to_string());
     }
     for (key, value) in extra_fields {
-        builder = builder.unmapped(key, value.clone());
+        builder = builder.unmapped(
+            key,
+            sanitize_telemetry_text(value, MAX_TELEMETRY_FIELD_CHARS),
+        );
     }
     builder.build()
 }
 
-fn summarize_cli_policy_merge_op(operation: &PolicyMergeOp) -> String {
-    match operation {
-        PolicyMergeOp::AddRule { rule_name, rule } => summarize_add_endpoint(rule_name, rule),
-        PolicyMergeOp::RemoveEndpoint {
-            rule_name,
-            host,
-            port,
-        } => rule_name.as_ref().map_or_else(
-            || format!("remove-endpoint {host}:{port}"),
-            |rule_name| format!("remove-endpoint {host}:{port} from rule {rule_name}"),
-        ),
-        PolicyMergeOp::RemoveRule { rule_name } => format!("remove-rule {rule_name}"),
-        PolicyMergeOp::AddDenyRules { target, deny_rules } => format!(
-            "add-deny {} [{}]",
-            summarize_l7_target(target),
-            deny_rules
-                .iter()
-                .map(summarize_l7_deny_rule)
-                .collect::<Vec<_>>()
-                .join(", ")
-        ),
-        PolicyMergeOp::AddAllowRules { target, rules } => format!(
-            "add-allow {} [{}]",
-            summarize_l7_target(target),
-            rules
-                .iter()
-                .map(summarize_l7_rule)
-                .collect::<Vec<_>>()
-                .join(", ")
-        ),
-        PolicyMergeOp::RemoveBinary {
-            rule_name,
-            binary_path,
-        } => format!("remove-binary {rule_name} {binary_path}"),
+/// Normalize untrusted text before it reaches tracing/OCSF. Control
+/// characters become ordinary spaces, whitespace runs collapse, and the
+/// final value is capped on a character boundary.
+fn sanitize_telemetry_text(input: &str, max_chars: usize) -> String {
+    if max_chars == 0 {
+        return String::new();
     }
-}
 
-fn summarize_l7_target(target: &L7RuleTarget) -> String {
-    let ports = target
-        .ports
-        .iter()
-        .map(u32::to_string)
-        .collect::<Vec<_>>()
-        .join(",");
-    let binaries = match &target.binaries {
-        L7BinaryScope::Any => "any".to_string(),
-        L7BinaryScope::Restricted(binaries) => binaries
-            .iter()
-            .map(|binary| binary.path.as_str())
-            .collect::<Vec<_>>()
-            .join(", "),
-    };
-    // Preserve optional path presence in the audit trail: None means unique
-    // endpoint selection, while Some("") selects an endpoint with no path scope.
-    format!(
-        "{}:{ports} rule={} endpoint-path={:?} binaries=[{binaries}]",
-        target.host, target.rule_name, target.path,
-    )
+    let mut normalized = String::with_capacity(input.len().min(max_chars));
+    let mut char_count = 0_usize;
+    let mut pending_space = false;
+    let mut truncated = false;
+    for mut character in input.chars() {
+        if character.is_control() {
+            character = ' ';
+        }
+        if character.is_whitespace() {
+            pending_space = !normalized.is_empty();
+            continue;
+        }
+        if pending_space {
+            if char_count == max_chars {
+                truncated = true;
+                break;
+            }
+            normalized.push(' ');
+            char_count += 1;
+            pending_space = false;
+        }
+        if char_count == max_chars {
+            truncated = true;
+            break;
+        }
+        normalized.push(character);
+        char_count += 1;
+    }
+
+    if !truncated {
+        return normalized;
+    }
+    let suffix_len = max_chars.min(3);
+    for _ in 0..suffix_len {
+        normalized.pop();
+    }
+    normalized.extend(std::iter::repeat_n('.', suffix_len));
+    normalized
 }
 
 fn ensure_chunk_belongs_to_sandbox(
@@ -457,143 +741,6 @@ fn ensure_chunk_belongs_to_sandbox(
         return Err(Status::not_found("chunk not found"));
     }
     Ok(())
-}
-
-fn summarize_add_endpoint(rule_name: &str, rule: &NetworkPolicyRule) -> String {
-    let endpoints = rule
-        .endpoints
-        .iter()
-        .map(summarize_endpoint)
-        .collect::<Vec<_>>()
-        .join(", ");
-    let binaries = summarize_binaries(&rule.binaries);
-    format!("add-endpoint {rule_name} endpoints=[{endpoints}] binaries=[{binaries}]")
-}
-
-fn summarize_add_rule(rule_name: &str, rule: &NetworkPolicyRule) -> String {
-    let endpoints = rule
-        .endpoints
-        .iter()
-        .map(summarize_endpoint)
-        .collect::<Vec<_>>()
-        .join(", ");
-    let binaries = summarize_binaries(&rule.binaries);
-    format!("add-rule {rule_name} endpoints=[{endpoints}] binaries=[{binaries}]")
-}
-
-fn summarize_endpoint(endpoint: &NetworkEndpoint) -> String {
-    let mut parts = vec![format!("{}:{}", endpoint.host, endpoint.port)];
-    if !endpoint.protocol.is_empty() {
-        parts.push(format!("protocol={}", endpoint.protocol));
-    }
-    if endpoint.access != 0 {
-        parts.push(format!(
-            "access={}",
-            openshell_policy::network_access_preset_to_str(endpoint.access).unwrap_or("unknown")
-        ));
-    }
-    if endpoint.enforcement != 0 {
-        parts.push(format!(
-            "enforcement={}",
-            openshell_policy::network_enforcement_mode_to_str(endpoint.enforcement)
-                .unwrap_or("unknown")
-        ));
-    }
-    if endpoint.tls != 0 {
-        parts.push(format!(
-            "tls={}",
-            openshell_policy::network_tls_mode_to_str(endpoint.tls).unwrap_or("unknown")
-        ));
-    }
-    if endpoint.websocket_credential_rewrite {
-        parts.push("websocket_credential_rewrite=true".to_string());
-    }
-    if endpoint.request_body_credential_rewrite {
-        parts.push("request_body_credential_rewrite=true".to_string());
-    }
-    if endpoint.allow_uninspected_credentials {
-        parts.push("allow_uninspected_credentials=true".to_string());
-    }
-    if !endpoint.allowed_ips.is_empty() {
-        parts.push(format!("allowed_ips={}", endpoint.allowed_ips.len()));
-    }
-    if !endpoint.ports.is_empty() {
-        parts.push(format!("ports={}", endpoint.ports.len()));
-    }
-    if !endpoint.rules.is_empty() {
-        parts.push(format!(
-            "allow=[{}]",
-            endpoint
-                .rules
-                .iter()
-                .map(summarize_l7_rule)
-                .collect::<Vec<_>>()
-                .join(", ")
-        ));
-    }
-    if !endpoint.deny_rules.is_empty() {
-        parts.push(format!(
-            "deny=[{}]",
-            endpoint
-                .deny_rules
-                .iter()
-                .map(summarize_l7_deny_rule)
-                .collect::<Vec<_>>()
-                .join(", ")
-        ));
-    }
-    parts.join(" ")
-}
-
-fn summarize_l7_rule(rule: &L7Rule) -> String {
-    let Some(allow) = rule.allow.as_ref() else {
-        return "allow".to_string();
-    };
-    summarize_l7_match(
-        &allow.method,
-        &allow.path,
-        &allow.command,
-        allow.query.len(),
-    )
-}
-
-fn summarize_l7_deny_rule(rule: &L7DenyRule) -> String {
-    summarize_l7_match(&rule.method, &rule.path, &rule.command, rule.query.len())
-}
-
-fn summarize_l7_match(method: &str, path: &str, command: &str, query_count: usize) -> String {
-    let mut parts = Vec::new();
-    if !method.is_empty() {
-        parts.push(method.to_string());
-    }
-    if !path.is_empty() {
-        parts.push(path.to_string());
-    }
-    if !command.is_empty() {
-        parts.push(format!("command={}", truncate_for_log(command, 48)));
-    }
-    if query_count > 0 {
-        parts.push(format!("query_keys={query_count}"));
-    }
-    if parts.is_empty() {
-        "rule".to_string()
-    } else {
-        parts.join(" ")
-    }
-}
-
-fn summarize_binaries(binaries: &[NetworkBinary]) -> String {
-    binaries
-        .iter()
-        .map(|binary| binary.path.as_str())
-        .collect::<Vec<_>>()
-        .join(", ")
-}
-
-fn summarize_draft_chunk_rule(chunk: &DraftChunkRecord) -> Result<String, Status> {
-    let rule = NetworkPolicyRule::decode(chunk.proposed_rule.as_slice())
-        .map_err(|e| Status::internal(format!("decode proposed_rule failed: {e}")))?;
-    Ok(summarize_add_rule(&chunk.rule_name, &rule))
 }
 
 /// Run prover queries against the merged policy and render a short
@@ -1139,12 +1286,18 @@ fn one_line(s: &str) -> String {
         .join("; ")
 }
 
-async fn reconcile_pending_chunks_covered_by_policy(
+/// Reconcile pending chunks while the caller holds this sandbox's distributed
+/// mutation guard. Keeping the status transition and its authoritative event
+/// in the same critical section prevents an approval or undo from being
+/// recorded between them.
+async fn reconcile_pending_chunks_covered_by_policy_locked(
     state: &Arc<ServerState>,
-    sandbox_id: &str,
+    sandbox: &Sandbox,
     effective_policy: &ProtoSandboxPolicy,
     policy_version: i64,
+    policy_hash: &str,
 ) -> Result<u32, Status> {
+    let sandbox_id = sandbox.object_id();
     let pending = state
         .store
         .list_draft_chunks(sandbox_id, Some("pending"))
@@ -1166,6 +1319,18 @@ async fn reconcile_pending_chunks_covered_by_policy(
             .map_err(|error| Status::internal(format!("reconcile covered chunk failed: {error}")))?
         {
             reconciled += 1;
+            emit_gateway_policy_reject_audit_log(
+                sandbox,
+                &chunk,
+                GatewayPolicyRejectDecision {
+                    rejection_reason: &reason,
+                    decision_reason: GatewayPolicyDecisionReason::Covered,
+                    actor: AUTO_REJECT_ACTOR,
+                    actor_class: "gateway",
+                    version: policy_version,
+                    policy_hash,
+                },
+            );
         }
     }
     if reconciled > 0 {
@@ -1174,7 +1339,9 @@ async fn reconcile_pending_chunks_covered_by_policy(
     Ok(reconciled)
 }
 
-async fn reconcile_pending_chunks_after_policy_change(
+/// Recompute the live policy and reconcile pending chunks while the caller
+/// holds this sandbox's distributed mutation guard.
+async fn reconcile_pending_chunks_after_policy_change_locked(
     state: &Arc<ServerState>,
     workspace: &str,
     sandbox: &Sandbox,
@@ -1197,7 +1364,8 @@ async fn reconcile_pending_chunks_after_policy_change(
         .await
         .map_err(|error| Status::internal(format!("fetch latest policy failed: {error}")))?
         .map_or(0, |record| record.version);
-    reconcile_pending_chunks_covered_by_policy(state, sandbox.object_id(), &effective, version)
+    let hash = deterministic_policy_hash(&effective);
+    reconcile_pending_chunks_covered_by_policy_locked(state, sandbox, &effective, version, &hash)
         .await
 }
 
@@ -1357,7 +1525,7 @@ async fn refresh_pending_chunk_evaluation(
 /// Failures (DB error, scan error) are logged via `warn!` and the function
 /// returns silently. The new chunk's persistence has already succeeded;
 /// failing this cleanup pass should not abort the submission flow.
-async fn supersede_other_pending_chunks_for_endpoint(
+async fn supersede_other_pending_chunks_for_endpoint_locked(
     state: &Arc<ServerState>,
     sandbox: &Sandbox,
     new_chunk_id: &str,
@@ -1371,6 +1539,19 @@ async fn supersede_other_pending_chunks_for_endpoint(
         return;
     }
     let sandbox_id = sandbox.object_id();
+    let new_chunk = match state.store.get_draft_chunk(new_chunk_id).await {
+        Ok(Some(chunk)) if chunk.status == "pending" => chunk,
+        Ok(_) => return,
+        Err(err) => {
+            warn!(
+                sandbox_id = %sandbox_id,
+                chunk_id = %new_chunk_id,
+                error = %err,
+                "supersede winner lookup failed; older pending chunks remain pending"
+            );
+            return;
+        }
+    };
 
     let pending = match state
         .store
@@ -1390,10 +1571,15 @@ async fn supersede_other_pending_chunks_for_endpoint(
 
     let now_ms = current_time_ms();
     for other in pending {
+        // Concurrent submissions can scan in either order. Use one stable
+        // total order so they cannot reject each other; the later timestamp
+        // wins, with the server-generated id breaking timestamp ties.
         if other.id == new_chunk_id
             || other.host != host
             || other.port != port
             || other.binary != binary
+            || (other.created_at_ms, other.id.as_str())
+                >= (new_chunk.created_at_ms, new_chunk.id.as_str())
         {
             continue;
         }
@@ -1401,20 +1587,35 @@ async fn supersede_other_pending_chunks_for_endpoint(
         let reason = format!("superseded by chunk {new_chunk_id}");
         match state
             .store
-            .update_draft_chunk_status(&other.id, "rejected", Some(now_ms), Some(&reason))
+            .conditionally_reject_draft_chunk(&other.id, now_ms, &reason)
             .await
         {
-            Ok(_) => {
+            Ok(true) => {
                 info!(
                     sandbox_id = %sandbox_id,
                     superseded_chunk = %other.id,
                     by_chunk = %new_chunk_id,
-                    host = %host,
-                    port = port,
-                    binary = %binary,
                     "Auto-rejected pending chunk: superseded by newer submission for same (host, port, binary)"
                 );
-                emit_gateway_policy_reject_audit_log(sandbox, &other, &reason, AUTO_REJECT_ACTOR);
+                emit_gateway_policy_reject_audit_log(
+                    sandbox,
+                    &other,
+                    GatewayPolicyRejectDecision {
+                        rejection_reason: &reason,
+                        decision_reason: GatewayPolicyDecisionReason::Superseded,
+                        actor: AUTO_REJECT_ACTOR,
+                        actor_class: "gateway",
+                        version: 0,
+                        policy_hash: "",
+                    },
+                );
+            }
+            Ok(false) => {
+                debug!(
+                    sandbox_id = %sandbox_id,
+                    chunk_id = %other.id,
+                    "supersede auto-reject skipped: chunk no longer pending"
+                );
             }
             Err(err) => {
                 warn!(
@@ -1434,7 +1635,7 @@ async fn supersede_other_pending_chunks_for_endpoint(
 ///
 /// `agent_authored` submissions are NEVER self-rejected — that path remains
 /// open for refinement. Only the mechanistic side is asymmetric.
-async fn self_reject_mechanistic_if_already_covered(
+async fn self_reject_mechanistic_if_already_covered_locked(
     state: &Arc<ServerState>,
     sandbox: &Sandbox,
     new_chunk_id: &str,
@@ -1512,12 +1713,20 @@ async fn self_reject_mechanistic_if_already_covered(
                 sandbox_id = %sandbox_id,
                 chunk_id = %new_chunk_id,
                 covering_chunk = %covering.id,
-                host = %host,
-                port = port,
-                binary = %binary,
                 "Auto-rejected incoming mechanistic chunk: endpoint already covered by an approved chunk"
             );
-            emit_gateway_policy_reject_audit_log(sandbox, &incoming, &reason, AUTO_REJECT_ACTOR);
+            emit_gateway_policy_reject_audit_log(
+                sandbox,
+                &incoming,
+                GatewayPolicyRejectDecision {
+                    rejection_reason: &reason,
+                    decision_reason: GatewayPolicyDecisionReason::Redundant,
+                    actor: AUTO_REJECT_ACTOR,
+                    actor_class: "gateway",
+                    version: 0,
+                    policy_hash: "",
+                },
+            );
         }
         Ok(false) => {
             info!(
@@ -1543,9 +1752,9 @@ async fn self_reject_mechanistic_if_already_covered(
 /// this chunk.
 ///
 /// `source` is the `analysis_mode` of the originating submission
-/// (`mechanistic` or `agent_authored`). The audit copy says "auto-approved:
-/// no new prover findings" — never "safe" — because the claim is about the
-/// prover's reasoning, not the world.
+/// (`mechanistic` or `agent_authored`). The structured `prover_delta=empty`
+/// field records why the gateway auto-approved without copying proposal text
+/// into telemetry.
 /// Resolve the effective proposal-approval mode for a sandbox.
 ///
 /// Precedence (matches the rest of the settings model): gateway scope wins
@@ -1800,14 +2009,14 @@ struct AutoApproveChunkContext<'a> {
     resolved_from: &'a str,
 }
 
-async fn auto_approve_chunk(
+async fn auto_approve_chunk_locked(
     state: &Arc<ServerState>,
     chunk_id: &str,
     context: AutoApproveChunkContext<'_>,
 ) -> Result<(), Status> {
     let sandbox_id = context.sandbox.object_id();
     let sandbox_name = context.sandbox.object_name();
-
+    let source_label = canonical_analysis_mode(context.source);
     // Same gate the human-driven approve paths apply: if a global policy is
     // active, sandbox-scoped chunk approvals are meaningless because
     // `GetSandboxConfig` prefers the global policy. Auto-approving here
@@ -1843,9 +2052,8 @@ async fn auto_approve_chunk(
         info!(
             sandbox_id = %sandbox_id,
             chunk_id = %chunk_id,
-            rule_name = %chunk.rule_name,
-            validation_result = %validation_result,
-            source = %context.source,
+            prover_findings_present = true,
+            source = %source_label,
             resolved_from = %context.resolved_from,
             "Auto-approval skipped: current stored rule has prover findings"
         );
@@ -1857,9 +2065,8 @@ async fn auto_approve_chunk(
         info!(
             sandbox_id = %sandbox_id,
             chunk_id = %chunk_id,
-            rule_name = %chunk.rule_name,
-            security_notes = %security_notes,
-            source = %context.source,
+            security_flagged = true,
+            source = %source_label,
             resolved_from = %context.resolved_from,
             "Auto-approval skipped: current rule is security-flagged"
         );
@@ -1899,20 +2106,26 @@ async fn auto_approve_chunk(
         }
     };
     crate::config_delivery::publish_sandbox(state, sandbox_id);
-    let chunk_summary = summarize_draft_chunk_rule(&chunk)?;
-
     let now_ms = current_time_ms();
     clear_pending_application_error(state, chunk_id).await;
-    state
+    let transitioned = state
         .store
         .update_draft_chunk_status(chunk_id, "approved", Some(now_ms), None)
         .await
         .map_err(|e| Status::internal(format!("update chunk status failed: {e}")))?;
+    if !transitioned {
+        return Err(Status::aborted(
+            "chunk disappeared while it was being auto-approved",
+        ));
+    }
 
     state.sandbox_watch_bus.notify(sandbox_id);
-    if let Err(error) =
-        reconcile_pending_chunks_after_policy_change(state, context.workspace, context.sandbox)
-            .await
+    if let Err(error) = reconcile_pending_chunks_after_policy_change_locked(
+        state,
+        context.workspace,
+        context.sandbox,
+    )
+    .await
     {
         warn!(
             sandbox_id,
@@ -1922,17 +2135,10 @@ async fn auto_approve_chunk(
     }
     spawn_pending_chunk_refresh(state, context.workspace, context.sandbox);
 
-    let source_label = if context.source.is_empty() {
-        "unspecified"
-    } else {
-        context.source
-    };
     emit_gateway_policy_auto_approve_audit_log(
         sandbox_id,
         sandbox_name,
-        format!(
-            "auto-approved: no new prover findings (source={source_label}) — chunk {chunk_id}: {chunk_summary}"
-        ),
+        chunk_id,
         version,
         &hash,
         source_label,
@@ -1942,7 +2148,6 @@ async fn auto_approve_chunk(
     info!(
         sandbox_id = %sandbox_id,
         chunk_id = %chunk_id,
-        rule_name = %chunk.rule_name,
         version = version,
         policy_hash = %hash,
         source = %source_label,
@@ -2603,16 +2808,6 @@ pub(super) async fn validate_candidate_sandbox_credential_policy(
     )
     .await?;
     validate_uninspected_credentialed_endpoints(&effective)
-}
-
-fn truncate_for_log(input: &str, max_chars: usize) -> String {
-    let mut chars = input.chars();
-    let truncated: String = chars.by_ref().take(max_chars).collect();
-    if chars.next().is_some() {
-        format!("{truncated}...")
-    } else {
-        truncated
-    }
 }
 
 #[cfg(test)]
@@ -4568,6 +4763,8 @@ async fn handle_update_config_inner(
             .ok_or_else(|| Status::internal("sandbox has no spec"))?;
         let merge_ops = parse_merge_operations(&req.merge_operations)?;
         validate_merge_operations_for_server(&merge_ops)?;
+        let merge_operation_summary =
+            MergeOperationKindCounts::from_operations(&merge_ops).summary();
         let merge_validation =
             sandbox_policy_merge_validation_data(state, &workspace, &sandbox, &spec.providers)
                 .await?;
@@ -4612,30 +4809,18 @@ async fn handle_update_config_inner(
             sandbox.object_name(),
             "merged",
             format!(
-                "gateway merged {} incremental policy operation(s)",
-                merge_ops.len()
+                "gateway merged {} incremental policy operation(s); kinds:{merge_operation_summary}",
+                merge_ops.len(),
             ),
             version,
             &hash,
         );
-        for operation in &merge_ops {
-            emit_gateway_policy_audit_log(
-                &sandbox_id,
-                sandbox.object_name(),
-                "merged",
-                format!(
-                    "gateway merged incremental policy op: {}",
-                    summarize_cli_policy_merge_op(operation)
-                ),
-                version,
-                &hash,
-            );
-        }
         info!(
             sandbox_id = %sandbox_id,
             version,
             policy_hash = %hash,
             operation_count = merge_ops.len(),
+            operation_kind_counts = %merge_operation_summary,
             "UpdateConfig: merged incremental policy operations"
         );
         spawn_pending_chunk_refresh(state, &workspace, &sandbox);
@@ -5517,6 +5702,7 @@ pub(super) async fn handle_submit_policy_analysis(
         .cloned()
         .ok_or_else(|| Status::unauthenticated("missing principal"))?;
     let req = request.into_inner();
+    let analysis_mode = canonical_analysis_mode(&req.analysis_mode);
     let workspace = super::workspace::resolve_workspace(
         state.store.as_ref(),
         selected_workspace_name(req.workspace_scope.as_ref())?,
@@ -5526,6 +5712,7 @@ pub(super) async fn handle_submit_policy_analysis(
     if req.name.is_empty() {
         return Err(Status::invalid_argument("name is required"));
     }
+    validate_submit_policy_analysis_chunk_count(req.proposed_chunks.len())?;
 
     let sandbox = resolve_sandbox_by_name_for_principal(
         state.store.as_ref(),
@@ -5551,6 +5738,18 @@ pub(super) async fn handle_submit_policy_analysis(
             accepted_chunk_ids: Vec::new(),
         }));
     }
+
+    // Proposal persistence, automatic decisions, and automatic approval share
+    // one sandbox mutation critical section with human approval/rejection/undo.
+    // Acquire before reading the policy baseline so a waiter cannot reconcile
+    // against state captured before another decision completed.
+    let _mutation_guard = state
+        .compute
+        .mutation_guard(MutationScope::sandbox(&workspace, &sandbox_id))
+        .await
+        .map_err(|error| {
+            super::persistence_error_to_status(error, "acquire policy mutation lock")
+        })?;
 
     // `current_policy` is captured ONCE at the top of the batch and frozen
     // for every chunk's delta computation, even if an earlier chunk in the
@@ -5578,11 +5777,12 @@ pub(super) async fn handle_submit_policy_analysis(
         .await
         .map_err(|error| Status::internal(format!("fetch latest policy failed: {error}")))?
         .map_or(0, |record| record.version);
-    reconcile_pending_chunks_covered_by_policy(
+    reconcile_pending_chunks_covered_by_policy_locked(
         state,
-        &sandbox_id,
+        &sandbox,
         &current_policy,
         active_policy_version,
+        &deterministic_policy_hash(&current_policy),
     )
     .await?;
     let current_base_policy =
@@ -5699,7 +5899,7 @@ pub(super) async fn handle_submit_policy_analysis(
         };
 
         let rule_ref = chunk.proposed_rule.as_ref().expect("checked above");
-        if req.analysis_mode == "agent_authored"
+        if analysis_mode == "agent_authored"
             && let Some(reason) = rule_ref.endpoints.iter().find_map(|endpoint| {
                 openshell_policy::agent_authored_transport_rejection(
                     &endpoint.protocol,
@@ -5720,7 +5920,7 @@ pub(super) async fn handle_submit_policy_analysis(
                 )
             })
         });
-        let existing_mechanistic = if req.analysis_mode == "mechanistic" {
+        let existing_mechanistic = if analysis_mode == "mechanistic" {
             let chunks = state
                 .store
                 .list_draft_chunks(&sandbox_id, None)
@@ -5760,7 +5960,7 @@ pub(super) async fn handle_submit_policy_analysis(
         let evaluation_mode = if existing_pending_rule.is_some() {
             "stored"
         } else {
-            req.analysis_mode.as_str()
+            analysis_mode
         };
         let reusable_validation = existing_mechanistic
             .as_ref()
@@ -5791,7 +5991,7 @@ pub(super) async fn handle_submit_policy_analysis(
                 None,
             );
         }
-        if req.analysis_mode != "mechanistic" && !evaluation.application_error.is_empty() {
+        if analysis_mode != "mechanistic" && !evaluation.application_error.is_empty() {
             rejected += 1;
             rejection_reasons.push(format!(
                 "chunk '{}': {}",
@@ -5848,7 +6048,7 @@ pub(super) async fn handle_submit_policy_analysis(
         // modes) submit each chunk as a distinct row — the redraft loop
         // relies on it, and the conservative default for an unknown mode
         // is to keep the proposal rather than silently fold it away.
-        let dedup_key = matches!(req.analysis_mode.as_str(), "mechanistic")
+        let dedup_key = matches!(analysis_mode, "mechanistic")
             .then(|| crate::policy_store::observation_dedup_key(&record));
         let effective_id = state
             .store
@@ -5874,7 +6074,7 @@ pub(super) async fn handle_submit_policy_analysis(
         // refine a mechanistic L4 draft into an L7 narrow proposal without
         // any explicit `supersedes_chunk_id` plumbing — the gateway figures
         // out the relationship by structural overlap.
-        supersede_other_pending_chunks_for_endpoint(
+        supersede_other_pending_chunks_for_endpoint_locked(
             state,
             &sandbox,
             &effective_id,
@@ -5890,8 +6090,8 @@ pub(super) async fn handle_submit_policy_analysis(
         // redundant — the agent already handled it. Auto-reject so it
         // doesn't pile up as approval-queue noise. Agent_authored
         // submissions never self-reject; refinement is always allowed.
-        if req.analysis_mode == "mechanistic" {
-            self_reject_mechanistic_if_already_covered(
+        if analysis_mode == "mechanistic" {
+            self_reject_mechanistic_if_already_covered_locked(
                 state,
                 &sandbox,
                 &effective_id,
@@ -5912,13 +6112,13 @@ pub(super) async fn handle_submit_policy_analysis(
         // string means findings or infrastructure error, both of which
         // require human attention.
         if auto_approve_enabled
-            && let Err(err) = Box::pin(auto_approve_chunk(
+            && let Err(err) = Box::pin(auto_approve_chunk_locked(
                 state,
                 &effective_id,
                 AutoApproveChunkContext {
                     sandbox: &sandbox,
                     workspace: &workspace,
-                    source: &req.analysis_mode,
+                    source: analysis_mode,
                     resolved_from,
                 },
             ))
@@ -5928,7 +6128,7 @@ pub(super) async fn handle_submit_policy_analysis(
             warn!(
                 chunk_id = %effective_id,
                 sandbox_id = %sandbox_id,
-                error = %err,
+                error_code = ?err.code(),
                 "auto-approval failed; chunk remains pending for human review"
             );
         }
@@ -6049,10 +6249,16 @@ async fn handle_approve_draft_chunk_inner(
         return Err(Status::invalid_argument("chunk_id is required"));
     }
 
-    require_no_global_policy(state).await?;
-
     let sandbox_id = sandbox.object_id().to_string();
     replay_facts.resource(&sandbox)?;
+    let _mutation_guard = state
+        .compute
+        .mutation_guard(MutationScope::sandbox(&workspace, &sandbox_id))
+        .await
+        .map_err(|error| {
+            super::persistence_error_to_status(error, "acquire policy mutation lock")
+        })?;
+    require_no_global_policy(state).await?;
 
     let chunk = state
         .store
@@ -6081,9 +6287,6 @@ async fn handle_approve_draft_chunk_inner(
     info!(
         sandbox_id = %sandbox_id,
         chunk_id = %req.chunk_id,
-        rule_name = %chunk.rule_name,
-        host = %chunk.host,
-        port = chunk.port,
         hit_count = chunk.hit_count,
         prev_status = %chunk.status,
         "ApproveDraftChunk: merging rule into active policy"
@@ -6116,19 +6319,22 @@ async fn handle_approve_draft_chunk_inner(
         }
     };
     crate::config_delivery::publish_sandbox(state, &sandbox_id);
-    let chunk_summary = summarize_draft_chunk_rule(&chunk)?;
-
     let now_ms = current_time_ms();
     clear_pending_application_error(state, &req.chunk_id).await;
-    state
+    let transitioned = state
         .store
         .update_draft_chunk_status(&req.chunk_id, "approved", Some(now_ms), None)
         .await
         .map_err(|e| Status::internal(format!("update chunk status failed: {e}")))?;
+    if !transitioned {
+        return Err(Status::aborted(
+            "chunk disappeared while it was being approved",
+        ));
+    }
 
     state.sandbox_watch_bus.notify(&sandbox_id);
     if let Err(error) =
-        reconcile_pending_chunks_after_policy_change(state, &workspace, &sandbox).await
+        reconcile_pending_chunks_after_policy_change_locked(state, &workspace, &sandbox).await
     {
         warn!(
             sandbox_id,
@@ -6137,22 +6343,19 @@ async fn handle_approve_draft_chunk_inner(
         );
     }
     refresh_pending_chunk_evaluations_best_effort(state, &workspace, &sandbox).await;
-    emit_gateway_policy_audit_log(
+    emit_gateway_policy_approve_audit_log(
         &sandbox_id,
         sandbox.object_name(),
-        "approved",
-        format!(
-            "gateway approved draft chunk {}: {chunk_summary}",
-            req.chunk_id
-        ),
+        &req.chunk_id,
         version,
         &hash,
+        &principal.audit_actor(),
+        policy_actor_class(&principal),
     );
 
     info!(
         sandbox_id = %sandbox_id,
         chunk_id = %req.chunk_id,
-        rule_name = %chunk.rule_name,
         version = version,
         policy_hash = %hash,
         "ApproveDraftChunk: rule merged successfully"
@@ -6199,6 +6402,13 @@ async fn handle_reject_draft_chunk_inner(
 
     let sandbox_id = sandbox.object_id().to_string();
     replay_facts.resource(&sandbox)?;
+    let _mutation_guard = state
+        .compute
+        .mutation_guard(MutationScope::sandbox(&workspace, &sandbox_id))
+        .await
+        .map_err(|error| {
+            super::persistence_error_to_status(error, "acquire policy mutation lock")
+        })?;
 
     let chunk = state
         .store
@@ -6220,32 +6430,20 @@ async fn handle_reject_draft_chunk_inner(
     info!(
         sandbox_id = %sandbox_id,
         chunk_id = %req.chunk_id,
-        rule_name = %chunk.rule_name,
-        host = %chunk.host,
-        port = chunk.port,
-        reason = %req.reason,
+        rejection_reason_present = !req.reason.trim().is_empty(),
         prev_status = %chunk.status,
         "RejectDraftChunk: rejecting chunk"
     );
 
-    if was_approved {
+    let removed_revision = if was_approved {
         require_no_global_policy(state).await?;
         let (version, hash) =
             remove_chunk_from_policy(state, &sandbox_id, &workspace, &chunk).await?;
         crate::config_delivery::publish_sandbox(state, &sandbox_id);
-        emit_gateway_policy_audit_log(
-            &sandbox_id,
-            sandbox.object_name(),
-            "removed",
-            format!(
-                "gateway removed previously approved draft chunk {}: remove-binary {} {}",
-                req.chunk_id, chunk.rule_name, chunk.binary
-            ),
-            version,
-            &hash,
-        );
-        emit_sandbox_policy_update_success();
-    }
+        Some((version, hash))
+    } else {
+        None
+    };
 
     let now_ms = current_time_ms();
     // Persist the reviewer's free-form `reason` into the chunk's
@@ -6256,12 +6454,49 @@ async fn handle_reject_draft_chunk_inner(
     } else {
         Some(req.reason.as_str())
     };
-    state
-        .store
-        .update_draft_chunk_status(&req.chunk_id, "rejected", Some(now_ms), persisted_reason)
-        .await
-        .map_err(|e| Status::internal(format!("update chunk status failed: {e}")))?;
-    emit_gateway_policy_reject_audit_log(&sandbox, &chunk, &req.reason, &principal.audit_actor());
+    let transitioned = if was_approved {
+        state
+            .store
+            .update_draft_chunk_status(&req.chunk_id, "rejected", Some(now_ms), persisted_reason)
+            .await
+    } else {
+        state
+            .store
+            .conditionally_reject_draft_chunk(&req.chunk_id, now_ms, &req.reason)
+            .await
+    }
+    .map_err(|e| Status::internal(format!("update chunk status failed: {e}")))?;
+    if !transitioned {
+        return Err(Status::aborted(
+            "chunk changed while it was being rejected; refetch before retrying",
+        ));
+    }
+    let (version, policy_hash) = removed_revision
+        .as_ref()
+        .map_or((0, ""), |(version, hash)| (*version, hash.as_str()));
+    if let Some((version, hash)) = removed_revision.as_ref() {
+        emit_gateway_policy_audit_log(
+            &sandbox_id,
+            sandbox.object_name(),
+            "removed",
+            "gateway removed an approved draft policy rule",
+            *version,
+            hash,
+        );
+        emit_sandbox_policy_update_success();
+    }
+    emit_gateway_policy_reject_audit_log(
+        &sandbox,
+        &chunk,
+        GatewayPolicyRejectDecision {
+            rejection_reason: &req.reason,
+            decision_reason: GatewayPolicyDecisionReason::Reviewer,
+            actor: &principal.audit_actor(),
+            actor_class: policy_actor_class(&principal),
+            version,
+            policy_hash,
+        },
+    );
 
     state.sandbox_watch_bus.notify(&sandbox_id);
     if was_approved {
@@ -6290,6 +6525,7 @@ async fn handle_approve_all_draft_chunks_inner(
     let principal = super::extract_principal(&request)?;
     let replay_facts = super::mutation_replay::ordinary::Facts::from_request(&request);
     let req = request.into_inner();
+    validate_unique_bulk_approval_chunk_ids(&req.approvals)?;
     let sandbox = super::sandbox::resolve_and_authorize_sandbox_name(
         state,
         &principal,
@@ -6300,10 +6536,16 @@ async fn handle_approve_all_draft_chunks_inner(
     .await?;
     let workspace = sandbox.object_workspace().to_string();
 
-    require_no_global_policy(state).await?;
-
     let sandbox_id = sandbox.object_id().to_string();
     replay_facts.resource(&sandbox)?;
+    let _mutation_guard = state
+        .compute
+        .mutation_guard(MutationScope::sandbox(&workspace, &sandbox_id))
+        .await
+        .map_err(|error| {
+            super::persistence_error_to_status(error, "acquire policy mutation lock")
+        })?;
+    require_no_global_policy(state).await?;
 
     let pending_chunks = state
         .store
@@ -6362,15 +6604,14 @@ async fn handle_approve_all_draft_chunks_inner(
     };
     let mut staged_policy = current_base_policy_for_sandbox(state.store.as_ref(), &sandbox).await?;
     let mut expected_effective_hash: Option<String> = None;
-    let mut accepted = Vec::<(DraftChunkRecord, PolicyMergeOp, String)>::new();
+    let mut accepted = Vec::<(DraftChunkRecord, PolicyMergeOp)>::new();
     for chunk in &chunks_to_approve {
         let security_notes = current_draft_chunk_security_notes(chunk)?;
         if !req.include_security_flagged && !security_notes.is_empty() {
             info!(
                 sandbox_id = %sandbox_id,
                 chunk_id = %chunk.id,
-                rule_name = %chunk.rule_name,
-                security_notes = %security_notes,
+                security_flagged = true,
                 "ApproveAllDraftChunks: skipping security-flagged chunk"
             );
             chunks_skipped += 1;
@@ -6392,7 +6633,7 @@ async fn handle_approve_all_draft_chunks_inner(
                 info!(
                     sandbox_id = %sandbox_id,
                     chunk_id = %chunk.id,
-                    reason = %status.message(),
+                    candidate_current = false,
                     "ApproveAllDraftChunks: skipping stale or invalid candidate"
                 );
                 chunks_skipped += 1;
@@ -6413,9 +6654,6 @@ async fn handle_approve_all_draft_chunks_inner(
         info!(
             sandbox_id = %sandbox_id,
             chunk_id = %chunk.id,
-            rule_name = %chunk.rule_name,
-            host = %chunk.host,
-            port = chunk.port,
             "ApproveAllDraftChunks: staging chunk"
         );
 
@@ -6434,19 +6672,18 @@ async fn handle_approve_all_draft_chunks_inner(
                 info!(
                     sandbox_id = %sandbox_id,
                     chunk_id = %chunk.id,
-                    reason = %status.message(),
+                    staged_conflict = true,
                     "ApproveAllDraftChunks: skipping chunk that conflicts with the staged batch"
                 );
                 chunks_skipped += 1;
                 continue;
             }
         };
-        let chunk_summary = summarize_draft_chunk_rule(chunk)?;
         if expected_effective_hash.is_none() {
             expected_effective_hash = Some(current_hash);
         }
         staged_policy = candidate;
-        accepted.push((chunk.clone(), operation, chunk_summary));
+        accepted.push((chunk.clone(), operation));
     }
 
     let (last_version, last_hash) = if accepted.is_empty() {
@@ -6455,7 +6692,7 @@ async fn handle_approve_all_draft_chunks_inner(
         // Rebuild the staged candidate from fresh live inputs immediately before
         // persistence. This reuses each unchanged chunk's cached prover result;
         // it does not silently bind the request to a newly refreshed token.
-        for (chunk, _, _) in &accepted {
+        for (chunk, _) in &accepted {
             let supplied_token = review_tokens.get(chunk.id.as_str()).copied().unwrap_or("");
             require_current_proposal_evaluation(
                 state,
@@ -6477,7 +6714,7 @@ async fn handle_approve_all_draft_chunks_inner(
         };
         let final_base = current_base_policy_for_sandbox(state.store.as_ref(), &sandbox).await?;
         let mut rebuilt_policy = final_base.clone();
-        for (_, operation, _) in &accepted {
+        for (_, operation) in &accepted {
             rebuilt_policy = stage_validated_merge_operation(
                 &rebuilt_policy,
                 operation,
@@ -6492,7 +6729,7 @@ async fn handle_approve_all_draft_chunks_inner(
 
         let operations = accepted
             .iter()
-            .map(|(_, operation, _)| operation.clone())
+            .map(|(_, operation)| operation.clone())
             .collect::<Vec<_>>();
         let expected_hash = expected_effective_hash.as_deref().ok_or_else(|| {
             Status::failed_precondition("bulk approval has no reviewed policy snapshot")
@@ -6511,7 +6748,7 @@ async fn handle_approve_all_draft_chunks_inner(
         {
             Ok((version, hash, _)) => (version, hash),
             Err(status) => {
-                for (chunk, _, _) in &accepted {
+                for (chunk, _) in &accepted {
                     persist_pending_application_error(state, &chunk.id, &status).await;
                 }
                 return Err(status);
@@ -6523,22 +6760,31 @@ async fn handle_approve_all_draft_chunks_inner(
         crate::config_delivery::publish_sandbox(state, &sandbox_id);
     }
 
-    for (chunk, _, chunk_summary) in &accepted {
+    let audit_actor = principal.audit_actor();
+    let audit_actor_class = policy_actor_class(&principal);
+    for (chunk, _) in &accepted {
         let now_ms = current_time_ms();
         clear_pending_application_error(state, &chunk.id).await;
-        state
+        let transitioned = state
             .store
             .update_draft_chunk_status(&chunk.id, "approved", Some(now_ms), None)
             .await
             .map_err(|e| Status::internal(format!("update chunk status failed: {e}")))?;
+        if !transitioned {
+            return Err(Status::aborted(format!(
+                "chunk '{}' disappeared while it was being bulk-approved",
+                chunk.id
+            )));
+        }
 
-        emit_gateway_policy_audit_log(
+        emit_gateway_policy_approve_audit_log(
             &sandbox_id,
             sandbox.object_name(),
-            "approved",
-            format!("gateway approved draft chunk {}: {chunk_summary}", chunk.id),
+            &chunk.id,
             last_version,
             &last_hash,
+            &audit_actor,
+            audit_actor_class,
         );
         emit_sandbox_policy_update_success();
     }
@@ -6546,7 +6792,7 @@ async fn handle_approve_all_draft_chunks_inner(
 
     state.sandbox_watch_bus.notify(&sandbox_id);
     if let Err(error) =
-        reconcile_pending_chunks_after_policy_change(state, &workspace, &sandbox).await
+        reconcile_pending_chunks_after_policy_change_locked(state, &workspace, &sandbox).await
     {
         warn!(
             sandbox_id,
@@ -6612,6 +6858,13 @@ pub(super) async fn handle_edit_draft_chunk(
 
     let sandbox_id = sandbox.object_id().to_string();
     replay_facts.resource(&sandbox)?;
+    let _mutation_guard = state
+        .compute
+        .mutation_guard(MutationScope::sandbox(&workspace, &sandbox_id))
+        .await
+        .map_err(|error| {
+            super::persistence_error_to_status(error, "acquire policy mutation lock")
+        })?;
 
     let chunk = state
         .store
@@ -6643,6 +6896,13 @@ pub(super) async fn handle_edit_draft_chunk(
             "proposal changed while it was being edited; refetch and edit again",
         ));
     }
+
+    emit_gateway_policy_edit_audit_log(
+        &sandbox,
+        &req.chunk_id,
+        &principal.audit_actor(),
+        policy_actor_class(&principal),
+    );
 
     info!(
         chunk_id = %req.chunk_id,
@@ -6685,6 +6945,13 @@ async fn handle_undo_draft_chunk_inner(
 
     let sandbox_id = sandbox.object_id().to_string();
     replay_facts.resource(&sandbox)?;
+    let _mutation_guard = state
+        .compute
+        .mutation_guard(MutationScope::sandbox(&workspace, &sandbox_id))
+        .await
+        .map_err(|error| {
+            super::persistence_error_to_status(error, "acquire policy mutation lock")
+        })?;
 
     let chunk = state
         .store
@@ -6704,9 +6971,6 @@ async fn handle_undo_draft_chunk_inner(
     info!(
         sandbox_id = %sandbox_id,
         chunk_id = %req.chunk_id,
-        rule_name = %chunk.rule_name,
-        host = %chunk.host,
-        port = chunk.port,
         "UndoDraftChunk: removing rule from active policy"
     );
 
@@ -6716,21 +6980,32 @@ async fn handle_undo_draft_chunk_inner(
     // Clear any prior rejection_reason on the way back to "pending" so an
     // agent reading the chunk via policy.local cannot see a stale guidance
     // string left over from a previous reject → undo round.
-    state
+    let transitioned = state
         .store
         .update_draft_chunk_status(&req.chunk_id, "pending", None, Some(""))
         .await
         .map_err(|e| Status::internal(format!("update chunk status failed: {e}")))?;
+    if !transitioned {
+        return Err(Status::aborted(
+            "chunk disappeared while its approval was being undone",
+        ));
+    }
 
     state.sandbox_watch_bus.notify(&sandbox_id);
+
     emit_gateway_policy_audit_log(
         &sandbox_id,
         sandbox.object_name(),
         "removed",
-        format!(
-            "gateway reverted approved draft chunk {}: remove-binary {} {}",
-            req.chunk_id, chunk.rule_name, chunk.binary
-        ),
+        "gateway removed an approved draft policy rule for undo",
+        version,
+        &hash,
+    );
+    emit_gateway_policy_undo_audit_log(
+        &sandbox,
+        &req.chunk_id,
+        &principal.audit_actor(),
+        policy_actor_class(&principal),
         version,
         &hash,
     );
@@ -6738,7 +7013,6 @@ async fn handle_undo_draft_chunk_inner(
     info!(
         sandbox_id = %sandbox_id,
         chunk_id = %req.chunk_id,
-        rule_name = %chunk.rule_name,
         version = version,
         policy_hash = %hash,
         "UndoDraftChunk: rule removed, chunk reverted to pending"
@@ -6768,8 +7042,16 @@ pub(super) async fn handle_clear_draft_chunks(
         MinWorkspaceRole::Admin,
     )
     .await?;
+    let workspace = sandbox.object_workspace().to_string();
     let sandbox_id = sandbox.object_id().to_string();
     replay_facts.resource(&sandbox)?;
+    let _mutation_guard = state
+        .compute
+        .mutation_guard(MutationScope::sandbox(&workspace, &sandbox_id))
+        .await
+        .map_err(|error| {
+            super::persistence_error_to_status(error, "acquire policy mutation lock")
+        })?;
 
     let deleted = state
         .store
@@ -6778,6 +7060,15 @@ pub(super) async fn handle_clear_draft_chunks(
         .map_err(|e| Status::internal(format!("delete draft chunks failed: {e}")))?;
 
     state.sandbox_watch_bus.notify(&sandbox_id);
+
+    if deleted > 0 {
+        emit_gateway_policy_clear_audit_log(
+            &sandbox,
+            &principal.audit_actor(),
+            policy_actor_class(&principal),
+            deleted,
+        );
+    }
 
     info!(
         sandbox_id = %sandbox_id,
@@ -8236,7 +8527,7 @@ mod tests {
     use super::*;
     use crate::auth::audit::test_support::assert_boundary_finding;
     use crate::auth::identity::{Identity, IdentityProvider};
-    use crate::auth::principal::{Principal, UserPrincipal};
+    use crate::auth::principal::{OperatorPrincipal, Principal, UserPrincipal};
     use crate::grpc::test_support::{authed_request, test_server_state};
 
     /// An in-memory store with the example profiles imported at platform scope.
@@ -16214,7 +16505,7 @@ mod tests {
                 )),
                 approvals: chunks
                     .iter()
-                    .map(|chunk| openshell_core::proto::DraftChunkApproval {
+                    .map(|chunk| DraftChunkApproval {
                         chunk_id: chunk.id.clone(),
                         review_token: chunk.review_token.clone(),
                     })
@@ -16350,7 +16641,7 @@ mod tests {
                 )),
                 approvals: chunks
                     .iter()
-                    .map(|chunk| openshell_core::proto::DraftChunkApproval {
+                    .map(|chunk| DraftChunkApproval {
                         chunk_id: chunk.id.clone(),
                         review_token: chunk.review_token.clone(),
                     })
@@ -16551,7 +16842,7 @@ mod tests {
                     "default".to_string(),
                 )),
                 include_security_flagged: false,
-                approvals: vec![openshell_core::proto::DraftChunkApproval {
+                approvals: vec![DraftChunkApproval {
                     chunk_id: chunk_id.clone(),
                     review_token: chunk.review_token.clone(),
                 }],
@@ -16582,7 +16873,7 @@ mod tests {
                     "default".to_string(),
                 )),
                 include_security_flagged: true,
-                approvals: vec![openshell_core::proto::DraftChunkApproval {
+                approvals: vec![DraftChunkApproval {
                     chunk_id: chunk_id.clone(),
                     review_token: chunk.review_token.clone(),
                 }],
@@ -18642,22 +18933,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn policy_change_reconciles_pending_chunk_already_covered_by_live_policy() {
+    async fn principal_review_reconcile_emits_without_waiter() {
         use openshell_core::proto::{NetworkBinary, NetworkEndpoint, NetworkPolicyRule};
 
         let state = test_server_state().await;
         let sandbox_id = "sb-covered-pending";
         let sandbox_name = "covered-pending";
-        state
-            .store
-            .put_message(&test_sandbox(
-                sandbox_id,
-                sandbox_name,
-                ProtoSandboxPolicy::default(),
-                Vec::new(),
-            ))
-            .await
-            .unwrap();
+        let sandbox = test_sandbox(
+            sandbox_id,
+            sandbox_name,
+            ProtoSandboxPolicy::default(),
+            Vec::new(),
+        );
+        state.store.put_message(&sandbox).await.unwrap();
         let rule = NetworkPolicyRule {
             name: "example".to_string(),
             endpoints: vec![NetworkEndpoint {
@@ -18690,12 +18978,24 @@ mod tests {
 
         let mut live = ProtoSandboxPolicy::default();
         live.network_policies.insert("example".to_string(), rule);
-        assert_eq!(
-            reconcile_pending_chunks_covered_by_policy(&state, sandbox_id, &live, 7)
+        let policy_hash = deterministic_policy_hash(&live);
+        let (result, events) = capture_ocsf_jsonl(async {
+            let _guard = state
+                .compute
+                .mutation_guard(MutationScope::sandbox("default", sandbox_id))
                 .await
-                .unwrap(),
-            1
-        );
+                .unwrap();
+            reconcile_pending_chunks_covered_by_policy_locked(
+                &state,
+                &sandbox,
+                &live,
+                7,
+                &policy_hash,
+            )
+            .await
+        })
+        .await;
+        assert_eq!(result.unwrap(), 1);
         let reconciled = state
             .store
             .get_draft_chunk(chunk_id)
@@ -18707,6 +19007,88 @@ mod tests {
             reconciled.rejection_reason,
             "covered by active policy revision 7"
         );
+        let event = decision_event(&events, chunk_id);
+        assert_eq!(event["unmapped"]["actor"], AUTO_REJECT_ACTOR);
+        assert_eq!(event["unmapped"]["actor_class"], "gateway");
+        assert_eq!(event["unmapped"]["decision_reason"], "covered");
+        assert_eq!(event["unmapped"]["policy_version"], "v7");
+        assert_eq!(event["unmapped"]["policy_hash"], policy_hash);
+    }
+
+    #[tokio::test]
+    async fn principal_review_concurrent_reconcile_emits_one_rejection() {
+        use openshell_core::proto::{NetworkBinary, NetworkEndpoint, NetworkPolicyRule};
+
+        let state = test_server_state().await;
+        let sandbox = test_sandbox(
+            "sb-covered-race",
+            "covered-race",
+            ProtoSandboxPolicy::default(),
+            Vec::new(),
+        );
+        state.store.put_message(&sandbox).await.unwrap();
+        let rule = NetworkPolicyRule {
+            name: "race".to_string(),
+            endpoints: vec![NetworkEndpoint {
+                host: "race.example.com".to_string(),
+                port: 443,
+                ..Default::default()
+            }],
+            binaries: vec![NetworkBinary {
+                path: "/usr/bin/curl".to_string(),
+            }],
+        };
+        let submit = handle_submit_policy_analysis(
+            &state,
+            with_user(Request::new(SubmitPolicyAnalysisRequest {
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+                name: "covered-race".to_string(),
+                analysis_mode: "agent_authored".to_string(),
+                proposed_chunks: vec![PolicyChunk {
+                    rule_name: "race".to_string(),
+                    proposed_rule: Some(rule.clone()),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            })),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        let chunk_id = submit.accepted_chunk_ids[0].clone();
+        let mut live = ProtoSandboxPolicy::default();
+        live.network_policies.insert("race".to_string(), rule);
+        let policy_hash = deterministic_policy_hash(&live);
+
+        let (results, events) = capture_ocsf_jsonl(futures::future::join_all((0..8).map(|_| {
+            let state = Arc::clone(&state);
+            let sandbox = sandbox.clone();
+            let live = live.clone();
+            let policy_hash = policy_hash.clone();
+            crate::persistence::lock_order::branch(async move {
+                let _guard = state
+                    .compute
+                    .mutation_guard(MutationScope::sandbox("default", sandbox.object_id()))
+                    .await
+                    .unwrap();
+                reconcile_pending_chunks_covered_by_policy_locked(
+                    &state,
+                    &sandbox,
+                    &live,
+                    11,
+                    &policy_hash,
+                )
+                .await
+            })
+        })))
+        .await;
+
+        let transition_count: u32 = results.into_iter().map(Result::unwrap).sum();
+        assert_eq!(transition_count, 1);
+        let event = decision_event(&events, &chunk_id);
+        assert_eq!(event["unmapped"]["policy_version"], "v11");
+        assert_eq!(event["unmapped"]["policy_hash"], policy_hash);
+        assert_eq!(event["unmapped"]["decision_reason"], "covered");
     }
 
     #[tokio::test]
@@ -18901,9 +19283,16 @@ mod tests {
             source: "agent_authored",
             resolved_from: "sandbox",
         };
-        let error = auto_approve_chunk(&state, chunk_id, context())
-            .await
-            .unwrap_err();
+        let error = {
+            let _guard = state
+                .compute
+                .mutation_guard(MutationScope::sandbox("default", sandbox.object_id()))
+                .await
+                .unwrap();
+            auto_approve_chunk_locked(&state, chunk_id, context())
+                .await
+                .unwrap_err()
+        };
         assert_eq!(error.code(), Code::FailedPrecondition);
         let mut refreshed = state
             .store
@@ -18923,9 +19312,16 @@ mod tests {
                 .await
                 .unwrap()
         );
-        let error = auto_approve_chunk(&state, chunk_id, context())
-            .await
-            .unwrap_err();
+        let error = {
+            let _guard = state
+                .compute
+                .mutation_guard(MutationScope::sandbox("default", sandbox.object_id()))
+                .await
+                .unwrap();
+            auto_approve_chunk_locked(&state, chunk_id, context())
+                .await
+                .unwrap_err()
+        };
         assert!(error.message().contains("prover validation unavailable"));
         let blocked = state
             .store
@@ -21461,9 +21857,7 @@ mod tests {
     /// Auto-approval audit messages carry `auto=true`, `source=<mode>`, and
     /// `prover_delta=empty` as extra unmapped fields so a reviewer can
     /// reconstruct the safety reasoning without needing to grep the chunk
-    /// table. The message text itself says "auto-approved: no new prover
-    /// findings" — never "safe" — because the claim is about the prover's
-    /// reasoning, not the world.
+    /// table. Proposal content remains in the chunk record, not the message.
     #[test]
     fn build_gateway_policy_audit_event_carries_auto_approve_provenance() {
         let extra = [
@@ -21475,7 +21869,7 @@ mod tests {
             "sb-123",
             "demo-sandbox",
             "approved",
-            "auto-approved: no new prover findings (source=agent_authored) — chunk abc: add-rule x",
+            "gateway policy auto_approve decision",
             12,
             "sha256:autohash",
             &extra,
@@ -21485,10 +21879,7 @@ mod tests {
             message.contains("CONFIG:APPROVED"),
             "auto-approval reuses CONFIG:APPROVED; got: {message}"
         );
-        assert!(
-            message.contains("auto-approved: no new prover findings"),
-            "audit copy must say `no new prover findings`, not `safe`; got: {message}"
-        );
+        assert!(message.contains("gateway policy auto_approve decision"));
         assert!(
             message.contains("auto:true"),
             "missing auto field: {message}"
@@ -21531,21 +21922,51 @@ mod tests {
         (output, events)
     }
 
+    #[derive(Clone, Default)]
+    struct TracingEventCapture(Arc<std::sync::Mutex<Vec<String>>>);
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for TracingEventCapture {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _context: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            #[derive(Default)]
+            struct Fields(String);
+
+            impl tracing::field::Visit for Fields {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    use std::fmt::Write as _;
+                    let _ = write!(self.0, "{}={value:?} ", field.name());
+                }
+            }
+
+            let mut fields = Fields::default();
+            event.record(&mut fields);
+            self.0.lock().unwrap().push(fields.0);
+        }
+    }
+
     #[tokio::test]
     async fn gateway_policy_audit_events_reach_ocsf_jsonl() {
         let ((), events) = capture_ocsf_jsonl(async {
-            emit_gateway_policy_audit_log(
+            emit_gateway_policy_approve_audit_log(
                 "sb-123",
                 "demo-sandbox",
-                "approved",
-                "approved chunk abc",
+                "manual-chunk",
                 7,
                 "sha256:manual",
+                "user:reviewer",
+                "user",
             );
             emit_gateway_policy_auto_approve_audit_log(
                 "sb-123",
                 "demo-sandbox",
-                "auto-approved: no new prover findings",
+                "auto-chunk",
                 8,
                 "sha256:auto",
                 "mechanistic",
@@ -21561,10 +21982,177 @@ mod tests {
             assert!(event["container"].get("image").is_none());
         }
         assert_eq!(events[0]["unmapped"]["policy_hash"], "sha256:manual");
+        assert!(events[0]["metadata"].get("correlation_uid").is_none());
+        assert_eq!(events[0]["unmapped"]["chunk_id"], "manual-chunk");
+        assert_eq!(events[0]["unmapped"]["actor"], "user:reviewer");
+        assert_eq!(events[0]["unmapped"]["actor_class"], "user");
+        assert_eq!(events[0]["unmapped"]["decision_reason"], "approval");
         assert!(events[0]["unmapped"].get("auto").is_none());
         assert_eq!(events[1]["unmapped"]["policy_hash"], "sha256:auto");
+        assert!(events[1]["metadata"].get("correlation_uid").is_none());
+        assert_eq!(events[1]["unmapped"]["chunk_id"], "auto-chunk");
+        assert_eq!(events[1]["unmapped"]["actor"], "gateway:auto");
+        assert_eq!(events[1]["unmapped"]["actor_class"], "gateway");
+        assert_eq!(events[1]["unmapped"]["decision_reason"], "approval");
         assert_eq!(events[1]["unmapped"]["auto"], "true");
         assert_eq!(events[1]["unmapped"]["resolved_from"], "gateway");
+    }
+
+    #[test]
+    fn policy_actor_class_distinguishes_user_and_operator() {
+        let identity = Identity {
+            subject: "reviewer".to_string(),
+            display_name: None,
+            roles: vec![],
+            scopes: vec![],
+            provider: IdentityProvider::Mtls,
+        };
+        let user = Principal::User(UserPrincipal {
+            identity: identity.clone(),
+        });
+        let operator = Principal::Operator(OperatorPrincipal {
+            identity,
+            certificate_sha256: "fingerprint".to_string(),
+        });
+
+        assert_eq!(policy_actor_class(&user), "user");
+        assert_eq!(policy_actor_class(&operator), "operator");
+    }
+
+    #[tokio::test]
+    async fn gateway_policy_decision_spans_record_only_bounded_result_fields() {
+        use crate::otel_tracing::test_exporter;
+
+        let traced = test_exporter::install_traced();
+        emit_gateway_policy_decision_audit_log(
+            "sb-span",
+            "span-sandbox",
+            "approved",
+            GatewayPolicyDecision {
+                chunk_id: Some("approve-chunk"),
+                action: "approve",
+                reason: GatewayPolicyDecisionReason::Approval,
+                actor_class: "user",
+                actor: "user:alice@example.com",
+                version: 7,
+                policy_hash: "sha256:approved",
+            },
+            &[],
+        );
+        emit_gateway_policy_decision_audit_log(
+            "sb-span",
+            "span-sandbox",
+            "rejected",
+            GatewayPolicyDecision {
+                chunk_id: Some("reject-chunk"),
+                action: "reject",
+                reason: GatewayPolicyDecisionReason::Reviewer,
+                actor_class: "user",
+                actor: "user:bob@example.com",
+                version: 0,
+                policy_hash: "",
+            },
+            &[("rejection_reason_present", "true".to_string())],
+        );
+
+        let submit_parent = tracing::info_span!("submit_policy_analysis_parent");
+        submit_parent.in_scope(|| {
+            emit_gateway_policy_decision_audit_log(
+                "sb-span",
+                "span-sandbox",
+                "approved",
+                GatewayPolicyDecision {
+                    chunk_id: Some("auto-chunk"),
+                    action: "auto_approve",
+                    reason: GatewayPolicyDecisionReason::Approval,
+                    actor_class: "gateway",
+                    actor: "gateway:auto",
+                    version: 8,
+                    policy_hash: "sha256:auto",
+                },
+                &[("source", "mechanistic".to_string())],
+            );
+        });
+        drop(submit_parent);
+
+        let spans = traced
+            .wait_for_spans(|spans| {
+                spans
+                    .iter()
+                    .filter(|span| span.name == "openshell.policy.decision")
+                    .count()
+                    == 3
+                    && spans
+                        .iter()
+                        .any(|span| span.name == "submit_policy_analysis_parent")
+            })
+            .await;
+        let decision = |action: &str| {
+            spans
+                .iter()
+                .find(|span| {
+                    span.name == "openshell.policy.decision"
+                        && test_exporter::attribute(span, "openshell.policy.action").as_deref()
+                            == Some(action)
+                })
+                .expect("decision span for action")
+        };
+
+        let approve = decision("approve");
+        assert_eq!(
+            test_exporter::attribute(approve, "openshell.policy.proposal.chunk_id").as_deref(),
+            Some("approve-chunk")
+        );
+        assert_eq!(
+            test_exporter::attribute(approve, "openshell.policy.actor_class").as_deref(),
+            Some("user")
+        );
+        assert_eq!(
+            test_exporter::attribute(approve, "openshell.policy.version").as_deref(),
+            Some("7")
+        );
+        assert_eq!(
+            test_exporter::attribute(approve, "openshell.policy.hash").as_deref(),
+            Some("sha256:approved")
+        );
+        assert_eq!(
+            test_exporter::attribute(approve, "openshell.policy.decision_reason").as_deref(),
+            Some("approval")
+        );
+
+        let reject = decision("reject");
+        assert!(test_exporter::attribute(reject, "openshell.policy.version").is_none());
+        assert!(test_exporter::attribute(reject, "openshell.policy.hash").is_none());
+        assert_eq!(
+            test_exporter::attribute(reject, "openshell.policy.decision_reason").as_deref(),
+            Some("reviewer")
+        );
+
+        let auto = decision("auto_approve");
+        assert_eq!(
+            test_exporter::attribute(auto, "openshell.policy.actor_class").as_deref(),
+            Some("gateway")
+        );
+        let parent = spans
+            .iter()
+            .find(|span| span.name == "submit_policy_analysis_parent")
+            .unwrap();
+        assert_eq!(auto.parent_span_id, parent.span_context.span_id());
+
+        for span in [approve, reject, auto] {
+            assert_eq!(
+                test_exporter::attribute(span, "openshell.sandbox.id").as_deref(),
+                Some("sb-span")
+            );
+            assert_eq!(
+                test_exporter::attribute(span, "openshell.policy.outcome").as_deref(),
+                Some("success")
+            );
+            assert!(test_exporter::attribute(span, "actor").is_none());
+            assert!(test_exporter::attribute(span, "reason").is_none());
+            assert!(test_exporter::attribute(span, "rule").is_none());
+            assert!(test_exporter::attribute(span, "body").is_none());
+        }
     }
 
     async fn seed_ready_sandbox(state: &Arc<ServerState>, name: &str) {
@@ -21639,16 +22227,73 @@ mod tests {
     fn rejected_events(events: &[serde_json::Value]) -> Vec<&serde_json::Value> {
         events
             .iter()
-            .filter(|event| {
-                event["message"]
-                    .as_str()
-                    .is_some_and(|m| m.contains("rejected"))
-            })
+            .filter(|event| event["unmapped"]["action"] == "reject")
             .collect()
     }
 
+    fn decision_event<'a>(
+        events: &'a [serde_json::Value],
+        chunk_id: &str,
+    ) -> &'a serde_json::Value {
+        let matching = events
+            .iter()
+            .filter(|event| event["unmapped"]["chunk_id"] == chunk_id)
+            .collect::<Vec<_>>();
+        assert_eq!(matching.len(), 1, "events: {events:?}");
+        matching[0]
+    }
+
     #[tokio::test]
-    async fn reviewer_reject_emits_config_rejected_without_wait() {
+    async fn reviewer_approve_emits_config_approved_with_lifecycle_join() {
+        let state = test_server_state().await;
+        seed_ready_sandbox(&state, "approve-audit").await;
+        let chunk_id = submit_example_chunk(&state, "approve-audit", "agent_authored").await;
+        let review_token = state
+            .store
+            .get_draft_chunk(&chunk_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .review_token;
+
+        let (result, events) = capture_ocsf_jsonl(Box::pin(handle_approve_draft_chunk(
+            &state,
+            authed_request(ApproveDraftChunkRequest {
+                request_id: String::new(),
+                sandbox: "approve-audit".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+                chunk_id: chunk_id.clone(),
+                review_token,
+            }),
+        )))
+        .await;
+        let response = result.unwrap().into_inner();
+
+        let event = decision_event(&events, &chunk_id);
+        assert_eq!(event["container"]["uid"], "sb-approve-audit");
+        assert_eq!(event["unmapped"]["chunk_id"], chunk_id);
+        assert_eq!(event["unmapped"]["actor"], "user:dev-user");
+        assert_eq!(event["unmapped"]["actor_class"], "user");
+        assert_eq!(event["unmapped"]["action"], "approve");
+        assert_eq!(event["unmapped"]["decision_reason"], "approval");
+        assert_eq!(event["unmapped"]["outcome"], "success");
+        assert!(event["metadata"].get("correlation_uid").is_none());
+        assert_eq!(
+            event["unmapped"]["policy_version"],
+            format!("v{}", response.policy_version)
+        );
+        assert_eq!(event["unmapped"]["policy_hash"], response.policy_hash);
+        assert!(
+            event["message"]
+                .as_str()
+                .unwrap()
+                .contains("gateway policy approve decision"),
+            "message should identify the authoritative approval: {event}"
+        );
+    }
+
+    #[tokio::test]
+    async fn reviewer_reject_emits_bounded_config_rejected_without_wait() {
         let state = test_server_state().await;
         seed_ready_sandbox(&state, "reject-audit").await;
         let chunk_id = submit_example_chunk(&state, "reject-audit", "agent_authored").await;
@@ -21660,7 +22305,7 @@ mod tests {
                 sandbox: "reject-audit".to_string(),
                 workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
                 chunk_id: chunk_id.clone(),
-                reason: "too broad\nscope it down".to_string(),
+                reason: "SENTINEL_REJECTION_SECRET\nscope it down".to_string(),
             }),
         )))
         .await;
@@ -21670,19 +22315,335 @@ mod tests {
         assert_eq!(rejected.len(), 1, "events: {events:?}");
         let event = rejected[0];
         assert_eq!(event["container"]["uid"], "sb-reject-audit");
+        assert!(event["metadata"].get("correlation_uid").is_none());
         assert_eq!(event["unmapped"]["chunk_id"], chunk_id);
-        assert_eq!(
-            event["unmapped"]["rejection_reason"],
-            "too broadscope it down"
-        );
+        assert_eq!(event["unmapped"]["rejection_reason_present"], "true");
+        assert!(event["unmapped"].get("rejection_reason").is_none());
         assert_eq!(event["unmapped"]["actor"], "user:dev-user");
-        assert!(
-            event["message"]
-                .as_str()
-                .unwrap()
-                .contains("example.com:8080"),
-            "message should name the rule: {event}"
+        assert_eq!(event["unmapped"]["actor_class"], "user");
+        assert_eq!(event["unmapped"]["action"], "reject");
+        assert_eq!(event["unmapped"]["decision_reason"], "reviewer");
+        assert_eq!(event["unmapped"]["outcome"], "success");
+        assert!(!event.to_string().contains("SENTINEL_REJECTION_SECRET"));
+        assert!(!event.to_string().contains("example.com:8080"));
+        assert!(!event.to_string().contains("/usr/bin/curl"));
+    }
+
+    #[tokio::test]
+    async fn reviewer_rejection_reason_is_not_emitted_to_tracing() {
+        use tracing_subscriber::prelude::*;
+
+        let state = test_server_state().await;
+        seed_ready_sandbox(&state, "reject-tracing").await;
+        let chunk_id = submit_example_chunk(&state, "reject-tracing", "agent_authored").await;
+        let capture = TracingEventCapture::default();
+        let events = Arc::clone(&capture.0);
+        let _subscriber =
+            tracing::subscriber::set_default(tracing_subscriber::registry().with(capture));
+
+        handle_reject_draft_chunk(
+            &state,
+            authed_request(RejectDraftChunkRequest {
+                request_id: String::new(),
+                sandbox: "reject-tracing".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+                chunk_id,
+                reason: "SENTINEL_REJECTION_SECRET\nscope it down".to_string(),
+            }),
+        )
+        .await
+        .unwrap();
+
+        let rendered = events.lock().unwrap().join("\n");
+        assert!(rendered.contains("rejection_reason_present=true"));
+        assert!(!rendered.contains("SENTINEL_REJECTION_SECRET"));
+    }
+
+    #[tokio::test]
+    async fn policy_decision_bulk_approval_emits_each_chunk_with_final_revision() {
+        use openshell_core::proto::{DraftChunkApproval, NetworkBinary, NetworkEndpoint};
+
+        let state = test_server_state().await;
+        seed_ready_sandbox(&state, "bulk-audit").await;
+        let submit = handle_submit_policy_analysis(
+            &state,
+            with_user(Request::new(SubmitPolicyAnalysisRequest {
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+                name: "bulk-audit".to_string(),
+                analysis_mode: "agent_authored".to_string(),
+                proposed_chunks: [
+                    ("allow_alpha", "alpha.example.com"),
+                    ("allow_beta", "beta.example.com"),
+                ]
+                .into_iter()
+                .map(|(rule_name, host)| PolicyChunk {
+                    rule_name: rule_name.to_string(),
+                    proposed_rule: Some(NetworkPolicyRule {
+                        name: rule_name.to_string(),
+                        endpoints: vec![NetworkEndpoint {
+                            host: host.to_string(),
+                            port: 443,
+                            ..Default::default()
+                        }],
+                        binaries: vec![NetworkBinary {
+                            path: "/usr/bin/curl".to_string(),
+                        }],
+                    }),
+                    ..Default::default()
+                })
+                .collect(),
+                ..Default::default()
+            })),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        let chunks = futures::future::try_join_all(
+            submit
+                .accepted_chunk_ids
+                .iter()
+                .map(|id| state.store.get_draft_chunk(id)),
+        )
+        .await
+        .unwrap()
+        .into_iter()
+        .map(Option::unwrap)
+        .collect::<Vec<_>>();
+
+        let (result, events) = capture_ocsf_jsonl(Box::pin(handle_approve_all_draft_chunks(
+            &state,
+            authed_request(ApproveAllDraftChunksRequest {
+                sandbox: "bulk-audit".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+                approvals: chunks
+                    .iter()
+                    .map(|chunk| DraftChunkApproval {
+                        chunk_id: chunk.id.clone(),
+                        review_token: chunk.review_token.clone(),
+                    })
+                    .collect(),
+                ..Default::default()
+            }),
+        )))
+        .await;
+        let response = result.unwrap().into_inner();
+
+        assert_eq!(response.chunks_approved, 2);
+        for chunk in &chunks {
+            let event = decision_event(&events, &chunk.id);
+            assert_eq!(event["unmapped"]["policy_version"], "v1");
+            assert_eq!(event["unmapped"]["policy_hash"], response.policy_hash);
+            assert_eq!(event["unmapped"]["actor_class"], "user");
+        }
+    }
+
+    #[tokio::test]
+    async fn policy_decision_rejecting_approved_chunk_records_removal_revision() {
+        let state = test_server_state().await;
+        seed_ready_sandbox(&state, "reject-approved-audit").await;
+        let chunk_id =
+            submit_example_chunk(&state, "reject-approved-audit", "agent_authored").await;
+        let review_token = state
+            .store
+            .get_draft_chunk(&chunk_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .review_token;
+        handle_approve_draft_chunk(
+            &state,
+            authed_request(ApproveDraftChunkRequest {
+                request_id: String::new(),
+                sandbox: "reject-approved-audit".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+                chunk_id: chunk_id.clone(),
+                review_token,
+            }),
+        )
+        .await
+        .unwrap();
+
+        let (result, events) = capture_ocsf_jsonl(Box::pin(handle_reject_draft_chunk(
+            &state,
+            authed_request(RejectDraftChunkRequest {
+                request_id: String::new(),
+                sandbox: "reject-approved-audit".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+                chunk_id: chunk_id.clone(),
+                reason: "no longer needed".to_string(),
+            }),
+        )))
+        .await;
+        result.unwrap();
+
+        let latest = state
+            .store
+            .get_latest_policy("sb-reject-approved-audit")
+            .await
+            .unwrap()
+            .unwrap();
+        let event = decision_event(&events, &chunk_id);
+        assert_eq!(event["unmapped"]["policy_version"], "v2");
+        assert_eq!(event["unmapped"]["policy_hash"], latest.policy_hash);
+        assert_eq!(event["unmapped"]["rejection_reason_present"], "true");
+    }
+
+    #[tokio::test]
+    async fn branch07_concurrent_rejection_of_approved_chunk_transitions_and_emits_once() {
+        let state = test_server_state().await;
+        seed_ready_sandbox(&state, "reject-approved-race").await;
+        let chunk_id = submit_example_chunk(&state, "reject-approved-race", "agent_authored").await;
+        let review_token = state
+            .store
+            .get_draft_chunk(&chunk_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .review_token;
+        handle_approve_draft_chunk(
+            &state,
+            authed_request(ApproveDraftChunkRequest {
+                request_id: String::new(),
+                sandbox: "reject-approved-race".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+                chunk_id: chunk_id.clone(),
+                review_token,
+            }),
+        )
+        .await
+        .unwrap();
+
+        let (results, events) = capture_ocsf_jsonl(futures::future::join_all((0..8).map(|_| {
+            crate::persistence::lock_order::branch(handle_reject_draft_chunk(
+                &state,
+                authed_request(RejectDraftChunkRequest {
+                    request_id: String::new(),
+                    sandbox: "reject-approved-race".to_string(),
+                    workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+                    chunk_id: chunk_id.clone(),
+                    reason: "duplicate reviewer requests".to_string(),
+                }),
+            ))
+        })))
+        .await;
+
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| result
+                    .as_ref()
+                    .is_err_and(|status| status.code() == Code::FailedPrecondition))
+                .count(),
+            7
         );
+        let event = decision_event(&events, &chunk_id);
+        assert_eq!(event["unmapped"]["action"], "reject");
+        let latest = state
+            .store
+            .get_latest_policy("sb-reject-approved-race")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(latest.version, 2, "the policy rule must be removed once");
+        assert_eq!(event["unmapped"]["policy_version"], "v2");
+    }
+
+    #[tokio::test]
+    async fn branch07_undo_emits_correlated_pending_decision_with_result_revision() {
+        let state = test_server_state().await;
+        seed_ready_sandbox(&state, "undo-audit").await;
+        let chunk_id = submit_example_chunk(&state, "undo-audit", "agent_authored").await;
+        let review_token = state
+            .store
+            .get_draft_chunk(&chunk_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .review_token;
+        handle_approve_draft_chunk(
+            &state,
+            authed_request(ApproveDraftChunkRequest {
+                request_id: String::new(),
+                sandbox: "undo-audit".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+                chunk_id: chunk_id.clone(),
+                review_token,
+            }),
+        )
+        .await
+        .unwrap();
+
+        let (result, events) = capture_ocsf_jsonl(Box::pin(handle_undo_draft_chunk(
+            &state,
+            authed_request(UndoDraftChunkRequest {
+                request_id: String::new(),
+                sandbox: "undo-audit".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+                chunk_id: chunk_id.clone(),
+            }),
+        )))
+        .await;
+        let response = result.unwrap().into_inner();
+        let event = decision_event(&events, &chunk_id);
+        assert_eq!(event["unmapped"]["action"], "undo");
+        assert_eq!(event["unmapped"]["decision_reason"], "undo");
+        assert_eq!(event["unmapped"]["outcome"], "success");
+        assert_eq!(event["unmapped"]["previous_status"], "approved");
+        assert_eq!(event["unmapped"]["actor_class"], "user");
+        assert_eq!(
+            event["unmapped"]["policy_version"],
+            format!("v{}", response.policy_version)
+        );
+        assert_eq!(event["unmapped"]["policy_hash"], response.policy_hash);
+    }
+
+    #[tokio::test]
+    async fn auto_approve_helper_emits_correlated_gateway_decision() {
+        let state = test_server_state().await;
+        seed_ready_sandbox(&state, "auto-approve-audit").await;
+        seed_sandbox_approval_mode(&state, "auto-approve-audit", "auto").await;
+
+        let (chunk_id, events) = capture_ocsf_jsonl(submit_example_chunk(
+            &state,
+            "auto-approve-audit",
+            "agent_authored",
+        ))
+        .await;
+
+        let event = decision_event(&events, &chunk_id);
+        assert_eq!(event["container"]["uid"], "sb-auto-approve-audit");
+        assert_eq!(event["unmapped"]["chunk_id"], chunk_id);
+        assert_eq!(event["unmapped"]["actor"], "gateway:auto");
+        assert_eq!(event["unmapped"]["auto"], "true");
+        assert_eq!(event["unmapped"]["source"], "agent_authored");
+        assert_eq!(event["unmapped"]["prover_delta"], "empty");
+        assert_eq!(event["unmapped"]["resolved_from"], "sandbox");
+        assert!(event["unmapped"]["policy_version"].is_string());
+        assert!(event["unmapped"]["policy_hash"].is_string());
+    }
+
+    #[tokio::test]
+    async fn auto_approve_canonicalizes_hostile_analysis_mode_in_telemetry() {
+        let state = test_server_state().await;
+        seed_ready_sandbox(&state, "auto-approve-unknown-mode").await;
+        seed_sandbox_approval_mode(&state, "auto-approve-unknown-mode", "auto").await;
+        let hostile_mode = "future\nmode\rSENTINEL_ANALYSIS_MODE_SECRET";
+
+        let (chunk_id, events) = capture_ocsf_jsonl(submit_example_chunk(
+            &state,
+            "auto-approve-unknown-mode",
+            hostile_mode,
+        ))
+        .await;
+
+        let event = decision_event(&events, &chunk_id);
+        assert_eq!(event["unmapped"]["source"], "unknown");
+        assert!(!event.to_string().contains(hostile_mode));
+        assert!(!event.to_string().contains("SENTINEL_ANALYSIS_MODE_SECRET"));
+        assert_eq!(canonical_analysis_mode("mechanistic"), "mechanistic");
+        assert_eq!(canonical_analysis_mode("agent_authored"), "agent_authored");
+        assert_eq!(canonical_analysis_mode(hostile_mode), "unknown");
     }
 
     #[tokio::test]
@@ -21691,7 +22652,7 @@ mod tests {
         seed_ready_sandbox(&state, "supersede-audit").await;
         let older = submit_example_chunk(&state, "supersede-audit", "mechanistic").await;
 
-        let (newer, events) = capture_ocsf_jsonl(submit_example_chunk(
+        let (_newer, events) = capture_ocsf_jsonl(submit_example_chunk(
             &state,
             "supersede-audit",
             "agent_authored",
@@ -21701,12 +22662,764 @@ mod tests {
         let rejected = rejected_events(&events);
         assert_eq!(rejected.len(), 1, "events: {events:?}");
         let event = rejected[0];
+        assert!(event["metadata"].get("correlation_uid").is_none());
         assert_eq!(event["unmapped"]["chunk_id"], older);
-        assert_eq!(
-            event["unmapped"]["rejection_reason"],
-            format!("superseded by chunk {newer}")
-        );
+        assert_eq!(event["unmapped"]["rejection_reason_present"], "true");
+        assert!(event["unmapped"].get("rejection_reason").is_none());
         assert_eq!(event["unmapped"]["actor"], AUTO_REJECT_ACTOR);
+        assert_eq!(event["unmapped"]["decision_reason"], "superseded");
+    }
+
+    #[tokio::test]
+    async fn branch07_concurrent_supersede_uses_stable_newest_wins_order_and_emits_once() {
+        let state = test_server_state().await;
+        let sandbox = test_sandbox(
+            "sb-supersede-race",
+            "supersede-race",
+            ProtoSandboxPolicy::default(),
+            Vec::new(),
+        );
+        state.store.put_message(&sandbox).await.unwrap();
+
+        let mut older = pending_draft_chunk("chunk-older", sandbox.object_id());
+        older.created_at_ms = 10;
+        older.first_seen_ms = 10;
+        older.host = "race.example.com".to_string();
+        older.port = 443;
+        older.binary = "/usr/bin/curl".to_string();
+        let mut newer = pending_draft_chunk("chunk-newer", sandbox.object_id());
+        newer.created_at_ms = 20;
+        newer.first_seen_ms = 20;
+        newer.host.clone_from(&older.host);
+        newer.port = older.port;
+        newer.binary.clone_from(&older.binary);
+        state
+            .store
+            .put_draft_chunk(&older, None, "default")
+            .await
+            .unwrap();
+        state
+            .store
+            .put_draft_chunk(&newer, None, "default")
+            .await
+            .unwrap();
+
+        let ((), events) = capture_ocsf_jsonl(Box::pin(async {
+            tokio::join!(
+                crate::persistence::lock_order::branch(async {
+                    let _guard = state
+                        .compute
+                        .mutation_guard(MutationScope::sandbox("default", sandbox.object_id()))
+                        .await
+                        .unwrap();
+                    supersede_other_pending_chunks_for_endpoint_locked(
+                        &state,
+                        &sandbox,
+                        &newer.id,
+                        &newer.host,
+                        newer.port,
+                        &newer.binary,
+                    )
+                    .await;
+                }),
+                crate::persistence::lock_order::branch(async {
+                    let _guard = state
+                        .compute
+                        .mutation_guard(MutationScope::sandbox("default", sandbox.object_id()))
+                        .await
+                        .unwrap();
+                    supersede_other_pending_chunks_for_endpoint_locked(
+                        &state,
+                        &sandbox,
+                        &older.id,
+                        &older.host,
+                        older.port,
+                        &older.binary,
+                    )
+                    .await;
+                }),
+            );
+        }))
+        .await;
+
+        let older = state
+            .store
+            .get_draft_chunk(&older.id)
+            .await
+            .unwrap()
+            .unwrap();
+        let newer = state
+            .store
+            .get_draft_chunk(&newer.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(older.status, "rejected");
+        assert_eq!(newer.status, "pending");
+        let rejected = rejected_events(&events);
+        assert_eq!(rejected.len(), 1, "events: {events:?}");
+        assert_eq!(rejected[0]["unmapped"]["chunk_id"], older.id);
+    }
+
+    #[tokio::test]
+    async fn branch07_manual_approval_serializes_with_automatic_reconcile() {
+        let state = test_server_state().await;
+        seed_ready_sandbox(&state, "approve-reconcile-race").await;
+        let chunk_id =
+            submit_example_chunk(&state, "approve-reconcile-race", "agent_authored").await;
+        let chunk = state
+            .store
+            .get_draft_chunk(&chunk_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let rule = decode_draft_chunk_rule(&chunk).unwrap().unwrap();
+        let mut covering_policy = ProtoSandboxPolicy::default();
+        covering_policy
+            .network_policies
+            .insert(chunk.rule_name.clone(), rule);
+        let covering_hash = deterministic_policy_hash(&covering_policy);
+        let sandbox = state
+            .store
+            .get_message::<Sandbox>("sb-approve-reconcile-race")
+            .await
+            .unwrap()
+            .unwrap();
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+
+        let ((approve, reconciled), events) = capture_ocsf_jsonl(Box::pin(async {
+            tokio::join!(
+                crate::persistence::lock_order::branch(async {
+                    barrier.wait().await;
+                    handle_approve_draft_chunk(
+                        &state,
+                        authed_request(ApproveDraftChunkRequest {
+                            request_id: String::new(),
+                            sandbox: "approve-reconcile-race".to_string(),
+                            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                                "default",
+                            )),
+                            chunk_id: chunk_id.clone(),
+                            review_token: chunk.review_token.clone(),
+                        }),
+                    )
+                    .await
+                }),
+                crate::persistence::lock_order::branch(async {
+                    barrier.wait().await;
+                    let _guard = state
+                        .compute
+                        .mutation_guard(MutationScope::sandbox("default", sandbox.object_id()))
+                        .await
+                        .unwrap();
+                    reconcile_pending_chunks_covered_by_policy_locked(
+                        &state,
+                        &sandbox,
+                        &covering_policy,
+                        41,
+                        &covering_hash,
+                    )
+                    .await
+                }),
+            )
+        }))
+        .await;
+
+        approve.unwrap();
+        assert!(matches!(reconciled.unwrap(), 0 | 1));
+        let final_chunk = state
+            .store
+            .get_draft_chunk(&chunk_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(final_chunk.status, "approved");
+        let decisions = events
+            .iter()
+            .filter(|event| event["unmapped"]["chunk_id"] == chunk_id)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            decisions
+                .iter()
+                .filter(|event| event["unmapped"]["action"] == "approve")
+                .count(),
+            1,
+            "events: {events:?}"
+        );
+        assert!(decisions.len() == 1 || decisions.len() == 2);
+        if decisions.len() == 2 {
+            assert_eq!(decisions[0]["unmapped"]["action"], "reject");
+            assert_eq!(decisions[1]["unmapped"]["action"], "approve");
+        }
+    }
+
+    #[tokio::test]
+    async fn branch07_auto_approval_serializes_with_automatic_reconcile() {
+        let state = test_server_state().await;
+        seed_ready_sandbox(&state, "auto-reconcile-race").await;
+        let chunk_id = submit_example_chunk(&state, "auto-reconcile-race", "agent_authored").await;
+        let chunk = state
+            .store
+            .get_draft_chunk(&chunk_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let rule = decode_draft_chunk_rule(&chunk).unwrap().unwrap();
+        let mut covering_policy = ProtoSandboxPolicy::default();
+        covering_policy
+            .network_policies
+            .insert(chunk.rule_name.clone(), rule);
+        let covering_hash = deterministic_policy_hash(&covering_policy);
+        let sandbox = state
+            .store
+            .get_message::<Sandbox>("sb-auto-reconcile-race")
+            .await
+            .unwrap()
+            .unwrap();
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+
+        let ((auto_approve, reconciled), events) = capture_ocsf_jsonl(Box::pin(async {
+            tokio::join!(
+                crate::persistence::lock_order::branch(async {
+                    barrier.wait().await;
+                    let _guard = state
+                        .compute
+                        .mutation_guard(MutationScope::sandbox("default", sandbox.object_id()))
+                        .await
+                        .unwrap();
+                    auto_approve_chunk_locked(
+                        &state,
+                        &chunk_id,
+                        AutoApproveChunkContext {
+                            sandbox: &sandbox,
+                            workspace: "default",
+                            source: "agent_authored",
+                            resolved_from: "sandbox",
+                        },
+                    )
+                    .await
+                }),
+                crate::persistence::lock_order::branch(async {
+                    barrier.wait().await;
+                    let _guard = state
+                        .compute
+                        .mutation_guard(MutationScope::sandbox("default", sandbox.object_id()))
+                        .await
+                        .unwrap();
+                    reconcile_pending_chunks_covered_by_policy_locked(
+                        &state,
+                        &sandbox,
+                        &covering_policy,
+                        42,
+                        &covering_hash,
+                    )
+                    .await
+                }),
+            )
+        }))
+        .await;
+
+        auto_approve.unwrap();
+        assert!(matches!(reconciled.unwrap(), 0 | 1));
+        let final_chunk = state
+            .store
+            .get_draft_chunk(&chunk_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let decisions = events
+            .iter()
+            .filter(|event| event["unmapped"]["chunk_id"] == chunk_id)
+            .collect::<Vec<_>>();
+        assert_eq!(decisions.len(), 1, "events: {events:?}");
+        match final_chunk.status.as_str() {
+            "approved" => assert_eq!(decisions[0]["unmapped"]["action"], "auto_approve"),
+            "rejected" => assert_eq!(decisions[0]["unmapped"]["action"], "reject"),
+            status => panic!("unexpected final status {status}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn branch07_undo_serializes_with_automatic_reconcile() {
+        let state = test_server_state().await;
+        seed_ready_sandbox(&state, "undo-reconcile-race").await;
+        let chunk_id = submit_example_chunk(&state, "undo-reconcile-race", "agent_authored").await;
+        let pending = state
+            .store
+            .get_draft_chunk(&chunk_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let rule = decode_draft_chunk_rule(&pending).unwrap().unwrap();
+        handle_approve_draft_chunk(
+            &state,
+            authed_request(ApproveDraftChunkRequest {
+                request_id: String::new(),
+                sandbox: "undo-reconcile-race".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+                chunk_id: chunk_id.clone(),
+                review_token: pending.review_token,
+            }),
+        )
+        .await
+        .unwrap();
+        let mut covering_policy = ProtoSandboxPolicy::default();
+        covering_policy
+            .network_policies
+            .insert(pending.rule_name, rule);
+        let covering_hash = deterministic_policy_hash(&covering_policy);
+        let sandbox = state
+            .store
+            .get_message::<Sandbox>("sb-undo-reconcile-race")
+            .await
+            .unwrap()
+            .unwrap();
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+
+        let ((undo, reconciled), events) = capture_ocsf_jsonl(Box::pin(async {
+            tokio::join!(
+                crate::persistence::lock_order::branch(async {
+                    barrier.wait().await;
+                    handle_undo_draft_chunk(
+                        &state,
+                        authed_request(UndoDraftChunkRequest {
+                            request_id: String::new(),
+                            sandbox: "undo-reconcile-race".to_string(),
+                            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                                "default",
+                            )),
+                            chunk_id: chunk_id.clone(),
+                        }),
+                    )
+                    .await
+                }),
+                crate::persistence::lock_order::branch(async {
+                    barrier.wait().await;
+                    let _guard = state
+                        .compute
+                        .mutation_guard(MutationScope::sandbox("default", sandbox.object_id()))
+                        .await
+                        .unwrap();
+                    reconcile_pending_chunks_covered_by_policy_locked(
+                        &state,
+                        &sandbox,
+                        &covering_policy,
+                        43,
+                        &covering_hash,
+                    )
+                    .await
+                }),
+            )
+        }))
+        .await;
+
+        undo.unwrap();
+        assert!(matches!(reconciled.unwrap(), 0 | 1));
+        let final_chunk = state
+            .store
+            .get_draft_chunk(&chunk_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let decisions = events
+            .iter()
+            .filter(|event| event["unmapped"]["chunk_id"] == chunk_id)
+            .collect::<Vec<_>>();
+        assert_eq!(decisions[0]["unmapped"]["action"], "undo");
+        match final_chunk.status.as_str() {
+            "pending" => assert_eq!(decisions.len(), 1, "events: {events:?}"),
+            "rejected" => {
+                assert_eq!(decisions.len(), 2, "events: {events:?}");
+                assert_eq!(decisions[1]["unmapped"]["action"], "reject");
+            }
+            status => panic!("unexpected final status {status}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn branch07_bulk_approval_serializes_with_superseding_submission() {
+        let state = test_server_state().await;
+        seed_ready_sandbox(&state, "bulk-supersede-race").await;
+        let older_id = submit_example_chunk(&state, "bulk-supersede-race", "agent_authored").await;
+        let older = state
+            .store
+            .get_draft_chunk(&older_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+
+        let ((bulk, submit), events) = capture_ocsf_jsonl(Box::pin(async {
+            tokio::join!(
+                crate::persistence::lock_order::branch(async {
+                    barrier.wait().await;
+                    handle_approve_all_draft_chunks(
+                        &state,
+                        authed_request(ApproveAllDraftChunksRequest {
+                            sandbox: "bulk-supersede-race".to_string(),
+                            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                                "default",
+                            )),
+                            approvals: vec![DraftChunkApproval {
+                                chunk_id: older_id.clone(),
+                                review_token: older.review_token.clone(),
+                            }],
+                            ..Default::default()
+                        }),
+                    )
+                    .await
+                }),
+                crate::persistence::lock_order::branch(async {
+                    barrier.wait().await;
+                    handle_submit_policy_analysis(
+                        &state,
+                        with_user(Request::new(SubmitPolicyAnalysisRequest {
+                            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                                "default",
+                            )),
+                            name: "bulk-supersede-race".to_string(),
+                            analysis_mode: "agent_authored".to_string(),
+                            proposed_chunks: vec![PolicyChunk {
+                                rule_name: "refined_example_8080".to_string(),
+                                proposed_rule: Some(
+                                    decode_draft_chunk_rule(&older).unwrap().unwrap(),
+                                ),
+                                ..Default::default()
+                            }],
+                            ..Default::default()
+                        })),
+                    )
+                    .await
+                }),
+            )
+        }))
+        .await;
+
+        let submitted = submit.unwrap().into_inner();
+        assert_eq!(submitted.accepted_chunks, 1);
+        let newer = state
+            .store
+            .get_draft_chunk(&submitted.accepted_chunk_ids[0])
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(newer.status, "pending");
+        let final_older = state
+            .store
+            .get_draft_chunk(&older_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let older_decisions = events
+            .iter()
+            .filter(|event| event["unmapped"]["chunk_id"] == older_id)
+            .collect::<Vec<_>>();
+        assert_eq!(older_decisions.len(), 1, "events: {events:?}");
+        match bulk {
+            Ok(response) => {
+                assert_eq!(response.into_inner().chunks_approved, 1);
+                assert_eq!(final_older.status, "approved");
+                assert_eq!(older_decisions[0]["unmapped"]["action"], "approve");
+            }
+            Err(status) => {
+                assert_eq!(status.code(), Code::FailedPrecondition);
+                assert_eq!(final_older.status, "rejected");
+                assert_eq!(older_decisions[0]["unmapped"]["action"], "reject");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn branch07_clear_serializes_with_manual_approval() {
+        let state = test_server_state().await;
+        seed_ready_sandbox(&state, "clear-approve-race").await;
+        let chunk_id = submit_example_chunk(&state, "clear-approve-race", "agent_authored").await;
+        let chunk = state
+            .store
+            .get_draft_chunk(&chunk_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+
+        let ((clear, approve), events) = capture_ocsf_jsonl(Box::pin(async {
+            tokio::join!(
+                crate::persistence::lock_order::branch(async {
+                    barrier.wait().await;
+                    handle_clear_draft_chunks(
+                        &state,
+                        authed_request(ClearDraftChunksRequest {
+                            request_id: String::new(),
+                            sandbox: "clear-approve-race".to_string(),
+                            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                                "default",
+                            )),
+                        }),
+                    )
+                    .await
+                }),
+                crate::persistence::lock_order::branch(async {
+                    barrier.wait().await;
+                    handle_approve_draft_chunk(
+                        &state,
+                        authed_request(ApproveDraftChunkRequest {
+                            request_id: String::new(),
+                            sandbox: "clear-approve-race".to_string(),
+                            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                                "default",
+                            )),
+                            chunk_id: chunk_id.clone(),
+                            review_token: chunk.review_token.clone(),
+                        }),
+                    )
+                    .await
+                }),
+            )
+        }))
+        .await;
+
+        let cleared = clear.unwrap().into_inner().chunks_cleared;
+        let stored = state.store.get_draft_chunk(&chunk_id).await.unwrap();
+        let approval_events = events
+            .iter()
+            .filter(|event| {
+                event["unmapped"]["chunk_id"] == chunk_id
+                    && event["unmapped"]["action"] == "approve"
+            })
+            .count();
+        match approve {
+            Ok(_) => {
+                assert_eq!(cleared, 0);
+                assert_eq!(stored.unwrap().status, "approved");
+                assert_eq!(approval_events, 1);
+            }
+            Err(status) => {
+                assert_eq!(status.code(), Code::NotFound);
+                assert_eq!(cleared, 1);
+                assert!(stored.is_none());
+                assert_eq!(approval_events, 0);
+                assert!(
+                    state
+                        .store
+                        .get_latest_policy("sb-clear-approve-race")
+                        .await
+                        .unwrap()
+                        .is_none()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn branch07_submit_policy_analysis_chunk_limit_boundaries() {
+        assert!(validate_submit_policy_analysis_chunk_count(0).is_ok());
+        assert!(
+            validate_submit_policy_analysis_chunk_count(MAX_SUBMIT_POLICY_ANALYSIS_CHUNKS).is_ok()
+        );
+        let error =
+            validate_submit_policy_analysis_chunk_count(MAX_SUBMIT_POLICY_ANALYSIS_CHUNKS + 1)
+                .unwrap_err();
+        assert_eq!(error.code(), Code::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn branch07_bulk_approval_rejects_duplicate_chunk_ids_without_mutation() {
+        let state = test_server_state().await;
+        seed_ready_sandbox(&state, "bulk-duplicate").await;
+        let chunk_id = submit_example_chunk(&state, "bulk-duplicate", "agent_authored").await;
+        let chunk = state
+            .store
+            .get_draft_chunk(&chunk_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let approval = DraftChunkApproval {
+            chunk_id: chunk_id.clone(),
+            review_token: chunk.review_token,
+        };
+
+        let error = handle_approve_all_draft_chunks(
+            &state,
+            authed_request(ApproveAllDraftChunksRequest {
+                sandbox: "bulk-duplicate".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+                approvals: vec![approval.clone(), approval],
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error.code(), Code::InvalidArgument);
+        assert_eq!(
+            state
+                .store
+                .get_draft_chunk(&chunk_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            "pending"
+        );
+        assert!(
+            state
+                .store
+                .get_latest_policy("sb-bulk-duplicate")
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn branch07_edit_and_clear_emit_structural_lifecycle_records() {
+        let state = test_server_state().await;
+        seed_ready_sandbox(&state, "edit-lifecycle").await;
+        let chunk_id = submit_example_chunk(&state, "edit-lifecycle", "agent_authored").await;
+        let chunk = state
+            .store
+            .get_draft_chunk(&chunk_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut edited_rule = decode_draft_chunk_rule(&chunk).unwrap().unwrap();
+        edited_rule.endpoints[0].host = "edited-lifecycle.example.com".to_string();
+
+        let (edit_result, edit_events) = capture_ocsf_jsonl(Box::pin(handle_edit_draft_chunk(
+            &state,
+            authed_request(EditDraftChunkRequest {
+                request_id: String::new(),
+                sandbox: "edit-lifecycle".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+                chunk_id: chunk_id.clone(),
+                proposed_rule: Some(edited_rule),
+            }),
+        )))
+        .await;
+        edit_result.unwrap();
+        let edit_event = decision_event(&edit_events, &chunk_id);
+        assert_eq!(edit_event["unmapped"]["action"], "edit");
+        assert_eq!(edit_event["unmapped"]["decision_reason"], "reviewer");
+        assert!(
+            !edit_event
+                .to_string()
+                .contains("edited-lifecycle.example.com")
+        );
+
+        let (clear_result, clear_events) = capture_ocsf_jsonl(handle_clear_draft_chunks(
+            &state,
+            authed_request(ClearDraftChunksRequest {
+                request_id: String::new(),
+                sandbox: "edit-lifecycle".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+            }),
+        ))
+        .await;
+        assert_eq!(clear_result.unwrap().into_inner().chunks_cleared, 1);
+        assert_eq!(clear_events.len(), 1, "events: {clear_events:?}");
+        let clear_event = &clear_events[0];
+        assert_eq!(clear_event["unmapped"]["action"], "cancel_pending");
+        assert_eq!(clear_event["unmapped"]["decision_reason"], "reviewer");
+        assert_eq!(clear_event["unmapped"]["operation_count"], "1");
+        assert!(clear_event["unmapped"].get("chunk_id").is_none());
+    }
+
+    #[tokio::test]
+    async fn branch07_edit_serializes_with_manual_approval() {
+        let state = test_server_state().await;
+        seed_ready_sandbox(&state, "edit-approve-race").await;
+        let chunk_id = submit_example_chunk(&state, "edit-approve-race", "agent_authored").await;
+        let chunk = state
+            .store
+            .get_draft_chunk(&chunk_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut edited_rule = decode_draft_chunk_rule(&chunk).unwrap().unwrap();
+        edited_rule.endpoints[0].host = "edited-race.example.com".to_string();
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+
+        let ((edit, approve), events) = capture_ocsf_jsonl(Box::pin(async {
+            tokio::join!(
+                crate::persistence::lock_order::branch(async {
+                    barrier.wait().await;
+                    handle_edit_draft_chunk(
+                        &state,
+                        authed_request(EditDraftChunkRequest {
+                            request_id: String::new(),
+                            sandbox: "edit-approve-race".to_string(),
+                            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                                "default",
+                            )),
+                            chunk_id: chunk_id.clone(),
+                            proposed_rule: Some(edited_rule),
+                        }),
+                    )
+                    .await
+                }),
+                crate::persistence::lock_order::branch(async {
+                    barrier.wait().await;
+                    handle_approve_draft_chunk(
+                        &state,
+                        authed_request(ApproveDraftChunkRequest {
+                            request_id: String::new(),
+                            sandbox: "edit-approve-race".to_string(),
+                            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                                "default",
+                            )),
+                            chunk_id: chunk_id.clone(),
+                            review_token: chunk.review_token.clone(),
+                        }),
+                    )
+                    .await
+                }),
+            )
+        }))
+        .await;
+
+        let final_chunk = state
+            .store
+            .get_draft_chunk(&chunk_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let decisions = events
+            .iter()
+            .filter(|event| event["unmapped"]["chunk_id"] == chunk_id)
+            .collect::<Vec<_>>();
+        assert_eq!(decisions.len(), 1, "events: {events:?}");
+        match (edit, approve) {
+            (Ok(_), Err(status)) => {
+                assert_eq!(status.code(), Code::FailedPrecondition);
+                assert_eq!(final_chunk.status, "pending");
+                assert_eq!(decisions[0]["unmapped"]["action"], "edit");
+            }
+            (Err(status), Ok(_)) => {
+                assert_eq!(status.code(), Code::FailedPrecondition);
+                assert_eq!(final_chunk.status, "approved");
+                assert_eq!(decisions[0]["unmapped"]["action"], "approve");
+            }
+            _ => panic!("unexpected edit/approval outcome"),
+        }
+    }
+
+    #[test]
+    fn branch07_merge_operation_summary_is_bounded_and_content_free() {
+        let operations = vec![
+            PolicyMergeOp::RemoveRule {
+                rule_name: "SENTINEL_RULE_NAME".to_string(),
+            },
+            PolicyMergeOp::RemoveBinary {
+                rule_name: "SENTINEL_RULE_NAME".to_string(),
+                binary_path: "/secret/SENTINEL_BINARY".to_string(),
+            },
+        ];
+        let summary = MergeOperationKindCounts::from_operations(&operations).summary();
+        assert_eq!(
+            summary,
+            "add_rule=0,remove_endpoint=0,remove_rule=1,add_deny_rules=0,add_allow_rules=0,remove_binary=1"
+        );
+        assert!(!summary.contains("SENTINEL"));
     }
 
     #[tokio::test]
@@ -21714,7 +23427,7 @@ mod tests {
         let state = test_server_state().await;
         seed_ready_sandbox(&state, "covered-audit").await;
         seed_sandbox_approval_mode(&state, "covered-audit", "auto").await;
-        let approved = submit_example_chunk(&state, "covered-audit", "agent_authored").await;
+        let _approved = submit_example_chunk(&state, "covered-audit", "agent_authored").await;
 
         let (incoming, events) =
             capture_ocsf_jsonl(submit_example_chunk(&state, "covered-audit", "mechanistic")).await;
@@ -21722,127 +23435,56 @@ mod tests {
         let rejected = rejected_events(&events);
         assert_eq!(rejected.len(), 1, "events: {events:?}");
         let event = rejected[0];
+        assert!(event["metadata"].get("correlation_uid").is_none());
         assert_eq!(event["unmapped"]["chunk_id"], incoming);
-        assert!(
-            event["unmapped"]["rejection_reason"]
-                .as_str()
-                .unwrap()
-                .contains(&approved),
-            "reason should name the covering chunk: {event}"
-        );
+        assert_eq!(event["unmapped"]["rejection_reason_present"], "true");
+        assert!(event["unmapped"].get("rejection_reason").is_none());
         assert_eq!(event["unmapped"]["actor"], AUTO_REJECT_ACTOR);
+        assert_eq!(event["unmapped"]["decision_reason"], "redundant");
     }
 
-    #[test]
-    fn summarize_cli_policy_merge_op_formats_rest_allow_rules() {
-        let operation = PolicyMergeOp::AddAllowRules {
-            target: L7RuleTarget {
-                rule_name: "github".to_string(),
-                host: "api.github.com".to_string(),
-                ports: vec![443],
-                path: Some(String::new()),
-                binaries: L7BinaryScope::Restricted(vec![NetworkBinary {
-                    path: "/usr/bin/curl".to_string(),
-                }]),
-            },
-            rules: vec![L7Rule {
-                allow: Some(openshell_core::proto::L7Allow {
-                    method: "POST".to_string(),
-                    path: "/repos/*/issues".to_string(),
-                    command: String::new(),
-                    query: HashMap::new(),
-                    operation_type: String::new(),
-                    operation_name: String::new(),
-                    fields: Vec::new(),
-                    params: HashMap::default(),
-                }),
-            }],
-        };
-
-        assert_eq!(
-            summarize_cli_policy_merge_op(&operation),
-            "add-allow api.github.com:443 rule=github endpoint-path=Some(\"\") binaries=[/usr/bin/curl] [POST /repos/*/issues]"
+    #[tokio::test]
+    async fn branch07_policy_decision_ocsf_excludes_hostile_rule_content_and_bounds_large_fields() {
+        let sandbox = test_sandbox(
+            "sb-structural-audit",
+            "structural-audit",
+            ProtoSandboxPolicy::default(),
+            Vec::new(),
         );
-    }
+        let hostile = format!("{}UNLABELED_SECRET", "x".repeat(2 * 1024 * 1024));
+        let mut chunk = pending_draft_chunk("structural-chunk", sandbox.object_id());
+        chunk.rule_name.clone_from(&hostile);
+        chunk.host.clone_from(&hostile);
+        chunk.binary.clone_from(&hostile);
 
-    #[test]
-    fn summarize_cli_policy_merge_op_formats_endpoint_additions() {
-        let operation = PolicyMergeOp::AddRule {
-            rule_name: "github_api".to_string(),
-            rule: NetworkPolicyRule {
-                name: "github_api".to_string(),
-                endpoints: vec![NetworkEndpoint {
-                    host: "api.github.com".to_string(),
-                    port: 443,
-                    protocol: "rest".to_string(),
-                    access: openshell_core::proto::NetworkAccessPreset::ReadOnly as i32,
-                    enforcement: openshell_core::proto::NetworkEnforcementMode::Enforce as i32,
-                    ..Default::default()
-                }],
-                binaries: vec![NetworkBinary {
-                    path: "/usr/bin/curl".to_string(),
-                }],
-            },
-        };
+        let ((), events) = capture_ocsf_jsonl(async {
+            emit_gateway_policy_reject_audit_log(
+                &sandbox,
+                &chunk,
+                GatewayPolicyRejectDecision {
+                    rejection_reason: &hostile,
+                    decision_reason: GatewayPolicyDecisionReason::Redundant,
+                    actor: AUTO_REJECT_ACTOR,
+                    actor_class: "gateway",
+                    version: 9,
+                    policy_hash: "sha256:structural",
+                },
+            );
+        })
+        .await;
 
-        assert_eq!(
-            summarize_cli_policy_merge_op(&operation),
-            "add-endpoint github_api endpoints=[api.github.com:443 protocol=rest access=read-only enforcement=enforce] binaries=[/usr/bin/curl]"
-        );
-    }
+        let event = decision_event(&events, &chunk.id);
+        let rendered = event.to_string();
+        assert!(!rendered.contains("UNLABELED_SECRET"));
+        assert!(!rendered.contains(&"x".repeat(MAX_TELEMETRY_FIELD_CHARS + 1)));
+        assert_eq!(event["message"], "gateway policy reject decision");
+        assert_eq!(event["unmapped"]["rejection_reason_present"], "true");
+        assert_eq!(event["unmapped"]["decision_reason"], "redundant");
 
-    #[test]
-    fn summarize_cli_policy_merge_op_formats_websocket_credential_rewrite() {
-        let operation = PolicyMergeOp::AddRule {
-            rule_name: "realtime_api".to_string(),
-            rule: NetworkPolicyRule {
-                name: "realtime_api".to_string(),
-                endpoints: vec![NetworkEndpoint {
-                    host: "realtime.example.com".to_string(),
-                    port: 443,
-                    protocol: "websocket".to_string(),
-                    access: openshell_core::proto::NetworkAccessPreset::ReadWrite as i32,
-                    enforcement: openshell_core::proto::NetworkEnforcementMode::Enforce as i32,
-                    websocket_credential_rewrite: true,
-                    ..Default::default()
-                }],
-                binaries: vec![NetworkBinary {
-                    path: "/usr/bin/node".to_string(),
-                }],
-            },
-        };
-
-        assert_eq!(
-            summarize_cli_policy_merge_op(&operation),
-            "add-endpoint realtime_api endpoints=[realtime.example.com:443 protocol=websocket access=read-write enforcement=enforce websocket_credential_rewrite=true] binaries=[/usr/bin/node]"
-        );
-    }
-
-    #[test]
-    fn summarize_cli_policy_merge_op_formats_request_body_credential_rewrite() {
-        let operation = PolicyMergeOp::AddRule {
-            rule_name: "slack_api".to_string(),
-            rule: NetworkPolicyRule {
-                name: "slack_api".to_string(),
-                endpoints: vec![NetworkEndpoint {
-                    host: "slack.com".to_string(),
-                    port: 443,
-                    protocol: "rest".to_string(),
-                    access: openshell_core::proto::NetworkAccessPreset::ReadWrite as i32,
-                    enforcement: openshell_core::proto::NetworkEnforcementMode::Enforce as i32,
-                    request_body_credential_rewrite: true,
-                    ..Default::default()
-                }],
-                binaries: vec![NetworkBinary {
-                    path: "/usr/bin/node".to_string(),
-                }],
-            },
-        };
-
-        assert_eq!(
-            summarize_cli_policy_merge_op(&operation),
-            "add-endpoint slack_api endpoints=[slack.com:443 protocol=rest access=read-write enforcement=enforce request_body_credential_rewrite=true] binaries=[/usr/bin/node]"
-        );
+        let normalized = sanitize_telemetry_text(&hostile, MAX_TELEMETRY_FIELD_CHARS);
+        assert_eq!(normalized.chars().count(), MAX_TELEMETRY_FIELD_CHARS);
+        assert!(normalized.ends_with("..."));
+        assert!(!normalized.contains("UNLABELED_SECRET"));
     }
 
     // ---- merge_chunk_into_policy ----

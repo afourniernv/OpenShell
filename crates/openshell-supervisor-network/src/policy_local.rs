@@ -11,15 +11,14 @@ use openshell_core::proto::{
     L7Allow, L7DenyRule, L7Rule, NetworkBinary, NetworkEndpoint, NetworkPolicyRule, PolicyChunk,
     SandboxPolicy as ProtoSandboxPolicy,
 };
-use openshell_ocsf::{
-    ConfigStateChangeBuilder, SeverityId, StateId, StatusId, ocsf_emit, sanitize_reason_for_audit,
-};
+use openshell_ocsf::{ConfigStateChangeBuilder, SeverityId, StateId, StatusId, ocsf_emit};
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::RwLock;
+use tracing::Instrument as _;
 
 pub const POLICY_LOCAL_HOST: &str = "policy.local";
 
@@ -86,6 +85,232 @@ const MAX_DENIAL_LINE_BYTES: usize = 4096;
 
 /// Most recent denial lines retained for one hosted sandbox instance.
 const MAX_INSTANCE_DENIAL_LINES: usize = 256;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PolicyLocalOperation {
+    ReadCurrentPolicy,
+    ReadDenials,
+    SubmitProposal,
+    ReadProposal,
+    WaitForDecision,
+    Unknown,
+}
+
+impl PolicyLocalOperation {
+    fn from_request(method: &str, path: &str) -> Self {
+        let route = path.split_once('?').map_or(path, |(route, _)| route);
+        match (method, route) {
+            ("GET", ROUTE_POLICY_CURRENT) => Self::ReadCurrentPolicy,
+            ("GET", ROUTE_DENIALS) => Self::ReadDenials,
+            ("POST", ROUTE_PROPOSALS) => Self::SubmitProposal,
+            ("GET", route) if route.starts_with(ROUTE_PROPOSALS_PREFIX) => {
+                if route.ends_with("/wait") {
+                    Self::WaitForDecision
+                } else {
+                    Self::ReadProposal
+                }
+            }
+            _ => Self::Unknown,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::ReadCurrentPolicy => "read_current_policy",
+            Self::ReadDenials => "read_denials",
+            Self::SubmitProposal => "submit_proposal",
+            Self::ReadProposal => "read_proposal",
+            Self::WaitForDecision => "wait_for_decision",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+struct PolicyLocalCorrelation {
+    request_id: String,
+    span: tracing::Span,
+    completed: bool,
+}
+
+impl PolicyLocalCorrelation {
+    fn new(method: &str, path: &str, initial_request: &[u8]) -> Self {
+        Self::build(
+            method,
+            path,
+            initial_request,
+            uuid::Uuid::new_v4().to_string(),
+        )
+    }
+
+    fn build(method: &str, path: &str, initial_request: &[u8], request_id: String) -> Self {
+        let operation = PolicyLocalOperation::from_request(method, path);
+        let sandbox_id = openshell_ocsf::ctx::ctx().sandbox_id.clone();
+        let http_method = match method {
+            "GET" => "GET",
+            "POST" => "POST",
+            _ => "OTHER",
+        };
+        let span = tracing::info_span!(
+            "openshell.policy.local",
+            "openshell.request.id" = %request_id,
+            "openshell.sandbox.id" = tracing::field::Empty,
+            "openshell.policy.operation" = operation.as_str(),
+            "openshell.policy.proposal.chunk_id" = tracing::field::Empty,
+            "openshell.policy.proposal.status" = tracing::field::Empty,
+            "openshell.policy.proposal.accepted_count" = tracing::field::Empty,
+            "openshell.policy.proposal.rejected_count" = tracing::field::Empty,
+            "openshell.policy.reload_observed" = tracing::field::Empty,
+            "openshell.policy.outcome" = tracing::field::Empty,
+            "http.request.method" = http_method,
+            "http.response.status_code" = tracing::field::Empty,
+        );
+        let headers = crate::l7::correlation::trace_headers(initial_request);
+        let _ = openshell_otel::set_parent_from_headers(&span, &headers);
+        if !sandbox_id.is_empty() {
+            span.record("openshell.sandbox.id", sandbox_id.as_str());
+        }
+        Self {
+            request_id,
+            span,
+            completed: false,
+        }
+    }
+
+    fn record_response(&self, status: u16, payload: &serde_json::Value) {
+        self.span.record("http.response.status_code", status);
+
+        let proposal_status = payload
+            .get("status")
+            .and_then(serde_json::Value::as_str)
+            .filter(|status| matches!(*status, "submitted" | "pending" | "approved" | "rejected"));
+        if let Some(proposal_status) = proposal_status {
+            self.span
+                .record("openshell.policy.proposal.status", proposal_status);
+        }
+
+        if let Some(count) = payload
+            .get("accepted_chunks")
+            .and_then(serde_json::Value::as_u64)
+        {
+            self.span.record(
+                "openshell.policy.proposal.accepted_count",
+                i64::try_from(count).unwrap_or(i64::MAX),
+            );
+        }
+        if let Some(count) = payload
+            .get("rejected_chunks")
+            .and_then(serde_json::Value::as_u64)
+        {
+            self.span.record(
+                "openshell.policy.proposal.rejected_count",
+                i64::try_from(count).unwrap_or(i64::MAX),
+            );
+        }
+        if let Some(reloaded) = payload
+            .get("policy_reloaded")
+            .and_then(serde_json::Value::as_bool)
+        {
+            self.span
+                .record("openshell.policy.reload_observed", reloaded);
+        }
+
+        if let Some(chunk_id) = response_chunk_id(payload) {
+            self.span
+                .record("openshell.policy.proposal.chunk_id", chunk_id);
+        }
+
+        let outcome = policy_local_outcome(status, payload, proposal_status);
+        self.span.record("openshell.policy.outcome", outcome);
+    }
+
+    fn complete(&mut self) {
+        self.completed = true;
+    }
+
+    fn emit_lifecycle(&self, mut event: openshell_ocsf::OcsfEvent) {
+        event.set_correlation_uid(self.request_id.clone());
+        openshell_otel::with_span_context(&self.span, || {
+            self.span.in_scope(|| ocsf_emit!(event));
+        });
+    }
+}
+
+fn policy_local_outcome(
+    status: u16,
+    payload: &serde_json::Value,
+    proposal_status: Option<&str>,
+) -> &'static str {
+    if status >= 500 {
+        return "platform_error";
+    }
+    if status >= 400 {
+        return "client_error";
+    }
+    if payload
+        .get("timed_out")
+        .and_then(serde_json::Value::as_bool)
+        == Some(true)
+    {
+        return "timed_out";
+    }
+
+    if proposal_status == Some("submitted") {
+        let accepted = payload
+            .get("accepted_chunks")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+        let rejected = payload
+            .get("rejected_chunks")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+        return match (accepted > 0, rejected > 0) {
+            (true, false) => "accepted",
+            (true, true) => "partially_accepted",
+            // A successful submission response with no accepted chunks is
+            // not useful to the agent, even if an older gateway omitted its
+            // rejected count. Keep the outcome bounded and fail closed.
+            (false, _) => "rejected",
+        };
+    }
+
+    if proposal_status == Some("approved") {
+        return if payload
+            .get("policy_reloaded")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+        {
+            "approved"
+        } else {
+            "reload_pending"
+        };
+    }
+
+    match proposal_status {
+        Some("pending") => "pending",
+        Some("rejected") => "rejected",
+        _ => "success",
+    }
+}
+
+impl Drop for PolicyLocalCorrelation {
+    fn drop(&mut self) {
+        if !self.completed {
+            self.span.record("openshell.policy.outcome", "incomplete");
+        }
+    }
+}
+
+fn response_chunk_id(payload: &serde_json::Value) -> Option<&str> {
+    let direct = payload.get("chunk_id").and_then(serde_json::Value::as_str);
+    let accepted = payload
+        .get("accepted_chunk_ids")
+        .and_then(serde_json::Value::as_array)
+        .filter(|ids| ids.len() == 1)
+        .and_then(|ids| ids[0].as_str());
+    direct
+        .or(accepted)
+        .filter(|id| uuid::Uuid::parse_str(id).is_ok())
+}
 
 /// Where `/v1/denials` reads this sandbox's recent denials.
 #[derive(Clone, Debug)]
@@ -265,9 +490,13 @@ pub async fn handle_forward_request<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    let mut correlation = PolicyLocalCorrelation::new(method, path, initial_request);
     let body = read_request_body(initial_request, client).await?;
-    let (status, payload) = route_request(ctx, method, path, &body).await;
-    write_json_response(client, status, payload).await
+    let (status, payload) = route_request(ctx, method, path, &body, Some(&correlation)).await;
+    correlation.record_response(status, &payload);
+    write_json_response(client, status, payload, &correlation.request_id).await?;
+    correlation.complete();
+    Ok(())
 }
 
 async fn route_request(
@@ -275,6 +504,7 @@ async fn route_request(
     method: &str,
     path: &str,
     body: &[u8],
+    correlation: Option<&PolicyLocalCorrelation>,
 ) -> (u16, serde_json::Value) {
     let (route, query) = path.split_once('?').map_or((path, ""), |(r, q)| (r, q));
     // Gate every route on the feature flag so the agent surface is fully off
@@ -293,7 +523,7 @@ async fn route_request(
     match (method, route) {
         ("GET", ROUTE_POLICY_CURRENT) => current_policy_response(ctx).await,
         ("GET", ROUTE_DENIALS) => recent_denials_response(ctx, query).await,
-        ("POST", ROUTE_PROPOSALS) => submit_proposal(ctx, body).await,
+        ("POST", ROUTE_PROPOSALS) => submit_proposal(ctx, body, correlation).await,
         ("GET", path) if path.starts_with(ROUTE_PROPOSALS_PREFIX) => {
             proposal_state_route(ctx, path, query).await
         }
@@ -604,7 +834,11 @@ fn collect_shorthand_log_files(log_dir: &Path, max_files: usize) -> std::io::Res
         .collect())
 }
 
-async fn submit_proposal(ctx: &PolicyLocalContext, body: &[u8]) -> (u16, serde_json::Value) {
+async fn submit_proposal(
+    ctx: &PolicyLocalContext,
+    body: &[u8],
+    correlation: Option<&PolicyLocalCorrelation>,
+) -> (u16, serde_json::Value) {
     let Some(gateway) = ctx.gateway.as_ref() else {
         return (
             503,
@@ -661,16 +895,23 @@ async fn submit_proposal(ctx: &PolicyLocalContext, body: &[u8]) -> (u16, serde_j
         }
     };
 
-    // Pre-compute the audit summaries before handing `chunks` to the
-    // gateway client (which consumes the vec). The summaries pair up with
+    // Pre-compute structural audit metadata before handing `chunks` to the
+    // gateway client (which consumes the vec). The metadata pairs up with
     // the gateway's `accepted_chunk_ids` by index for the propose events
     // emitted after submit returns.
-    let audit_summaries: Vec<String> = chunks.iter().map(summarize_chunk_for_audit).collect();
+    let audit_shapes: Vec<ProposalAuditShape> =
+        chunks.iter().map(ProposalAuditShape::from_chunk).collect();
 
-    let response = match client
-        .submit_policy_analysis(sandbox_name, vec![], chunks, vec![], "agent_authored")
-        .await
-    {
+    let submit =
+        client.submit_policy_analysis(sandbox_name, vec![], chunks, vec![], "agent_authored");
+    // Only the proposal submission is causally part of the Relay operation.
+    // Status and wait polling deliberately run without this span as current
+    // context so one long wait does not create a child span per gateway poll.
+    let result = match correlation {
+        Some(correlation) => submit.instrument(correlation.span.clone()).await,
+        None => submit.await,
+    };
+    let response = match result {
         Ok(response) => response,
         Err(error) => {
             return (
@@ -688,20 +929,11 @@ async fn submit_proposal(ctx: &PolicyLocalContext, body: &[u8]) -> (u16, serde_j
     // proxy deny and policy reload that bracket it.
     //
     // The gateway compresses its `accepted_chunk_ids` by skipping rejected
-    // chunks (`grpc/policy.rs:1357-1436`); the proto does not promise 1:1
-    // ordering against the request. Today client-side validation catches
-    // both rejection causes (missing rule_name, missing proposed_rule)
-    // before submit, so the lengths match in practice. If they don't, we
-    // can't safely pair audit_summaries by index — fall back to a generic
-    // event per accepted chunk_id rather than mis-attribute a summary.
-    let pairing_is_safe = response.accepted_chunk_ids.len() == audit_summaries.len();
+    // chunks, so only pair metadata when the response remains one-to-one.
+    let pairing_is_safe = response.accepted_chunk_ids.len() == audit_shapes.len();
     for (idx, chunk_id) in response.accepted_chunk_ids.iter().enumerate() {
-        let summary = if pairing_is_safe {
-            audit_summaries[idx].as_str()
-        } else {
-            "(summary unavailable: gateway partially accepted)"
-        };
-        emit_policy_propose_event(chunk_id, summary);
+        let shape = pairing_is_safe.then_some(audit_shapes[idx]);
+        emit_policy_propose_event(chunk_id, shape, correlation);
     }
 
     (
@@ -716,116 +948,62 @@ async fn submit_proposal(ctx: &PolicyLocalContext, body: &[u8]) -> (u16, serde_j
     )
 }
 
-/// Emit one CONFIG:PROPOSED audit event for an agent-authored proposal that
-/// the gateway just accepted. The message names the `chunk_id`, the binary,
-/// and the endpoint the agent is asking to reach — what a developer needs
-/// to see in the audit trace to correlate against the inbox card.
-fn emit_policy_propose_event(chunk_id: &str, summary: &str) {
-    ocsf_emit!(
-        ConfigStateChangeBuilder::new(openshell_ocsf::ctx::ctx())
-            .severity(SeverityId::Informational)
-            .status(StatusId::Success)
-            .state(StateId::Other, "PROPOSED")
-            .unmapped("chunk_id", serde_json::json!(chunk_id))
-            .message(format!(
-                "agent_authored proposal chunk:{chunk_id} {summary}"
-            ))
-            .build()
-    );
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct ProposalAuditShape {
+    rule_present: bool,
+    endpoint_count: usize,
+    binary_count: usize,
 }
 
-/// Emit one CONFIG:APPROVED or CONFIG:REJECTED audit event observed by the
-/// `/wait` poll loop. The reviewer's free-form `rejection_reason` (if any)
-/// is included verbatim so the audit trace shows what guidance the agent
-/// received.
-fn emit_policy_decision_event(chunk: &PolicyChunk) {
-    let summary = summarize_chunk_for_audit(chunk);
-    match chunk.status.as_str() {
-        "approved" => ocsf_emit!(
-            ConfigStateChangeBuilder::new(openshell_ocsf::ctx::ctx())
-                .severity(SeverityId::Informational)
-                .status(StatusId::Success)
-                .state(StateId::Enabled, "APPROVED")
-                .unmapped("chunk_id", serde_json::json!(chunk.id))
-                .message(format!("chunk:{} approved {summary}", chunk.id))
-                .build()
-        ),
-        "rejected" => {
-            // The reviewer's free-form rejection_reason is opaque user
-            // input. The agent reads the raw text via `GET /v1/proposals/
-            // {id}` to redraft; the OCSF surface (which can be shipped to
-            // external SIEMs per AGENTS.md) gets a sanitized copy — caps
-            // length and strips control characters so a stray credential
-            // or escape sequence cannot leak into the audit log.
-            let sanitized = sanitize_reason_for_audit(&chunk.rejection_reason);
-            let reason_display = if sanitized.is_empty() {
-                "(no guidance)".to_string()
-            } else {
-                format!("\"{sanitized}\"")
-            };
-            ocsf_emit!(
-                ConfigStateChangeBuilder::new(openshell_ocsf::ctx::ctx())
-                    .severity(SeverityId::Low)
-                    .status(StatusId::Success)
-                    .state(StateId::Disabled, "REJECTED")
-                    .unmapped("chunk_id", serde_json::json!(chunk.id))
-                    .unmapped("rejection_reason", serde_json::json!(sanitized))
-                    .message(format!(
-                        "chunk:{} rejected {summary} reason:{reason_display}",
-                        chunk.id
-                    ))
-                    .build()
-            );
+impl ProposalAuditShape {
+    fn from_chunk(chunk: &PolicyChunk) -> Self {
+        let Some(rule) = chunk.proposed_rule.as_ref() else {
+            return Self::default();
+        };
+        Self {
+            rule_present: true,
+            endpoint_count: rule.endpoints.len(),
+            binary_count: rule.binaries.len(),
         }
-        // Caller is gated on `is_terminal_status`, so a non-terminal status
-        // here is a code change that broke the invariant. Warn loudly so
-        // the audit gap doesn't go silent.
-        other => tracing::warn!(
-            chunk_id = %chunk.id,
-            status = %other,
-            "emit_policy_decision_event called on non-terminal status; no audit event emitted"
-        ),
     }
 }
 
-/// One-line audit description of a chunk's target: binary, host, port, and
-/// L7 method/path allows for every endpoint. Used by both the propose and
-/// approve/reject audit events so the trace can be grepped by endpoint
-/// without parsing JSON.
-fn summarize_chunk_for_audit(chunk: &PolicyChunk) -> String {
-    let Some(rule) = chunk.proposed_rule.as_ref() else {
-        return format!("rule_name:{}", chunk.rule_name);
-    };
-    let endpoints = if rule.endpoints.is_empty() {
-        "unknown".to_string()
-    } else {
-        rule.endpoints
-            .iter()
-            .map(summarize_endpoint_for_audit)
-            .collect::<Vec<_>>()
-            .join(", ")
-    };
-    let binary = if chunk.binary.is_empty() {
-        String::new()
-    } else {
-        format!(" by {}", chunk.binary)
-    };
-    format!("on {endpoints}{binary}")
+/// Emit one CONFIG:PROPOSED audit event for a proposal accepted by the
+/// gateway. Agent-authored strings are intentionally excluded: the event
+/// carries only the gateway-issued chunk ID and constant-size structural
+/// metadata.
+fn emit_policy_propose_event(
+    chunk_id: &str,
+    shape: Option<ProposalAuditShape>,
+    correlation: Option<&PolicyLocalCorrelation>,
+) {
+    let shape_available = shape.is_some();
+    let shape = shape.unwrap_or_default();
+    let event = ConfigStateChangeBuilder::new(openshell_ocsf::ctx::ctx())
+        .severity(SeverityId::Informational)
+        .status(StatusId::Success)
+        .state(StateId::Other, "PROPOSED")
+        .unmapped("chunk_id", serde_json::json!(chunk_id))
+        .unmapped("proposal_shape_available", shape_available)
+        .unmapped("proposal_rule_present", shape.rule_present)
+        .unmapped("proposal_endpoint_count", shape.endpoint_count)
+        .unmapped("proposal_binary_count", shape.binary_count)
+        .message(format!(
+            "agent_authored proposal chunk:{chunk_id} endpoints:{} binaries:{}",
+            shape.endpoint_count, shape.binary_count
+        ))
+        .build();
+    emit_policy_lifecycle_event(event, correlation);
 }
 
-fn summarize_endpoint_for_audit(endpoint: &NetworkEndpoint) -> String {
-    let allows = endpoint
-        .rules
-        .iter()
-        .filter_map(|r| r.allow.as_ref())
-        .map(|a| format!("{} {}", a.method, a.path))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let target = format!("{}:{}", endpoint.host, endpoint.port);
-    if allows.is_empty() {
-        target
+fn emit_policy_lifecycle_event(
+    event: openshell_ocsf::OcsfEvent,
+    correlation: Option<&PolicyLocalCorrelation>,
+) {
+    if let Some(correlation) = correlation {
+        correlation.emit_lifecycle(event);
     } else {
-        format!("{target} [{allows}]")
+        ocsf_emit!(event);
     }
 }
 
@@ -860,11 +1038,6 @@ async fn proposal_wait_response(
     loop {
         match fetch_chunk(&session, chunk_id).await {
             Ok(Some(chunk)) if is_terminal_status(&chunk.status) => {
-                // Audit beat: emit at the moment this sandbox observes the
-                // decision so the trace correlates with the proxy events
-                // bracketing the loop. Multiple waiters on the same chunk
-                // each fire one event — acceptable for a wakeup audit.
-                emit_policy_decision_event(&chunk);
                 let policy_reloaded = if chunk.status == "approved" {
                     // Hold the wait until the local supervisor has loaded a
                     // policy that semantically contains this chunk's
@@ -1406,6 +1579,7 @@ async fn write_json_response<S>(
     client: &mut S,
     status: u16,
     payload: serde_json::Value,
+    request_id: &str,
 ) -> Result<()>
 where
     S: AsyncWrite + Unpin,
@@ -1415,6 +1589,7 @@ where
         "HTTP/1.1 {status} {}\r\n\
          Content-Type: application/json\r\n\
          Content-Length: {}\r\n\
+         X-OpenShell-Request-ID: {request_id}\r\n\
          Connection: close\r\n\
          \r\n\
          {}",
@@ -1936,7 +2111,7 @@ mod tests {
         // Even the otherwise-public `current_policy` route returns 404 with
         // a feature_disabled error: when the surface is off it's off
         // entirely, not selectively.
-        let (status, payload) = route_request(&ctx, "GET", ROUTE_POLICY_CURRENT, &[]).await;
+        let (status, payload) = route_request(&ctx, "GET", ROUTE_POLICY_CURRENT, &[], None).await;
         assert_eq!(status, 404);
         assert_eq!(payload["error"], "feature_disabled");
         assert!(
@@ -1980,6 +2155,231 @@ mod tests {
         let body: serde_json::Value = serde_json::from_str(body).unwrap();
         assert_eq!(body["format"], "yaml");
         assert!(body["policy_yaml"].as_str().unwrap().contains("version: 1"));
+    }
+
+    #[tokio::test]
+    async fn policy_local_response_is_relay_parented_and_returns_a_trusted_receipt() {
+        use tracing::instrument::WithSubscriber as _;
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let ctx = PolicyLocalContext::new(
+            Some(ProtoSandboxPolicy {
+                version: 1,
+                ..Default::default()
+            }),
+            None,
+            None,
+            AgentProposals::new(true),
+            test_workspace_rx(),
+        );
+        let exporter = opentelemetry_sdk::trace::InMemorySpanExporterBuilder::new().build();
+        let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+            .with_simple_exporter(exporter.clone())
+            .build();
+        let subscriber = tracing_subscriber::registry()
+            .with(openshell_otel::layer(&provider, "policy-local-test"));
+
+        let (mut client, mut server) = tokio::io::duplex(4096);
+        let request = b"GET http://policy.local/v1/policy/current HTTP/1.1\r\nHost: policy.local\r\nX-OpenShell-Request-ID: forged\r\ntraceparent: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01\r\n\r\n";
+        let task = tokio::spawn(
+            async move {
+                handle_forward_request(&ctx, "GET", "/v1/policy/current", request, &mut server)
+                    .await
+                    .unwrap();
+            }
+            .with_subscriber(subscriber),
+        );
+
+        let mut received = Vec::new();
+        client.read_to_end(&mut received).await.unwrap();
+        task.await.unwrap();
+        provider.force_flush().expect("flush spans");
+
+        let response = String::from_utf8(received).unwrap();
+        let request_id = response
+            .lines()
+            .find_map(|line| line.strip_prefix("X-OpenShell-Request-ID: "))
+            .expect("trusted request receipt");
+        assert_ne!(request_id, "forged");
+        assert!(uuid::Uuid::parse_str(request_id).is_ok());
+
+        let span = exporter
+            .get_finished_spans()
+            .expect("finished spans")
+            .into_iter()
+            .find(|span| span.name == "openshell.policy.local")
+            .expect("policy.local span");
+        assert_eq!(
+            span.span_context.trace_id().to_string(),
+            "4bf92f3577b34da6a3ce929d0e0e4736"
+        );
+        assert_eq!(span.parent_span_id.to_string(), "00f067aa0ba902b7");
+        let attributes = span
+            .attributes
+            .into_iter()
+            .map(|attribute| {
+                (
+                    attribute.key.as_str().to_string(),
+                    attribute.value.to_string(),
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        assert_eq!(attributes["openshell.request.id"], request_id);
+        assert_eq!(
+            attributes["openshell.policy.operation"],
+            "read_current_policy"
+        );
+        assert_eq!(attributes["openshell.policy.outcome"], "success");
+        assert_eq!(attributes["http.response.status_code"], "200");
+    }
+
+    #[test]
+    fn policy_local_outcomes_distinguish_submission_and_reload_states() {
+        let submitted = |accepted, rejected| {
+            serde_json::json!({
+                "status": "submitted",
+                "accepted_chunks": accepted,
+                "rejected_chunks": rejected,
+            })
+        };
+        assert_eq!(
+            policy_local_outcome(202, &submitted(2, 0), Some("submitted")),
+            "accepted"
+        );
+        assert_eq!(
+            policy_local_outcome(202, &submitted(2, 1), Some("submitted")),
+            "partially_accepted"
+        );
+        assert_eq!(
+            policy_local_outcome(202, &submitted(0, 1), Some("submitted")),
+            "rejected"
+        );
+
+        let reload_pending = serde_json::json!({
+            "status": "approved",
+            "policy_reloaded": false,
+        });
+        assert_eq!(
+            policy_local_outcome(200, &reload_pending, Some("approved")),
+            "reload_pending"
+        );
+        let approved = serde_json::json!({
+            "status": "approved",
+            "policy_reloaded": true,
+        });
+        assert_eq!(
+            policy_local_outcome(200, &approved, Some("approved")),
+            "approved"
+        );
+    }
+
+    #[test]
+    fn proposal_and_wait_use_separate_requests_without_duplicate_lifecycle_events() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let chunk_id = "00000000-0000-4000-8000-000000000071";
+        let submit_request = "POST /v1/proposals HTTP/1.1\r\nHost: policy.local\r\n\r\n";
+        let wait_request =
+            format!("GET /v1/proposals/{chunk_id}/wait HTTP/1.1\r\nHost: policy.local\r\n\r\n");
+        let exporter = opentelemetry_sdk::trace::InMemorySpanExporterBuilder::new().build();
+        let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+            .with_simple_exporter(exporter.clone())
+            .build();
+        let ocsf = openshell_ocsf::test_support::OcsfCapture::default();
+        let subscriber = tracing_subscriber::registry()
+            .with(openshell_otel::layer(&provider, "policy-local-test"))
+            .with(ocsf.clone());
+
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::callsite::rebuild_interest_cache();
+            let mut submit = PolicyLocalCorrelation::build(
+                "POST",
+                "/v1/proposals",
+                submit_request.as_bytes(),
+                "submit-receipt".to_string(),
+            );
+            emit_policy_propose_event(
+                chunk_id,
+                Some(ProposalAuditShape {
+                    rule_present: true,
+                    endpoint_count: 1,
+                    binary_count: 1,
+                }),
+                Some(&submit),
+            );
+            submit.record_response(
+                202,
+                &serde_json::json!({
+                    "status": "submitted",
+                    "accepted_chunks": 1,
+                    "rejected_chunks": 0,
+                    "accepted_chunk_ids": [chunk_id],
+                }),
+            );
+            submit.complete();
+
+            let mut wait = PolicyLocalCorrelation::build(
+                "GET",
+                &format!("/v1/proposals/{chunk_id}/wait"),
+                wait_request.as_bytes(),
+                "wait-receipt".to_string(),
+            );
+            wait.record_response(
+                200,
+                &serde_json::json!({
+                    "chunk_id": chunk_id,
+                    "status": "approved",
+                    "policy_reloaded": true,
+                }),
+            );
+            wait.complete();
+        });
+        provider.force_flush().expect("flush spans");
+
+        let events = ocsf
+            .json_events()
+            .into_iter()
+            .filter(|event| event["unmapped"]["chunk_id"] == chunk_id)
+            .collect::<Vec<_>>();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["metadata"]["correlation_uid"], "submit-receipt");
+        assert_eq!(events[0]["unmapped"]["chunk_id"], chunk_id);
+        assert!(events[0]["unmapped"].get("observation").is_none());
+
+        let spans = exporter.get_finished_spans().expect("finished spans");
+        let attributes_for = |request_id: &str| {
+            spans
+                .iter()
+                .find(|span| {
+                    span.name == "openshell.policy.local"
+                        && span.attributes.iter().any(|attribute| {
+                            attribute.key.as_str() == "openshell.request.id"
+                                && attribute.value.to_string() == request_id
+                        })
+                })
+                .expect("policy.local span")
+                .attributes
+                .iter()
+                .map(|attribute| {
+                    (
+                        attribute.key.as_str().to_string(),
+                        attribute.value.to_string(),
+                    )
+                })
+                .collect::<HashMap<_, _>>()
+        };
+        let submit = attributes_for("submit-receipt");
+        assert_eq!(submit["openshell.policy.operation"], "submit_proposal");
+        assert_eq!(submit["openshell.policy.proposal.chunk_id"], chunk_id);
+        assert_eq!(submit["openshell.policy.proposal.status"], "submitted");
+        assert_eq!(submit["openshell.policy.outcome"], "accepted");
+
+        let wait = attributes_for("wait-receipt");
+        assert_eq!(wait["openshell.policy.operation"], "wait_for_decision");
+        assert_eq!(wait["openshell.policy.proposal.chunk_id"], chunk_id);
+        assert_eq!(wait["openshell.policy.proposal.status"], "approved");
+        assert_eq!(wait["openshell.policy.reload_observed"], "true");
+        assert_eq!(wait["openshell.policy.outcome"], "approved");
     }
 
     #[test]
@@ -2071,18 +2471,19 @@ mod tests {
         );
 
         // Empty chunk_id after the prefix is 404, not a wildcard list.
-        let (status, _) = route_request(&ctx, "GET", "/v1/proposals/", &[]).await;
+        let (status, _) = route_request(&ctx, "GET", "/v1/proposals/", &[], None).await;
         assert_eq!(status, 404);
 
         // More than one segment after the id (not "/wait") is 404, not a
         // partial match. Prevents `/v1/proposals/abc/extra` from silently
         // dispatching as a status lookup for "abc/extra".
-        let (status, _) = route_request(&ctx, "GET", "/v1/proposals/abc/extra", &[]).await;
+        let (status, _) = route_request(&ctx, "GET", "/v1/proposals/abc/extra", &[], None).await;
         assert_eq!(status, 404);
 
         // Trailing path after `/wait` also 404 — must not match the wait
         // arm as a wildcard.
-        let (status, _) = route_request(&ctx, "GET", "/v1/proposals/abc/wait/extra", &[]).await;
+        let (status, _) =
+            route_request(&ctx, "GET", "/v1/proposals/abc/wait/extra", &[], None).await;
         assert_eq!(status, 404);
     }
 
@@ -2096,7 +2497,7 @@ mod tests {
             test_workspace_rx(),
         );
 
-        let (status, body) = route_request(&ctx, "GET", "/v1/proposals/chunk-id", &[]).await;
+        let (status, body) = route_request(&ctx, "GET", "/v1/proposals/chunk-id", &[], None).await;
         assert_eq!(status, 503);
         assert_eq!(body["error"], "gateway_unavailable");
     }
@@ -2111,8 +2512,14 @@ mod tests {
             test_workspace_rx(),
         );
 
-        let (status, body) =
-            route_request(&ctx, "GET", "/v1/proposals/chunk-id/wait?timeout=1", &[]).await;
+        let (status, body) = route_request(
+            &ctx,
+            "GET",
+            "/v1/proposals/chunk-id/wait?timeout=1",
+            &[],
+            None,
+        )
+        .await;
         assert_eq!(status, 503);
         assert_eq!(body["error"], "gateway_unavailable");
     }
@@ -2127,80 +2534,102 @@ mod tests {
             test_workspace_rx(),
         );
 
-        let (status, body) = route_request(&ctx, "GET", "/v1/proposals/abc", &[]).await;
+        let (status, body) = route_request(&ctx, "GET", "/v1/proposals/abc", &[], None).await;
         assert_eq!(status, 404);
         assert_eq!(body["error"], "feature_disabled");
 
-        let (status, _) = route_request(&ctx, "GET", "/v1/proposals/abc/wait", &[]).await;
+        let (status, _) = route_request(&ctx, "GET", "/v1/proposals/abc/wait", &[], None).await;
         assert_eq!(status, 404);
     }
 
     #[test]
-    fn summarize_chunk_for_audit_includes_endpoint_l7_path_and_binary() {
+    fn proposal_audit_shape_contains_only_structural_counts() {
         let chunk = PolicyChunk {
-            id: "ignored".to_string(),
-            rule_name: "github_write".to_string(),
-            binary: "/usr/bin/curl".to_string(),
+            rule_name: "UNLABELED_RULE_SECRET".to_string(),
+            binary: "/tmp/UNLABELED_BINARY_SECRET".to_string(),
             proposed_rule: Some(NetworkPolicyRule {
-                name: "github_write".to_string(),
+                name: "UNLABELED_NAME_SECRET".to_string(),
+                endpoints: vec![
+                    NetworkEndpoint {
+                        host: "UNLABELED_HOST_SECRET".to_string(),
+                        rules: vec![L7Rule {
+                            allow: Some(L7Allow {
+                                path: "/UNLABELED_PATH_SECRET".to_string(),
+                                ..Default::default()
+                            }),
+                        }],
+                        ..Default::default()
+                    },
+                    NetworkEndpoint::default(),
+                ],
+                binaries: vec![NetworkBinary {
+                    path: "/UNLABELED_RULE_BINARY_SECRET".to_string(),
+                }],
+            }),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            ProposalAuditShape::from_chunk(&chunk),
+            ProposalAuditShape {
+                rule_present: true,
+                endpoint_count: 2,
+                binary_count: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn propose_event_excludes_agent_authored_content() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let secret = "UNLABELED_SECRET_IN_PATH_BINARY_RULE_AND_HOST";
+        let huge = secret.repeat(100_000);
+        let chunk = PolicyChunk {
+            rule_name: huge.clone(),
+            binary: huge.clone(),
+            proposed_rule: Some(NetworkPolicyRule {
+                name: huge.clone(),
                 endpoints: vec![NetworkEndpoint {
-                    host: "api.github.com".to_string(),
-                    port: 443,
+                    host: huge.clone(),
+                    path: huge.clone(),
                     rules: vec![L7Rule {
                         allow: Some(L7Allow {
-                            method: "PUT".to_string(),
-                            path: "/repos/foo/bar/contents/x.md".to_string(),
+                            method: huge.clone(),
+                            path: huge.clone(),
+                            command: huge,
                             ..Default::default()
                         }),
                     }],
                     ..Default::default()
                 }],
                 binaries: vec![NetworkBinary {
-                    path: "/usr/bin/curl".to_string(),
+                    path: secret.to_string(),
                 }],
             }),
             ..Default::default()
         };
-        let summary = summarize_chunk_for_audit(&chunk);
-        assert!(summary.contains("api.github.com:443"));
-        assert!(summary.contains("PUT /repos/foo/bar/contents/x.md"));
-        assert!(summary.contains("/usr/bin/curl"));
-    }
 
-    #[test]
-    fn summarize_chunk_for_audit_lists_every_endpoint_and_allow() {
-        let allow = |method: &str, path: &str| L7Rule {
-            allow: Some(L7Allow {
-                method: method.to_string(),
-                path: path.to_string(),
-                ..Default::default()
-            }),
-        };
-        let chunk = PolicyChunk {
-            binary: "/usr/bin/perl".to_string(),
-            proposed_rule: Some(NetworkPolicyRule {
-                name: "two".to_string(),
-                endpoints: vec![
-                    NetworkEndpoint {
-                        host: "ports.ubuntu.com".to_string(),
-                        port: 80,
-                        rules: vec![allow("GET", "/ubuntu-ports/**"), allow("HEAD", "/x")],
-                        ..Default::default()
-                    },
-                    NetworkEndpoint {
-                        host: "169.254.169.254".to_string(),
-                        port: 80,
-                        ..Default::default()
-                    },
-                ],
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-        assert_eq!(
-            summarize_chunk_for_audit(&chunk),
-            "on ports.ubuntu.com:80 [GET /ubuntu-ports/**, HEAD /x], 169.254.169.254:80 by /usr/bin/perl"
-        );
+        let ocsf = openshell_ocsf::test_support::OcsfCapture::default();
+        let subscriber = tracing_subscriber::registry().with(ocsf.clone());
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::callsite::rebuild_interest_cache();
+            emit_policy_propose_event(
+                "00000000-0000-4000-8000-000000000072",
+                Some(ProposalAuditShape::from_chunk(&chunk)),
+                None,
+            );
+        });
+
+        let events = ocsf.json_events();
+        assert_eq!(events.len(), 1);
+        let serialized = serde_json::to_string(&events[0]).expect("serialize OCSF event");
+        assert!(!serialized.contains(secret));
+        assert!(serialized.len() < 4_096);
+        assert_eq!(events[0]["unmapped"]["proposal_endpoint_count"], 1);
+        assert_eq!(events[0]["unmapped"]["proposal_binary_count"], 1);
+        assert_eq!(events[0]["unmapped"]["proposal_rule_present"], true);
+        assert_eq!(events[0]["unmapped"]["proposal_shape_available"], true);
     }
 
     // Helpers — synthetic proposed rule + policy with that rule already
@@ -2457,12 +2886,16 @@ mod tests {
     }
 
     #[test]
-    fn summarize_chunk_for_audit_falls_back_to_rule_name_without_rule() {
+    fn proposal_audit_shape_without_rule_is_empty() {
         let chunk = PolicyChunk {
-            rule_name: "fallback".to_string(),
+            rule_name: "UNLABELED_RULE_SECRET".to_string(),
+            binary: "UNLABELED_BINARY_SECRET".to_string(),
             proposed_rule: None,
             ..Default::default()
         };
-        assert_eq!(summarize_chunk_for_audit(&chunk), "rule_name:fallback");
+        assert_eq!(
+            ProposalAuditShape::from_chunk(&chunk),
+            ProposalAuditShape::default()
+        );
     }
 }

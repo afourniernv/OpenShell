@@ -1155,7 +1155,7 @@ impl Drop for RequestCorrelation {
     }
 }
 
-fn trace_headers(raw_header: &[u8]) -> HeaderMap {
+pub fn trace_headers(raw_header: &[u8]) -> HeaderMap {
     let Some(header_end) = raw_header
         .windows(4)
         .position(|window| window == b"\r\n\r\n")
