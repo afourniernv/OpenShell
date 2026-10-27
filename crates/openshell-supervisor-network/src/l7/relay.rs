@@ -341,7 +341,14 @@ where
     W: AsyncWrite + Unpin,
 {
     if config.protocol != L7Protocol::Mcp {
+        if let Some(correlation) = correlation {
+            correlation.record_effective_jsonrpc_summary(config.protocol, &info);
+        }
         return Ok(Some(info));
+    }
+
+    if let Some(correlation) = correlation {
+        correlation.record_effective_jsonrpc_summary(config.protocol, &info);
     }
 
     match crate::l7::mcp::select_request_protocol_version(request, &info, &config.mcp_versions) {
@@ -359,6 +366,9 @@ where
             // classify, but later middleware re-evaluation must still retain
             // the exact transport-selected revision.
             info.mcp_revision = Some(version);
+            if let Some(correlation) = correlation {
+                correlation.record_effective_jsonrpc_summary(config.protocol, &info);
+            }
 
             if let Some(error) = info.error.as_ref() {
                 if let Some(observer) = observer {
@@ -1801,7 +1811,13 @@ where
             // body against that protocol's policy after every transforming
             // stage (a no-op for REST and websocket, whose policy inputs the
             // chain cannot mutate).
-            let validate = transformed_body_validator(config, &engine, ctx, &request_info);
+            let validate = transformed_body_validator(
+                config,
+                &engine,
+                ctx,
+                &request_info,
+                correlation.as_ref(),
+            );
             let middleware_result = apply_middleware_chain_with_request_id(
                 req,
                 client,
@@ -3124,7 +3140,8 @@ where
             // against the same body-aware policy after every transforming
             // stage so a middleware cannot smuggle a denied operation to the
             // upstream or the next stage.
-            let validate = transformed_body_validator(config, engine, ctx, &request_info);
+            let validate =
+                transformed_body_validator(config, engine, ctx, &request_info, Some(&correlation));
             let req = match apply_middleware_chain_with_request_id(
                 req,
                 client,
@@ -3451,7 +3468,8 @@ where
             // against the same body-aware policy after every transforming
             // stage so a middleware cannot smuggle a denied operation to the
             // upstream or the next stage.
-            let validate = transformed_body_validator(config, engine, ctx, &request_info);
+            let validate =
+                transformed_body_validator(config, engine, ctx, &request_info, Some(&correlation));
             let req = match apply_middleware_chain_with_request_id(
                 req,
                 client,
@@ -3823,6 +3841,7 @@ fn reevaluate_transformed_body(
     ctx: &L7EvalContext,
     request_info: &L7RequestInfo,
     body: &[u8],
+    correlation: Option<&RequestCorrelation>,
 ) -> Result<Option<String>> {
     let (engine_type, transformed_info) = match config.protocol {
         // REST and websocket-upgrade policy evaluates only the method, path,
@@ -3846,6 +3865,9 @@ fn reevaluate_transformed_body(
             }
             let info =
                 crate::l7::jsonrpc::parse_jsonrpc_body_with_options(body, inspection_options);
+            if let Some(correlation) = correlation {
+                correlation.record_effective_jsonrpc_summary(config.protocol, &info);
+            }
             let mut transformed_info = request_info.clone();
             transformed_info.jsonrpc = Some(info);
             (jsonrpc_engine_type(config.protocol), transformed_info)
@@ -3870,7 +3892,14 @@ fn reevaluate_transformed_body(
 
     if let Some(reason) = l7_request_hard_deny_reason(config.protocol, &transformed_info) {
         let reason = format!("middleware transformation rejected: {reason}");
-        emit_transformed_body_decision(ctx, request_info, engine_type, "deny", &reason);
+        emit_transformed_body_decision(
+            ctx,
+            request_info,
+            engine_type,
+            "deny",
+            &reason,
+            correlation,
+        );
         return Ok(Some(reason));
     }
 
@@ -3880,10 +3909,17 @@ fn reevaluate_transformed_body(
     }
     let reason = format!("middleware transformation denied by policy: {reason}");
     if config.enforcement == EnforcementMode::Audit {
-        emit_transformed_body_decision(ctx, request_info, engine_type, "audit", &reason);
+        emit_transformed_body_decision(
+            ctx,
+            request_info,
+            engine_type,
+            "audit",
+            &reason,
+            correlation,
+        );
         return Ok(None);
     }
-    emit_transformed_body_decision(ctx, request_info, engine_type, "deny", &reason);
+    emit_transformed_body_decision(ctx, request_info, engine_type, "deny", &reason, correlation);
     Ok(Some(reason))
 }
 
@@ -3895,8 +3931,11 @@ pub(crate) fn transformed_body_validator<'a>(
     engine: &'a TunnelPolicyEngine,
     ctx: &'a L7EvalContext,
     request_info: &'a L7RequestInfo,
+    correlation: Option<&'a RequestCorrelation>,
 ) -> impl Fn(&[u8]) -> Result<Option<String>> + Send + Sync + 'a {
-    move |body: &[u8]| reevaluate_transformed_body(config, engine, ctx, request_info, body)
+    move |body: &[u8]| {
+        reevaluate_transformed_body(config, engine, ctx, request_info, body, correlation)
+    }
 }
 
 /// Log the post-transformation policy decision as an OCSF HTTP Activity
@@ -3908,6 +3947,7 @@ fn emit_transformed_body_decision(
     engine_type: &str,
     decision_str: &str,
     reason: &str,
+    correlation: Option<&RequestCorrelation>,
 ) {
     let (action_id, disposition_id, severity) = match decision_str {
         "deny" => (ActionId::Denied, DispositionId::Blocked, SeverityId::Medium),
@@ -3933,7 +3973,11 @@ fn emit_transformed_body_decision(
             request_info.action, ctx.host, ctx.port, request_info.target, reason
         ))
         .build();
-    ocsf_emit!(event);
+    if let Some(correlation) = correlation {
+        correlation.emit(event);
+    } else {
+        ocsf_emit!(event);
+    }
 }
 
 fn jsonrpc_policy_input(info: &crate::l7::jsonrpc::JsonRpcRequestInfo) -> serde_json::Value {
@@ -4397,7 +4441,7 @@ mod tests {
     use openshell_core::token_grant_failure::{
         TokenGrantFailure, TokenGrantFailureKind, TokenGrantStage,
     };
-    use std::collections::{BTreeMap, HashMap as TestHashMap};
+    use std::collections::{BTreeMap, BTreeSet, HashMap as TestHashMap};
     use std::fmt::Write as _;
     use std::path::PathBuf;
     use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
@@ -7991,6 +8035,112 @@ network_policies:
         let (response, upstream_seen) = run_jsonrpc_transform_case("audit", b"not json").await;
         assert_middleware_failure_response(&response, "jsonrpc_api");
         assert!(upstream_seen.is_none(), "upstream must not see the request");
+    }
+
+    #[test]
+    fn transformed_jsonrpc_decision_reuses_correlation_without_body_data() {
+        const SENTINEL: &str = "SENTINEL_PRIVATE_TRANSFORMED_BODY";
+        const REQUEST_ID: &str = "00000000-0000-4000-8000-000000000011";
+
+        let (config, engine, ctx) = jsonrpc_transforming_relay_parts("enforce", b"not used");
+        let original_body = br#"{"jsonrpc":"2.0","id":1,"method":"reports.list"}"#;
+        let original_info = crate::l7::jsonrpc::parse_jsonrpc_body(
+            original_body,
+            crate::l7::jsonrpc::JsonRpcInspectionMode::JsonRpc,
+        );
+        let request_info = L7RequestInfo {
+            action: "POST".into(),
+            target: "/rpc".into(),
+            query_params: std::collections::HashMap::new(),
+            graphql: None,
+            jsonrpc: Some(original_info.clone()),
+        };
+        let request = crate::l7::provider::L7Request {
+            action: "POST".into(),
+            target: "/rpc".into(),
+            query_params: std::collections::HashMap::new(),
+            raw_header: format!(
+                "POST /rpc HTTP/1.1\r\nHost: api.example.test\r\nContent-Length: {}\r\n\r\n{}",
+                original_body.len(),
+                std::str::from_utf8(original_body).unwrap()
+            )
+            .into_bytes(),
+            body_length: crate::l7::provider::BodyLength::ContentLength(original_body.len() as u64),
+        };
+        let exporter = opentelemetry_sdk::trace::InMemorySpanExporterBuilder::new().build();
+        let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+            .with_simple_exporter(exporter.clone())
+            .build();
+        let ocsf = openshell_ocsf::test_support::OcsfCapture::default();
+        let subscriber = tracing_subscriber::registry()
+            .with(openshell_otel::layer(&provider, "correlation-test"))
+            .with(ocsf.clone());
+
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::callsite::rebuild_interest_cache();
+            let correlation =
+                RequestCorrelation::with_request_id(&request, &ctx, REQUEST_ID.to_string());
+            correlation.record_effective_jsonrpc_summary(config.protocol, &original_info);
+            let validate = transformed_body_validator(
+                &config,
+                &engine,
+                &ctx,
+                &request_info,
+                Some(&correlation),
+            );
+            let rejection = validate(format!("{SENTINEL} is not JSON").as_bytes())
+                .expect("transformed-body evaluation");
+            assert!(rejection.is_some());
+            correlation.record_final_http_outcome("denied");
+        });
+        provider.force_flush().expect("flush spans");
+
+        let span = exporter
+            .get_finished_spans()
+            .expect("finished spans")
+            .into_iter()
+            .find(|span| span.name == "openshell.http.enforcement")
+            .expect("HTTP enforcement span");
+        let attributes = span
+            .attributes
+            .into_iter()
+            .map(|attribute| {
+                (
+                    attribute.key.as_str().to_string(),
+                    attribute.value.to_string(),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(attributes["openshell.l7.protocol"], "jsonrpc");
+        assert_eq!(
+            attributes["openshell.jsonrpc.effective.inspection_outcome"],
+            "invalid_json"
+        );
+        assert_eq!(
+            attributes["openshell.jsonrpc.effective.message_kind"],
+            "invalid"
+        );
+        assert!(!format!("{attributes:?}").contains(SENTINEL));
+
+        let transformed_events = ocsf
+            .json_events()
+            .into_iter()
+            .filter(|event| {
+                event["message"]
+                    .as_str()
+                    .is_some_and(|message| message.starts_with("L7_REQUEST_TRANSFORMED"))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(transformed_events.len(), 1);
+        assert_eq!(
+            transformed_events[0]["metadata"]["correlation_uid"],
+            REQUEST_ID
+        );
+        assert!(
+            !serde_json::to_string(&transformed_events)
+                .unwrap()
+                .contains(SENTINEL)
+        );
     }
 
     #[tokio::test]
@@ -12232,6 +12382,187 @@ network_policies:
             "io.modelcontextprotocol/clientCapabilities": {}
         });
         serde_json::json!({"jsonrpc":"2.0", "id":1, "method":method, "params":params}).to_string()
+    }
+
+    async fn read_test_http_message<R: AsyncRead + Unpin>(reader: &mut R) -> Vec<u8> {
+        let mut message = Vec::new();
+        let mut byte = [0_u8; 1];
+        while !message.ends_with(b"\r\n\r\n") {
+            reader
+                .read_exact(&mut byte)
+                .await
+                .expect("complete HTTP headers");
+            message.push(byte[0]);
+        }
+        let headers = std::str::from_utf8(&message).expect("ASCII test headers");
+        let body_len = headers
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length").then(|| {
+                    value
+                        .trim()
+                        .parse::<usize>()
+                        .expect("numeric content length")
+                })
+            })
+            .unwrap_or_default();
+        let header_len = message.len();
+        message.resize(header_len + body_len, 0);
+        reader
+            .read_exact(&mut message[header_len..])
+            .await
+            .expect("complete HTTP body");
+        message
+    }
+
+    #[tokio::test]
+    async fn production_mcp_relays_export_one_privacy_safe_effective_summary() {
+        const SENTINEL: &str = "SENTINEL_PRIVATE_PRODUCTION_TOOL";
+
+        for route_selected in [false, true] {
+            let exporter = opentelemetry_sdk::trace::InMemorySpanExporterBuilder::new().build();
+            let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+                .with_simple_exporter(exporter.clone())
+                .build();
+            let subscriber = tracing_subscriber::registry().with(openshell_otel::layer(
+                &provider,
+                "mcp-production-correlation-test",
+            ));
+            let (config, tunnel_engine, ctx) = mcp_sessionless_test_relay_context();
+            let body = sessionless_mcp_body(
+                "tools/call",
+                serde_json::json!({"name": SENTINEL, "arguments": {"secret": SENTINEL}}),
+            );
+            let request = format!(
+                "POST /mcp HTTP/1.1\r\nHost: mcp.example.test:8000\r\nContent-Type: application/json\r\nAccept: application/json, text/event-stream\r\nMCP-Protocol-Version: 2026-07-28\r\nMcp-Method: tools/call\r\nMcp-Name: {SENTINEL}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let (mut app, mut relay_client) = tokio::io::duplex(32 * 1024);
+            let (mut relay_upstream, mut upstream) = tokio::io::duplex(32 * 1024);
+
+            let exchange = async {
+                tracing::callsite::rebuild_interest_cache();
+                tokio::join!(
+                    async {
+                        if route_selected {
+                            relay_with_route_selection(
+                                &[config],
+                                tunnel_engine,
+                                &mut relay_client,
+                                &mut relay_upstream,
+                                &ctx,
+                            )
+                            .await
+                        } else {
+                            relay_with_inspection(
+                                &config,
+                                tunnel_engine,
+                                &mut relay_client,
+                                &mut relay_upstream,
+                                &ctx,
+                            )
+                            .await
+                        }
+                    },
+                    async {
+                        app.write_all(request.as_bytes())
+                            .await
+                            .expect("send MCP request");
+                        app.flush().await.expect("flush MCP request");
+                        read_test_http_message(&mut app).await
+                    },
+                    async {
+                        let forwarded = read_test_http_message(&mut upstream).await;
+                        upstream
+                            .write_all(
+                                b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                            )
+                            .await
+                            .expect("send upstream response");
+                        upstream.flush().await.expect("flush upstream response");
+                        forwarded
+                    },
+                )
+            }
+            .with_subscriber(subscriber);
+            let (relay, response, forwarded) =
+                tokio::time::timeout(std::time::Duration::from_secs(5), Box::pin(exchange))
+                    .await
+                    .expect("MCP correlation exchange completes");
+            relay.expect("MCP relay succeeds");
+            assert!(response.starts_with(b"HTTP/1.1 204 No Content"));
+            assert!(forwarded.starts_with(b"POST /mcp HTTP/1.1"));
+            provider.force_flush().expect("flush spans");
+
+            let span = exporter
+                .get_finished_spans()
+                .expect("finished spans")
+                .into_iter()
+                .find(|span| span.name == "openshell.http.enforcement")
+                .expect("HTTP enforcement span");
+            assert_eq!(span.dropped_attributes_count, 0);
+            let raw_summary_keys = span
+                .attributes
+                .iter()
+                .map(|attribute| attribute.key.as_str())
+                .filter(|key| {
+                    *key == "openshell.l7.protocol"
+                        || key.starts_with("openshell.jsonrpc.")
+                        || key.starts_with("openshell.mcp.")
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                raw_summary_keys.len(),
+                raw_summary_keys
+                    .iter()
+                    .copied()
+                    .collect::<BTreeSet<_>>()
+                    .len(),
+                "route_selected={route_selected}: unique correlation summary keys"
+            );
+            let call_count = span
+                .attributes
+                .iter()
+                .find(|attribute| {
+                    attribute.key.as_str() == "openshell.jsonrpc.effective.call_count"
+                })
+                .expect("call count attribute");
+            assert_eq!(format!("{:?}", call_count.value), "I64(1)");
+            let attributes = span
+                .attributes
+                .into_iter()
+                .map(|attribute| {
+                    (
+                        attribute.key.as_str().to_string(),
+                        attribute.value.to_string(),
+                    )
+                })
+                .collect::<BTreeMap<_, _>>();
+            assert_eq!(attributes["openshell.l7.protocol"], "mcp");
+            assert_eq!(
+                attributes["openshell.jsonrpc.effective.message_kind"],
+                "call"
+            );
+            assert_eq!(
+                attributes["openshell.jsonrpc.effective.inspection_outcome"],
+                "accepted"
+            );
+            assert_eq!(
+                attributes["openshell.mcp.selected_protocol_revision"],
+                "2026-07-28"
+            );
+            assert_eq!(
+                attributes["openshell.mcp.effective.protocol_revision"],
+                "2026-07-28"
+            );
+            assert_eq!(
+                attributes["openshell.mcp.effective.method_classification"],
+                "core"
+            );
+            assert_eq!(attributes["openshell.mcp.tools_call_observed"], "true");
+            assert!(!format!("{attributes:?}").contains(SENTINEL));
+        }
     }
 
     async fn run_sessionless_mcp_relay(

@@ -19,15 +19,39 @@ use openshell_ocsf::{
 
 use crate::l7::provider::L7Request;
 use crate::l7::relay::L7EvalContext;
+use crate::l7::{L7Protocol, jsonrpc};
+
+const JSONRPC_CORRELATED_COUNT_LIMIT: usize = 64;
 
 #[derive(Debug)]
 pub struct RequestCorrelation {
     request_id: String,
     span: tracing::Span,
     completed: AtomicBool,
+    jsonrpc: Mutex<JsonRpcCorrelationState>,
     middleware_context: MiddlewareEventContext,
     middleware: Mutex<MiddlewareState>,
     credential: Mutex<CredentialState>,
+}
+
+#[derive(Debug, Default)]
+struct JsonRpcCorrelationState {
+    effective: Option<JsonRpcEffectiveSummary>,
+    selected_mcp_revision: Option<openshell_core::mcp::McpProtocolVersion>,
+    mcp_tools_call_observed: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct JsonRpcEffectiveSummary {
+    protocol: &'static str,
+    message_kind: &'static str,
+    inspection_outcome: &'static str,
+    call_count: i64,
+    notification_count: i64,
+    counts_truncated: bool,
+    has_response: bool,
+    mcp_revision: Option<openshell_core::mcp::McpProtocolVersion>,
+    mcp_method_classification: Option<&'static str>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -366,6 +390,17 @@ impl RequestCorrelation {
             "openshell.credential.static_placeholder.outcome" = tracing::field::Empty,
             "openshell.credential.token_grant.outcome" = tracing::field::Empty,
             "openshell.credential.sigv4.outcome" = tracing::field::Empty,
+            "openshell.l7.protocol" = tracing::field::Empty,
+            "openshell.jsonrpc.effective.message_kind" = tracing::field::Empty,
+            "openshell.jsonrpc.effective.inspection_outcome" = tracing::field::Empty,
+            "openshell.jsonrpc.effective.call_count" = tracing::field::Empty,
+            "openshell.jsonrpc.effective.notification_count" = tracing::field::Empty,
+            "openshell.jsonrpc.effective.counts_truncated" = tracing::field::Empty,
+            "openshell.jsonrpc.effective.has_response" = tracing::field::Empty,
+            "openshell.mcp.selected_protocol_revision" = tracing::field::Empty,
+            "openshell.mcp.effective.protocol_revision" = tracing::field::Empty,
+            "openshell.mcp.effective.method_classification" = tracing::field::Empty,
+            "openshell.mcp.tools_call_observed" = tracing::field::Empty,
         );
         let headers = trace_headers(&request.raw_header);
         let _ = openshell_otel::set_parent_from_headers(&span, &headers);
@@ -373,6 +408,7 @@ impl RequestCorrelation {
             request_id,
             span,
             completed: AtomicBool::new(false),
+            jsonrpc: Mutex::new(JsonRpcCorrelationState::default()),
             middleware_context: MiddlewareEventContext {
                 method,
                 host: ctx.host.clone(),
@@ -416,6 +452,62 @@ impl RequestCorrelation {
 
     pub(crate) fn record_error_stage(&self, stage: &str) {
         self.span.record("openshell.error.stage", stage);
+    }
+
+    pub(crate) fn record_effective_jsonrpc_summary(
+        &self,
+        protocol: L7Protocol,
+        info: &jsonrpc::JsonRpcRequestInfo,
+    ) {
+        let protocol_name = match protocol {
+            L7Protocol::JsonRpc => "jsonrpc",
+            L7Protocol::Mcp => "mcp",
+            _ => return,
+        };
+        let call_count = info
+            .calls
+            .iter()
+            .filter(|call| !call.is_notification)
+            .count();
+        let notification_count = info
+            .calls
+            .iter()
+            .filter(|call| call.is_notification)
+            .count();
+        let counts_truncated = call_count > JSONRPC_CORRELATED_COUNT_LIMIT
+            || notification_count > JSONRPC_CORRELATED_COUNT_LIMIT;
+
+        let mut state = self
+            .jsonrpc
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if protocol == L7Protocol::Mcp {
+            if let Some(revision) = info.mcp_revision {
+                state.selected_mcp_revision = Some(revision);
+            }
+            state.mcp_tools_call_observed |=
+                info.calls.iter().any(|call| call.method == "tools/call");
+        }
+        state.effective = Some(JsonRpcEffectiveSummary {
+            protocol: protocol_name,
+            message_kind: jsonrpc_message_kind(info, call_count, notification_count),
+            inspection_outcome: jsonrpc_inspection_outcome(info),
+            call_count: i64::try_from(call_count.min(JSONRPC_CORRELATED_COUNT_LIMIT))
+                .expect("bounded JSON-RPC call count fits i64"),
+            notification_count: i64::try_from(
+                notification_count.min(JSONRPC_CORRELATED_COUNT_LIMIT),
+            )
+            .expect("bounded JSON-RPC notification count fits i64"),
+            counts_truncated,
+            has_response: info.has_response,
+            mcp_revision: if protocol == L7Protocol::Mcp {
+                info.mcp_revision
+            } else {
+                None
+            },
+            mcp_method_classification: (protocol == L7Protocol::Mcp)
+                .then(|| mcp_method_classification(info)),
+        });
     }
 
     pub(crate) fn observe_credential(
@@ -585,11 +677,135 @@ impl RequestCorrelation {
         }
     }
 
+    fn record_jsonrpc_attributes(&self) {
+        let state = self
+            .jsonrpc
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(summary) = state.effective else {
+            return;
+        };
+
+        self.span.record("openshell.l7.protocol", summary.protocol);
+        self.span.record(
+            "openshell.jsonrpc.effective.message_kind",
+            summary.message_kind,
+        );
+        self.span.record(
+            "openshell.jsonrpc.effective.inspection_outcome",
+            summary.inspection_outcome,
+        );
+        self.span
+            .record("openshell.jsonrpc.effective.call_count", summary.call_count);
+        self.span.record(
+            "openshell.jsonrpc.effective.notification_count",
+            summary.notification_count,
+        );
+        self.span.record(
+            "openshell.jsonrpc.effective.counts_truncated",
+            summary.counts_truncated,
+        );
+        self.span.record(
+            "openshell.jsonrpc.effective.has_response",
+            summary.has_response,
+        );
+
+        if summary.protocol == "mcp" {
+            if let Some(revision) = state.selected_mcp_revision {
+                self.span.record(
+                    "openshell.mcp.selected_protocol_revision",
+                    revision.as_str(),
+                );
+            }
+            if let Some(revision) = summary.mcp_revision {
+                self.span.record(
+                    "openshell.mcp.effective.protocol_revision",
+                    revision.as_str(),
+                );
+            }
+            if let Some(classification) = summary.mcp_method_classification {
+                self.span.record(
+                    "openshell.mcp.effective.method_classification",
+                    classification,
+                );
+            }
+            self.span.record(
+                "openshell.mcp.tools_call_observed",
+                state.mcp_tools_call_observed,
+            );
+        }
+    }
+
     pub(crate) fn emit(&self, mut event: OcsfEvent) {
         event.set_correlation_uid(self.request_id.clone());
         openshell_otel::with_span_context(&self.span, || {
             self.span.in_scope(|| ocsf_emit!(event));
         });
+    }
+}
+
+fn jsonrpc_message_kind(
+    info: &jsonrpc::JsonRpcRequestInfo,
+    call_count: usize,
+    notification_count: usize,
+) -> &'static str {
+    if info.error.is_some() {
+        return "invalid";
+    }
+    if info.receive_stream {
+        return "receive_stream";
+    }
+    if info.is_batch {
+        return match (call_count > 0, notification_count > 0, info.has_response) {
+            (true, false, false) => "batch_calls",
+            (false, true, false) => "batch_notifications",
+            (false, false, true) => "batch_responses",
+            _ => "batch_mixed",
+        };
+    }
+    match (call_count > 0, notification_count > 0, info.has_response) {
+        (true, false, false) => "call",
+        (false, true, false) => "notification",
+        (false, false, true) => "response",
+        (false, false, false) => "empty",
+        _ => "mixed",
+    }
+}
+
+fn jsonrpc_inspection_outcome(info: &jsonrpc::JsonRpcRequestInfo) -> &'static str {
+    match info
+        .error
+        .as_ref()
+        .map(jsonrpc::JsonRpcInspectionError::kind)
+    {
+        None => "accepted",
+        Some(jsonrpc::JsonRpcInspectionErrorKind::InvalidJson) => "invalid_json",
+        Some(jsonrpc::JsonRpcInspectionErrorKind::InvalidMessage) => "invalid_message",
+        Some(jsonrpc::JsonRpcInspectionErrorKind::RevisionNotSelected) => "revision_not_selected",
+        Some(jsonrpc::JsonRpcInspectionErrorKind::McpProfileViolation) => "mcp_profile_violation",
+        Some(jsonrpc::JsonRpcInspectionErrorKind::McpLifecycleViolation) => {
+            "mcp_lifecycle_violation"
+        }
+    }
+}
+
+fn mcp_method_classification(info: &jsonrpc::JsonRpcRequestInfo) -> &'static str {
+    let mut core = false;
+    let mut extension = false;
+    let mut unclassified = false;
+    for call in &info.calls {
+        match call.mcp_classification {
+            Some(jsonrpc::McpMethodClassification::Available) => core = true,
+            Some(jsonrpc::McpMethodClassification::Extension) => extension = true,
+            None => unclassified = true,
+        }
+    }
+    match (core, extension, unclassified) {
+        (false, false, false) => "none",
+        (true, false, false) => "core",
+        (false, true, false) => "extension",
+        (true, true, false) => "mixed",
+        _ => "unclassified",
     }
 }
 
@@ -762,6 +978,7 @@ impl Drop for RequestCorrelation {
                 &snapshot,
             ));
         }
+        self.record_jsonrpc_attributes();
         if !self.completed.load(Ordering::Acquire) {
             self.span.record("openshell.http.outcome", "incomplete");
             self.span.record("openshell.error.stage", "unclassified");
@@ -962,6 +1179,257 @@ mod tests {
             .find(|attribute| attribute.key.as_str() == "http.request.method")
             .expect("method attribute");
         assert_eq!(method.value.to_string(), "OTHER");
+    }
+
+    #[test]
+    fn mcp_summary_is_bounded_and_omits_caller_controlled_values() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        const SENTINEL: &str = "SENTINEL_PRIVATE_MCP_METHOD_OR_TOOL";
+        let exporter = opentelemetry_sdk::trace::InMemorySpanExporterBuilder::new().build();
+        let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+            .with_simple_exporter(exporter.clone())
+            .build();
+        let subscriber = tracing_subscriber::registry()
+            .with(openshell_otel::layer(&provider, "correlation-test"));
+        let calls = (0..140)
+            .map(|index| jsonrpc::JsonRpcCallInfo {
+                method: if index == 0 {
+                    "tools/call".into()
+                } else {
+                    format!("{SENTINEL}-{index}")
+                },
+                params: std::collections::HashMap::from([(
+                    "name".into(),
+                    format!("{SENTINEL}-parameter-{index}"),
+                )]),
+                tool: Some(format!("{SENTINEL}-tool-{index}")),
+                mcp_classification: Some(if index % 3 == 0 {
+                    jsonrpc::McpMethodClassification::Extension
+                } else {
+                    jsonrpc::McpMethodClassification::Available
+                }),
+                is_notification: index % 2 == 0,
+            })
+            .collect();
+        let info = jsonrpc::JsonRpcRequestInfo {
+            calls,
+            is_batch: true,
+            receive_stream: false,
+            has_response: false,
+            mcp_revision: Some(openshell_core::mcp::McpProtocolVersion::V2026_07_28),
+            mcp_http_metadata: None,
+            error: None,
+        };
+
+        tracing::subscriber::with_default(subscriber, || {
+            let correlation = RequestCorrelation::with_request_id(
+                &request(),
+                &L7EvalContext {
+                    host: "mcp.example.test".into(),
+                    port: 443,
+                    ..Default::default()
+                },
+                correlation_id(10),
+            );
+            correlation.record_effective_jsonrpc_summary(L7Protocol::Mcp, &info);
+            correlation.record_final_http_outcome("allowed");
+        });
+        provider.force_flush().expect("flush spans");
+
+        let span = exporter
+            .get_finished_spans()
+            .expect("finished spans")
+            .into_iter()
+            .find(|span| span.name == "openshell.http.enforcement")
+            .expect("HTTP enforcement span");
+        assert_eq!(span.dropped_attributes_count, 0);
+        let raw_keys = span
+            .attributes
+            .iter()
+            .map(|attribute| attribute.key.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            raw_keys.len(),
+            raw_keys.iter().copied().collect::<BTreeSet<_>>().len(),
+            "OTLP span must contain each attribute key exactly once"
+        );
+        let call_count = span
+            .attributes
+            .iter()
+            .find(|attribute| attribute.key.as_str() == "openshell.jsonrpc.effective.call_count")
+            .expect("call count attribute");
+        assert_eq!(format!("{:?}", call_count.value), "I64(64)");
+        let notification_count = span
+            .attributes
+            .iter()
+            .find(|attribute| {
+                attribute.key.as_str() == "openshell.jsonrpc.effective.notification_count"
+            })
+            .expect("notification count attribute");
+        assert_eq!(format!("{:?}", notification_count.value), "I64(64)");
+        let attributes = span
+            .attributes
+            .into_iter()
+            .map(|attribute| {
+                (
+                    attribute.key.as_str().to_string(),
+                    attribute.value.to_string(),
+                )
+            })
+            .collect::<std::collections::BTreeMap<_, _>>();
+
+        assert_eq!(attributes["openshell.l7.protocol"], "mcp");
+        assert_eq!(
+            attributes["openshell.jsonrpc.effective.message_kind"],
+            "batch_mixed"
+        );
+        assert_eq!(
+            attributes["openshell.jsonrpc.effective.inspection_outcome"],
+            "accepted"
+        );
+        assert_eq!(attributes["openshell.jsonrpc.effective.call_count"], "64");
+        assert_eq!(
+            attributes["openshell.jsonrpc.effective.notification_count"],
+            "64"
+        );
+        assert_eq!(
+            attributes["openshell.jsonrpc.effective.counts_truncated"],
+            "true"
+        );
+        assert_eq!(
+            attributes["openshell.jsonrpc.effective.has_response"],
+            "false"
+        );
+        assert_eq!(
+            attributes["openshell.mcp.selected_protocol_revision"],
+            "2026-07-28"
+        );
+        assert_eq!(
+            attributes["openshell.mcp.effective.protocol_revision"],
+            "2026-07-28"
+        );
+        assert_eq!(
+            attributes["openshell.mcp.effective.method_classification"],
+            "mixed"
+        );
+        assert_eq!(attributes["openshell.mcp.tools_call_observed"], "true");
+        assert!(!format!("{attributes:?}").contains(SENTINEL));
+        assert!(attributes.keys().all(|key| {
+            !key.contains("method_name")
+                && !key.contains("tool_name")
+                && !key.contains("params")
+                && !key.contains("request_id_value")
+        }));
+    }
+
+    #[test]
+    fn effective_mcp_summary_preserves_that_a_tools_call_was_observed() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        const SENTINEL: &str = "SENTINEL_PRIVATE_CORRUPTED_MCP_BODY";
+        let exporter = opentelemetry_sdk::trace::InMemorySpanExporterBuilder::new().build();
+        let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+            .with_simple_exporter(exporter.clone())
+            .build();
+        let subscriber = tracing_subscriber::registry()
+            .with(openshell_otel::layer(&provider, "correlation-test"));
+        let original = jsonrpc::JsonRpcRequestInfo {
+            calls: vec![jsonrpc::JsonRpcCallInfo {
+                method: "tools/call".into(),
+                params: std::collections::HashMap::new(),
+                tool: Some(format!("{SENTINEL}-tool")),
+                mcp_classification: Some(jsonrpc::McpMethodClassification::Available),
+                is_notification: false,
+            }],
+            is_batch: false,
+            receive_stream: false,
+            has_response: false,
+            mcp_revision: Some(openshell_core::mcp::McpProtocolVersion::V2026_07_28),
+            mcp_http_metadata: None,
+            error: None,
+        };
+        let transformed = jsonrpc::parse_jsonrpc_body_with_options(
+            format!("{SENTINEL} is not JSON").as_bytes(),
+            jsonrpc::JsonRpcInspectionOptions::mcp_selected(
+                openshell_core::mcp::McpProtocolVersion::V2026_07_28,
+                true,
+            ),
+        );
+
+        tracing::subscriber::with_default(subscriber, || {
+            let correlation = RequestCorrelation::with_request_id(
+                &request(),
+                &L7EvalContext {
+                    host: "mcp.example.test".into(),
+                    port: 443,
+                    ..Default::default()
+                },
+                correlation_id(11),
+            );
+            correlation.record_effective_jsonrpc_summary(L7Protocol::Mcp, &original);
+            correlation.record_effective_jsonrpc_summary(L7Protocol::Mcp, &transformed);
+            correlation.record_final_http_outcome("denied");
+        });
+        provider.force_flush().expect("flush spans");
+
+        let span = exporter
+            .get_finished_spans()
+            .expect("finished spans")
+            .into_iter()
+            .find(|span| span.name == "openshell.http.enforcement")
+            .expect("HTTP enforcement span");
+        assert_eq!(span.dropped_attributes_count, 0);
+        let raw_keys = span
+            .attributes
+            .iter()
+            .map(|attribute| attribute.key.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            raw_keys.len(),
+            raw_keys.iter().copied().collect::<BTreeSet<_>>().len(),
+            "OTLP span must contain each attribute key exactly once"
+        );
+        let call_count = span
+            .attributes
+            .iter()
+            .find(|attribute| attribute.key.as_str() == "openshell.jsonrpc.effective.call_count")
+            .expect("call count attribute");
+        assert_eq!(format!("{:?}", call_count.value), "I64(0)");
+        let attributes = span
+            .attributes
+            .into_iter()
+            .map(|attribute| {
+                (
+                    attribute.key.as_str().to_string(),
+                    attribute.value.to_string(),
+                )
+            })
+            .collect::<std::collections::BTreeMap<_, _>>();
+
+        assert_eq!(
+            attributes["openshell.jsonrpc.effective.inspection_outcome"],
+            "invalid_json"
+        );
+        assert_eq!(
+            attributes["openshell.jsonrpc.effective.message_kind"],
+            "invalid"
+        );
+        assert_eq!(attributes["openshell.jsonrpc.effective.call_count"], "0");
+        assert_eq!(
+            attributes["openshell.mcp.effective.method_classification"],
+            "none"
+        );
+        assert_eq!(
+            attributes["openshell.mcp.selected_protocol_revision"],
+            "2026-07-28"
+        );
+        assert!(
+            !attributes.contains_key("openshell.mcp.effective.protocol_revision"),
+            "invalid transformed body must clear the effective revision"
+        );
+        assert_eq!(attributes["openshell.mcp.tools_call_observed"], "true");
+        assert!(!format!("{attributes:?}").contains(SENTINEL));
     }
 
     #[test]
