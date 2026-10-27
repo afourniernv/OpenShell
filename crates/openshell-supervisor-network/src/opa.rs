@@ -12,7 +12,6 @@
 
 use miette::Result;
 use openshell_core::host_pattern::HostSelector;
-use openshell_core::mcp::is_mcp_protocol;
 use openshell_core::policy::{
     FilesystemPolicy, LandlockCompatibility, LandlockPolicy, ProcessPolicy,
 };
@@ -2455,11 +2454,20 @@ fn proto_to_opa_data_json(proto: &ProtoSandboxPolicy, entrypoint_pid: u32) -> St
                     // Every inspected protocol must bind grant reporting to the
                     // policy selected before credential acquisition.
                     ep["policy_hash"] = policy_hash.clone().into();
-                    if is_mcp_protocol(&e.protocol) {
-                        // Derive endpoint identity from the policy endpoint while
-                        // it is still available. Request handling carries this
-                        // opaque value through exact path selection and never
-                        // recomputes identity from a concrete request host.
+                    if matches!(
+                        PolicyL7Protocol::parse(&e.protocol),
+                        Some(
+                            PolicyL7Protocol::Rest
+                                | PolicyL7Protocol::Graphql
+                                | PolicyL7Protocol::JsonRpc
+                                | PolicyL7Protocol::Mcp
+                                | PolicyL7Protocol::Websocket
+                        )
+                    ) {
+                        // Derive endpoint identity from the configured policy
+                        // endpoint while it is still available. Request handling
+                        // carries this opaque value through path selection and
+                        // never recomputes identity from a concrete request.
                         ep["endpoint_id"] =
                             openshell_core::endpoint_status::endpoint_id(e).into();
                     }
@@ -3493,7 +3501,16 @@ mod tests {
         // this metadata independently and compare all remaining configuration.
         expected["policy_hash"] = deterministic_policy_hash(canonical_policy).into();
         assert_eq!(proto_config["policy_hash"], expected["policy_hash"]);
-        if is_mcp_protocol(&endpoint.protocol) {
+        if matches!(
+            PolicyL7Protocol::parse(&endpoint.protocol),
+            Some(
+                PolicyL7Protocol::Rest
+                    | PolicyL7Protocol::Graphql
+                    | PolicyL7Protocol::JsonRpc
+                    | PolicyL7Protocol::Mcp
+                    | PolicyL7Protocol::Websocket
+            )
+        ) {
             expected["endpoint_id"] = openshell_core::endpoint_status::endpoint_id(endpoint).into();
             assert_eq!(proto_config["endpoint_id"], expected["endpoint_id"]);
         } else {
@@ -3648,6 +3665,8 @@ network_policies:
                 ),
             ),
         ];
+        let expected_endpoint_count = 5;
+        let mut endpoint_ids = Vec::with_capacity(expected_endpoint_count);
 
         for (protocol, host, allowed, denied) in cases {
             let network_input = NetworkInput {
@@ -3666,6 +3685,8 @@ network_policies:
                 .query_endpoint_config(&network_input)
                 .expect("query protobuf endpoint config")
                 .unwrap_or_else(|| panic!("{protocol}: expected protobuf endpoint config"));
+            let selected = crate::l7::parse_l7_config(&proto_config)
+                .unwrap_or_else(|| panic!("{protocol}: expected parsed protobuf endpoint config"));
             let yaml_config: serde_json::Value = serde_json::from_str(
                 &yaml_config
                     .to_json_str()
@@ -3685,6 +3706,21 @@ network_policies:
                 .find(|endpoint| endpoint.host == host)
                 .expect("fixture contains the exact endpoint");
             assert_endpoint_config_parity(&yaml_config, &proto_config, &proto, endpoint);
+            if !selected.endpoint_id.is_empty() {
+                endpoint_ids.push(selected.endpoint_id.clone());
+            }
+            if protocol != "MCP" {
+                let (sender, mut receiver) =
+                    openshell_core::endpoint_status::endpoint_status_channel();
+                assert!(
+                    crate::l7::EndpointObserver::begin(Some(&sender), &selected).is_none(),
+                    "{protocol}: generic endpoint identity must not enable MCP observation"
+                );
+                assert!(
+                    receiver.try_recv().is_err(),
+                    "{protocol}: selecting the endpoint must not publish MCP status"
+                );
+            }
             assert_eq!(
                 yaml_config.get("mcp_versions").is_some(),
                 protocol == "MCP",
@@ -3699,6 +3735,14 @@ network_policies:
                 "{protocol}: equivalent denied request must fail both ingress formats"
             );
         }
+
+        endpoint_ids.sort_unstable();
+        endpoint_ids.dedup();
+        assert_eq!(
+            endpoint_ids.len(),
+            expected_endpoint_count,
+            "each configured L7 endpoint must retain a distinct stable identity"
+        );
     }
 
     #[test]

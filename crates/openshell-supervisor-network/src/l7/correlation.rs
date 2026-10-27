@@ -28,10 +28,31 @@ pub struct RequestCorrelation {
     request_id: String,
     span: tracing::Span,
     completed: AtomicBool,
+    resources: Mutex<ResourceCorrelationState>,
     jsonrpc: Mutex<JsonRpcCorrelationState>,
     middleware_context: MiddlewareEventContext,
     middleware: Mutex<MiddlewareState>,
     credential: Mutex<CredentialState>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct ResourceCorrelationState {
+    sandbox_id: Option<String>,
+    policy_runtime_generation: Option<String>,
+    policy_endpoint: Option<PolicyEndpointResources>,
+    provider_credential: Option<ProviderCredentialResources>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PolicyEndpointResources {
+    policy_hash: String,
+    endpoint_id: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ProviderCredentialResources {
+    environment_revision: String,
+    installation_id: String,
 }
 
 #[derive(Debug, Default)]
@@ -359,9 +380,16 @@ impl RequestCorrelation {
 
     fn build(request: &L7Request, ctx: &L7EvalContext, request_id: String) -> Self {
         let method = bounded_http_method(&request.action);
+        let sandbox_id = openshell_ocsf::ctx::ctx().sandbox_id.clone();
         let span = tracing::info_span!(
             "openshell.http.enforcement",
             "openshell.request.id" = %request_id,
+            "openshell.sandbox.id" = tracing::field::Empty,
+            "openshell.policy.runtime_generation" = tracing::field::Empty,
+            "openshell.policy.hash" = tracing::field::Empty,
+            "openshell.endpoint.id" = tracing::field::Empty,
+            "openshell.provider.environment.revision" = tracing::field::Empty,
+            "openshell.provider.credential.installation.id" = tracing::field::Empty,
             "http.request.method" = method,
             "server.address" = %ctx.host,
             "server.port" = ctx.port,
@@ -404,10 +432,17 @@ impl RequestCorrelation {
         );
         let headers = trace_headers(&request.raw_header);
         let _ = openshell_otel::set_parent_from_headers(&span, &headers);
+        if !sandbox_id.is_empty() {
+            span.record("openshell.sandbox.id", sandbox_id.as_str());
+        }
         Self {
             request_id,
             span,
             completed: AtomicBool::new(false),
+            resources: Mutex::new(ResourceCorrelationState {
+                sandbox_id: (!sandbox_id.is_empty()).then_some(sandbox_id),
+                ..Default::default()
+            }),
             jsonrpc: Mutex::new(JsonRpcCorrelationState::default()),
             middleware_context: MiddlewareEventContext {
                 method,
@@ -452,6 +487,89 @@ impl RequestCorrelation {
 
     pub(crate) fn record_error_stage(&self, stage: &str) {
         self.span.record("openshell.error.stage", stage);
+    }
+
+    pub(crate) fn record_policy_runtime_generation(&self, generation: u64) {
+        let generation = generation.to_string();
+        let recorded = {
+            let mut resources = self
+                .resources
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if resources.policy_runtime_generation.is_some() {
+                false
+            } else {
+                resources.policy_runtime_generation = Some(generation.clone());
+                true
+            }
+        };
+        if recorded {
+            self.span
+                .record("openshell.policy.runtime_generation", generation.as_str());
+        }
+    }
+
+    pub(crate) fn record_selected_policy_endpoint(&self, policy_hash: &str, endpoint_id: &str) {
+        let Some(policy_endpoint) = policy_endpoint_resources(policy_hash, endpoint_id) else {
+            return;
+        };
+        let recorded = {
+            let mut resources = self
+                .resources
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if resources.policy_endpoint.is_some() {
+                false
+            } else {
+                resources.policy_endpoint = Some(policy_endpoint.clone());
+                true
+            }
+        };
+        if recorded {
+            self.span.record(
+                "openshell.policy.hash",
+                policy_endpoint.policy_hash.as_str(),
+            );
+            self.span.record(
+                "openshell.endpoint.id",
+                policy_endpoint.endpoint_id.as_str(),
+            );
+        }
+    }
+
+    pub(crate) fn record_provider_credential_snapshot(
+        &self,
+        snapshot: &openshell_core::provider_credentials::ProviderCredentialSnapshot,
+    ) {
+        let Ok(installation_id) = uuid::Uuid::parse_str(&snapshot.installation_id) else {
+            return;
+        };
+        let provider_credential = ProviderCredentialResources {
+            environment_revision: snapshot.revision.to_string(),
+            installation_id: installation_id.hyphenated().to_string(),
+        };
+        let recorded = {
+            let mut resources = self
+                .resources
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if resources.provider_credential.is_some() {
+                false
+            } else {
+                resources.provider_credential = Some(provider_credential.clone());
+                true
+            }
+        };
+        if recorded {
+            self.span.record(
+                "openshell.provider.environment.revision",
+                provider_credential.environment_revision.as_str(),
+            );
+            self.span.record(
+                "openshell.provider.credential.installation.id",
+                provider_credential.installation_id.as_str(),
+            );
+        }
     }
 
     pub(crate) fn record_effective_jsonrpc_summary(
@@ -738,9 +856,60 @@ impl RequestCorrelation {
 
     pub(crate) fn emit(&self, mut event: OcsfEvent) {
         event.set_correlation_uid(self.request_id.clone());
+        let resources = self
+            .resources
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        add_resource_fields(&mut event, &resources);
         openshell_otel::with_span_context(&self.span, || {
             self.span.in_scope(|| ocsf_emit!(event));
         });
+    }
+}
+
+fn policy_endpoint_resources(
+    policy_hash: &str,
+    endpoint_id: &str,
+) -> Option<PolicyEndpointResources> {
+    const ENDPOINT_PREFIX: &str = "endpoint:v1:";
+    if !is_lower_hex_digest(policy_hash)
+        || endpoint_id
+            .strip_prefix(ENDPOINT_PREFIX)
+            .is_none_or(|digest| !is_lower_hex_digest(digest))
+    {
+        return None;
+    }
+    Some(PolicyEndpointResources {
+        policy_hash: policy_hash.to_string(),
+        endpoint_id: endpoint_id.to_string(),
+    })
+}
+
+fn is_lower_hex_digest(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn add_resource_fields(event: &mut OcsfEvent, resources: &ResourceCorrelationState) {
+    if let Some(generation) = resources.policy_runtime_generation.as_deref() {
+        event.add_unmapped("policy_runtime_generation", generation);
+    }
+    if let Some(policy_endpoint) = &resources.policy_endpoint {
+        event.add_unmapped("policy_hash", policy_endpoint.policy_hash.clone());
+        event.add_unmapped("endpoint_id", policy_endpoint.endpoint_id.clone());
+    }
+    if let Some(provider_credential) = &resources.provider_credential {
+        event.add_unmapped(
+            "provider_environment_revision",
+            provider_credential.environment_revision.clone(),
+        );
+        event.add_unmapped(
+            "provider_credential_installation_id",
+            provider_credential.installation_id.clone(),
+        );
     }
 }
 
@@ -1138,6 +1307,238 @@ mod tests {
         assert_eq!(attributes["http.response.status_code"], "403");
         assert_eq!(attributes["openshell.error.stage"], "policy");
         assert_eq!(attributes["openshell.target.reached"], "true");
+    }
+
+    #[test]
+    fn resource_correlation_is_first_write_wins_and_preserves_u64_max() {
+        use std::sync::Arc;
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        struct ThreadContextReset;
+        impl Drop for ThreadContextReset {
+            fn drop(&mut self) {
+                openshell_ocsf::ctx::bind_thread_ctx(None);
+            }
+        }
+
+        let event_context = openshell_ocsf::EventContext {
+            sandbox_id: "sandbox-resource-test".into(),
+            sandbox_name: "resource-test".into(),
+            container_image: "example.invalid/resource-test:latest".into(),
+            hostname: "resource-test".into(),
+            product_version: env!("CARGO_PKG_VERSION").into(),
+            proxy_ip: "127.0.0.1".parse().unwrap(),
+            proxy_port: 3128,
+            origin: openshell_ocsf::EventOrigin::Supervisor,
+        };
+        openshell_ocsf::ctx::bind_thread_ctx(Some(Arc::new(event_context)));
+        let _reset = ThreadContextReset;
+
+        let exporter = opentelemetry_sdk::trace::InMemorySpanExporterBuilder::new().build();
+        let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+            .with_simple_exporter(exporter.clone())
+            .build();
+        let ocsf = openshell_ocsf::test_support::OcsfCapture::default();
+        let subscriber = tracing_subscriber::registry()
+            .with(openshell_otel::layer(&provider, "correlation-test"))
+            .with(ocsf.clone());
+
+        let first_policy_hash = "a".repeat(64);
+        let first_endpoint_id = format!("endpoint:v1:{}", "b".repeat(64));
+        let second_policy_hash = "c".repeat(64);
+        let second_endpoint_id = format!("endpoint:v1:{}", "d".repeat(64));
+        let first_snapshot = openshell_core::provider_credentials::ProviderCredentialSnapshot {
+            installation_id: "AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA".into(),
+            revision: u64::MAX,
+            ..Default::default()
+        };
+        let second_snapshot = openshell_core::provider_credentials::ProviderCredentialSnapshot {
+            installation_id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb".into(),
+            revision: 7,
+            ..Default::default()
+        };
+
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::callsite::rebuild_interest_cache();
+            let correlation = RequestCorrelation::with_request_id(
+                &request(),
+                &L7EvalContext {
+                    host: "api.example.test".into(),
+                    port: 443,
+                    ..Default::default()
+                },
+                correlation_id(12),
+            );
+            correlation.record_policy_runtime_generation(u64::MAX);
+            correlation.record_policy_runtime_generation(7);
+            correlation.record_selected_policy_endpoint(&first_policy_hash, &first_endpoint_id);
+            correlation.record_selected_policy_endpoint(&second_policy_hash, &second_endpoint_id);
+            correlation.record_provider_credential_snapshot(&first_snapshot);
+            correlation.record_provider_credential_snapshot(&second_snapshot);
+            correlation.emit(
+                HttpActivityBuilder::new(openshell_ocsf::ctx::ctx())
+                    .activity(ActivityId::for_http_method("GET"))
+                    .action(ActionId::Allowed)
+                    .severity(SeverityId::Informational)
+                    .http_request(HttpRequest {
+                        http_method: "GET".parse().unwrap(),
+                        url: None,
+                    })
+                    .unmapped("existing", "preserved")
+                    .build(),
+            );
+            correlation.record_final_http_outcome("allowed");
+        });
+        provider.force_flush().expect("flush spans");
+
+        let span = exporter
+            .get_finished_spans()
+            .expect("finished spans")
+            .into_iter()
+            .find(|span| span.name == "openshell.http.enforcement")
+            .expect("HTTP enforcement span");
+        assert_eq!(span.dropped_attributes_count, 0);
+        let raw_keys = span
+            .attributes
+            .iter()
+            .map(|attribute| attribute.key.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            raw_keys.len(),
+            raw_keys.iter().copied().collect::<BTreeSet<_>>().len(),
+            "OTLP span must contain each attribute key exactly once"
+        );
+        let attributes = span
+            .attributes
+            .into_iter()
+            .map(|attribute| {
+                (
+                    attribute.key.as_str().to_string(),
+                    attribute.value.to_string(),
+                )
+            })
+            .collect::<std::collections::BTreeMap<_, _>>();
+        assert_eq!(attributes["openshell.sandbox.id"], "sandbox-resource-test");
+        assert_eq!(
+            attributes["openshell.policy.runtime_generation"],
+            u64::MAX.to_string()
+        );
+        assert_eq!(attributes["openshell.policy.hash"], first_policy_hash);
+        assert_eq!(attributes["openshell.endpoint.id"], first_endpoint_id);
+        assert_eq!(
+            attributes["openshell.provider.environment.revision"],
+            u64::MAX.to_string()
+        );
+        assert_eq!(
+            attributes["openshell.provider.credential.installation.id"],
+            "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        );
+
+        let events = ocsf.json_events();
+        assert_eq!(events.len(), 1);
+        let event = &events[0];
+        assert_eq!(event["container"]["uid"], "sandbox-resource-test");
+        assert_eq!(event["unmapped"]["existing"], "preserved");
+        assert_eq!(
+            event["unmapped"]["policy_runtime_generation"],
+            u64::MAX.to_string()
+        );
+        assert_eq!(event["unmapped"]["policy_hash"], first_policy_hash);
+        assert_eq!(event["unmapped"]["endpoint_id"], first_endpoint_id);
+        assert_eq!(
+            event["unmapped"]["provider_environment_revision"],
+            u64::MAX.to_string()
+        );
+        assert_eq!(
+            event["unmapped"]["provider_credential_installation_id"],
+            "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        );
+        assert!(event["unmapped"].get("sandbox_id").is_none());
+    }
+
+    #[test]
+    fn invalid_resource_identities_are_omitted_without_consuming_first_write() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        const SENTINEL: &str = "SENTINEL_PRIVATE_RESOURCE_VALUE";
+        let exporter = opentelemetry_sdk::trace::InMemorySpanExporterBuilder::new().build();
+        let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+            .with_simple_exporter(exporter.clone())
+            .build();
+        let ocsf = openshell_ocsf::test_support::OcsfCapture::default();
+        let subscriber = tracing_subscriber::registry()
+            .with(openshell_otel::layer(&provider, "correlation-test"))
+            .with(ocsf.clone());
+        let valid_policy_hash = "e".repeat(64);
+        let valid_endpoint_id = format!("endpoint:v1:{}", "f".repeat(64));
+        let invalid_snapshot = openshell_core::provider_credentials::ProviderCredentialSnapshot {
+            installation_id: SENTINEL.into(),
+            revision: 99,
+            ..Default::default()
+        };
+        let valid_snapshot = openshell_core::provider_credentials::ProviderCredentialSnapshot {
+            installation_id: "12345678-1234-4234-8234-123456789abc".into(),
+            revision: 42,
+            ..Default::default()
+        };
+
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::callsite::rebuild_interest_cache();
+            let correlation = RequestCorrelation::with_request_id(
+                &request(),
+                &L7EvalContext {
+                    host: "api.example.test".into(),
+                    port: 443,
+                    ..Default::default()
+                },
+                correlation_id(13),
+            );
+            correlation.record_selected_policy_endpoint(SENTINEL, SENTINEL);
+            correlation.record_selected_policy_endpoint(&valid_policy_hash, &valid_endpoint_id);
+            correlation.record_provider_credential_snapshot(&invalid_snapshot);
+            correlation.record_provider_credential_snapshot(&valid_snapshot);
+            correlation.emit(
+                HttpActivityBuilder::new(openshell_ocsf::ctx::ctx())
+                    .activity(ActivityId::for_http_method("GET"))
+                    .action(ActionId::Allowed)
+                    .severity(SeverityId::Informational)
+                    .http_request(HttpRequest {
+                        http_method: "GET".parse().unwrap(),
+                        url: None,
+                    })
+                    .build(),
+            );
+            correlation.record_final_http_outcome("allowed");
+        });
+        provider.force_flush().expect("flush spans");
+
+        let span = exporter
+            .get_finished_spans()
+            .expect("finished spans")
+            .into_iter()
+            .find(|span| span.name == "openshell.http.enforcement")
+            .expect("HTTP enforcement span");
+        let attributes = span
+            .attributes
+            .into_iter()
+            .map(|attribute| {
+                (
+                    attribute.key.as_str().to_string(),
+                    attribute.value.to_string(),
+                )
+            })
+            .collect::<std::collections::BTreeMap<_, _>>();
+        assert_eq!(attributes["openshell.policy.hash"], valid_policy_hash);
+        assert_eq!(attributes["openshell.endpoint.id"], valid_endpoint_id);
+        assert_eq!(attributes["openshell.provider.environment.revision"], "42");
+        assert_eq!(
+            attributes["openshell.provider.credential.installation.id"],
+            "12345678-1234-4234-8234-123456789abc"
+        );
+        assert!(!format!("{attributes:?}").contains(SENTINEL));
+        let events = ocsf.json_events();
+        assert_eq!(events.len(), 1);
+        assert!(!serde_json::to_string(&events).unwrap().contains(SENTINEL));
     }
 
     #[test]

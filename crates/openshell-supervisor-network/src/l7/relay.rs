@@ -178,6 +178,9 @@ pub(crate) async fn prepare_inspected_request(
 ) -> Result<(crate::l7::provider::L7Request, L7EvalContext)> {
     let mut scoped = ctx.clone();
     let snapshot = crate::l7::token_grant_injection::pin_live_credentials(&mut scoped);
+    if let (Some(correlation), Some(snapshot)) = (correlation, snapshot.as_deref()) {
+        correlation.record_provider_credential_snapshot(snapshot);
+    }
     // Admission-gated injection reads credentials only from the pinned snapshot,
     // so a context without one never acquires a grant.
     let grant_snapshot = snapshot.as_deref().filter(|snapshot| {
@@ -1473,6 +1476,8 @@ where
             }
         };
         let correlation = RequestCorrelation::new(&req, ctx);
+        correlation
+            .record_policy_runtime_generation(engine.generation_guard().captured_generation());
         if !request_authority_matches_endpoint(&req, ctx) {
             reject_request_authority_mismatch(client, ctx, &req.action, Some(&correlation)).await?;
             return Ok(());
@@ -1517,6 +1522,7 @@ where
                 .await?;
             return Ok(());
         };
+        correlation.record_selected_policy_endpoint(&config.policy_hash, &config.endpoint_id);
         let correlation = Some(correlation);
         let observer = EndpointObserver::begin_captured(
             ctx.endpoint_observation_tx.as_ref(),
@@ -2508,6 +2514,9 @@ where
             }
         };
         let correlation = RequestCorrelation::new(&req, ctx);
+        correlation
+            .record_policy_runtime_generation(engine.generation_guard().captured_generation());
+        correlation.record_selected_policy_endpoint(&config.policy_hash, &config.endpoint_id);
         if !request_authority_matches_endpoint(&req, ctx) {
             reject_request_authority_mismatch(client, ctx, &req.action, Some(&correlation)).await?;
             return Ok(());
@@ -3004,6 +3013,9 @@ where
         let req = parsed.request;
         let jsonrpc_info = parsed.info;
         let correlation = RequestCorrelation::new(&req, ctx);
+        correlation
+            .record_policy_runtime_generation(engine.generation_guard().captured_generation());
+        correlation.record_selected_policy_endpoint(&config.policy_hash, &config.endpoint_id);
         let observer = EndpointObserver::begin_captured(
             ctx.endpoint_observation_tx.as_ref(),
             config,
@@ -3319,6 +3331,9 @@ where
             }
         };
         let correlation = RequestCorrelation::new(&req, ctx);
+        correlation
+            .record_policy_runtime_generation(engine.generation_guard().captured_generation());
+        correlation.record_selected_policy_endpoint(&config.policy_hash, &config.endpoint_id);
 
         if !request_authority_matches_endpoint(&req, ctx) {
             reject_request_authority_mismatch(client, ctx, &req.action, Some(&correlation)).await?;
@@ -4174,6 +4189,7 @@ where
         };
         let correlation = Some(RequestCorrelation::new(&req, ctx));
         if let Some(correlation) = correlation.as_ref() {
+            correlation.record_policy_runtime_generation(generation_guard.captured_generation());
             correlation.record_policy_decision("not_applicable");
         }
         if !request_authority_matches_endpoint(&req, ctx) {
@@ -4222,7 +4238,10 @@ where
                     req.action, ctx.host, ctx.port, redacted_target,
                 ))
                 .build();
-            ocsf_emit!(event);
+            correlation
+                .as_ref()
+                .expect("credential passthrough requests always have correlation")
+                .emit(event);
         }
 
         let mut response_selection = None;
@@ -4325,6 +4344,9 @@ where
         let injected = match crate::l7::token_grant_injection::pin_live_credentials(&mut grant_ctx)
         {
             Some(snapshot) => {
+                if let Some(correlation) = correlation.as_ref() {
+                    correlation.record_provider_credential_snapshot(&snapshot);
+                }
                 crate::l7::token_grant_injection::inject_for_selectors(
                     req,
                     &grant_ctx,
@@ -4671,6 +4693,11 @@ network_policies:
             span.attributes
                 .iter()
                 .all(|attribute| !attribute.key.as_str().starts_with("openshell.credential."))
+        );
+        assert!(
+            span.attributes
+                .iter()
+                .all(|attribute| { !attribute.key.as_str().starts_with("openshell.provider.") })
         );
         assert!(
             ocsf.json_events()
@@ -5558,6 +5585,98 @@ network_policies:
         ctx.token_grant_resolver = Some(fixture.resolver());
 
         (config, tunnel_engine, ctx, fixture)
+    }
+
+    #[tokio::test]
+    async fn inspected_request_records_the_atomically_pinned_provider_snapshot() {
+        const REQUEST_ID: &str = "00000000-0000-4000-8000-000000000041";
+
+        let (config, tunnel_engine, ctx, fixture) =
+            rest_token_grant_relay_context(Ok("grant-token"));
+        let expected_snapshot = ctx
+            .provider_credentials
+            .as_ref()
+            .expect("provider state")
+            .snapshot();
+        let request = crate::l7::provider::L7Request {
+            action: "GET".into(),
+            target: "/v1/projects".into(),
+            query_params: TestHashMap::new(),
+            raw_header:
+                b"GET /v1/projects HTTP/1.1\r\nHost: api.example.test\r\nConnection: close\r\n\r\n"
+                    .to_vec(),
+            body_length: crate::l7::provider::BodyLength::None,
+        };
+        let request_info = L7RequestInfo {
+            action: request.action.clone(),
+            target: request.target.clone(),
+            query_params: TestHashMap::new(),
+            graphql: None,
+            jsonrpc: None,
+        };
+        let exporter = opentelemetry_sdk::trace::InMemorySpanExporterBuilder::new().build();
+        let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+            .with_simple_exporter(exporter.clone())
+            .build();
+        let subscriber = tracing_subscriber::registry().with(openshell_otel::layer(
+            &provider,
+            "provider-resource-correlation-test",
+        ));
+
+        async {
+            tracing::callsite::rebuild_interest_cache();
+            let correlation =
+                RequestCorrelation::with_request_id(&request, &ctx, REQUEST_ID.into());
+            let (_, scoped) = prepare_inspected_request(
+                request,
+                &ctx,
+                &tunnel_engine,
+                &config,
+                &request_info,
+                REQUEST_ID,
+                None,
+                Some(&correlation),
+            )
+            .await
+            .expect("prepare inspected request");
+            assert_eq!(
+                scoped.provider_credential_revision,
+                Some(expected_snapshot.revision)
+            );
+            assert_eq!(
+                scoped.provider_credential_installation_id.as_deref(),
+                Some(expected_snapshot.installation_id.as_str())
+            );
+            correlation.record_final_http_outcome("allowed");
+        }
+        .with_subscriber(subscriber)
+        .await;
+        provider.force_flush().expect("flush spans");
+
+        let attributes = exporter
+            .get_finished_spans()
+            .expect("finished spans")
+            .into_iter()
+            .find(|span| span.name == "openshell.http.enforcement")
+            .expect("HTTP enforcement span")
+            .attributes
+            .into_iter()
+            .map(|attribute| {
+                (
+                    attribute.key.as_str().to_string(),
+                    attribute.value.to_string(),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(
+            attributes["openshell.provider.environment.revision"],
+            expected_snapshot.revision.to_string()
+        );
+        assert_eq!(
+            attributes["openshell.provider.credential.installation.id"],
+            expected_snapshot.installation_id
+        );
+        fixture.assert_one_request("api.example.test\t8080\t/v1/**\tprovider:access_token");
     }
 
     fn middleware_relay_context(
@@ -9301,11 +9420,19 @@ network_policies:
         let (endpoints, generation) = engine
             .query_endpoint_configs_with_generation(&input)
             .unwrap();
-        let configs: Vec<_> = endpoints
+        let mut configs: Vec<_> = endpoints
             .iter()
             .map(|endpoint| crate::l7::parse_l7_config(endpoint).unwrap())
             .collect();
+        let expected_policy_hash = "a".repeat(64);
+        let expected_endpoint_id = format!("endpoint:v1:{}", "b".repeat(64));
+        configs[0].policy_hash = expected_policy_hash.clone();
+        configs[0].endpoint_id = expected_endpoint_id.clone();
         let tunnel_engine = engine.clone_engine_for_tunnel(generation).unwrap();
+        let expected_generation = tunnel_engine
+            .generation_guard()
+            .captured_generation()
+            .to_string();
         let ctx = L7EvalContext {
             host: "gateway.example.test".into(),
             port: 443,
@@ -9314,29 +9441,44 @@ network_policies:
             binary_path: "/usr/bin/node".into(),
             ..Default::default()
         };
+        let exporter = opentelemetry_sdk::trace::InMemorySpanExporterBuilder::new().build();
+        let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+            .with_simple_exporter(exporter.clone())
+            .build();
+        let ocsf = openshell_ocsf::test_support::OcsfCapture::default();
+        let subscriber = tracing_subscriber::registry()
+            .with(openshell_otel::layer(
+                &provider,
+                "websocket-resource-correlation-test",
+            ))
+            .with(ocsf.clone());
         let (mut app, mut relay_client) = tokio::io::duplex(8192);
         let (mut relay_upstream, mut upstream) = tokio::io::duplex(8192);
-        let relay = tokio::spawn(async move {
-            if route_selected {
-                relay_with_route_selection(
-                    &configs,
-                    tunnel_engine,
-                    &mut relay_client,
-                    &mut relay_upstream,
-                    &ctx,
-                )
-                .await
-            } else {
-                relay_with_inspection(
-                    &configs[0],
-                    tunnel_engine,
-                    &mut relay_client,
-                    &mut relay_upstream,
-                    &ctx,
-                )
-                .await
+        let relay = tokio::spawn(
+            async move {
+                tracing::callsite::rebuild_interest_cache();
+                if route_selected {
+                    relay_with_route_selection(
+                        &configs,
+                        tunnel_engine,
+                        &mut relay_client,
+                        &mut relay_upstream,
+                        &ctx,
+                    )
+                    .await
+                } else {
+                    relay_with_inspection(
+                        &configs[0],
+                        tunnel_engine,
+                        &mut relay_client,
+                        &mut relay_upstream,
+                        &ctx,
+                    )
+                    .await
+                }
             }
-        });
+            .with_subscriber(subscriber),
+        );
 
         app.write_all(
             b"GET /ws HTTP/1.1\r\nHost: gateway.example.test\r\nConnection: close\r\n\r\n",
@@ -9358,8 +9500,9 @@ network_policies:
                 name.eq_ignore_ascii_case("x-openshell-request-id")
                     .then(|| value.trim())
             })
-            .expect("denial should carry a supervisor receipt");
-        assert!(uuid::Uuid::parse_str(request_id).is_ok());
+            .expect("denial should carry a supervisor receipt")
+            .to_string();
+        assert!(uuid::Uuid::parse_str(&request_id).is_ok());
 
         let mut upstream_bytes = [0u8; 16];
         assert!(matches!(
@@ -9377,6 +9520,42 @@ network_policies:
             .expect("relay should finish")
             .unwrap()
             .unwrap();
+        provider.force_flush().expect("flush spans");
+
+        let attributes = exporter
+            .get_finished_spans()
+            .expect("finished spans")
+            .into_iter()
+            .find(|span| span.name == "openshell.http.enforcement")
+            .expect("HTTP enforcement span")
+            .attributes
+            .into_iter()
+            .map(|attribute| {
+                (
+                    attribute.key.as_str().to_string(),
+                    attribute.value.to_string(),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(attributes["openshell.request.id"], request_id);
+        assert_eq!(
+            attributes["openshell.policy.runtime_generation"],
+            expected_generation
+        );
+        assert_eq!(attributes["openshell.policy.hash"], expected_policy_hash);
+        assert_eq!(attributes["openshell.endpoint.id"], expected_endpoint_id);
+
+        let event = ocsf
+            .json_events()
+            .into_iter()
+            .find(|event| event["metadata"]["correlation_uid"] == request_id)
+            .expect("correlated WebSocket handshake event");
+        assert_eq!(
+            event["unmapped"]["policy_runtime_generation"],
+            expected_generation
+        );
+        assert_eq!(event["unmapped"]["policy_hash"], expected_policy_hash);
+        assert_eq!(event["unmapped"]["endpoint_id"], expected_endpoint_id);
     }
 
     #[tokio::test]
@@ -9393,18 +9572,39 @@ network_policies:
     async fn passthrough_relay_injects_token_grant_authorization_header() {
         let (generation_guard, ctx, fixture) =
             passthrough_token_grant_relay_context(Ok("grant-token"));
+        let expected_generation = generation_guard.captured_generation().to_string();
+        let expected_snapshot = ctx
+            .provider_credentials
+            .as_ref()
+            .expect("provider state")
+            .snapshot();
+        let exporter = opentelemetry_sdk::trace::InMemorySpanExporterBuilder::new().build();
+        let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+            .with_simple_exporter(exporter.clone())
+            .build();
+        let ocsf = openshell_ocsf::test_support::OcsfCapture::default();
+        let subscriber = tracing_subscriber::registry()
+            .with(openshell_otel::layer(
+                &provider,
+                "passthrough-provider-resource-correlation-test",
+            ))
+            .with(ocsf.clone());
         let (mut app, mut relay_client) = tokio::io::duplex(8192);
         let (mut relay_upstream, mut upstream) = tokio::io::duplex(8192);
-        let relay = tokio::spawn(async move {
-            relay_passthrough_with_credentials(
-                &mut relay_client,
-                &mut relay_upstream,
-                &ctx,
-                &generation_guard,
-                None,
-            )
-            .await
-        });
+        let relay = tokio::spawn(
+            async move {
+                tracing::callsite::rebuild_interest_cache();
+                relay_passthrough_with_credentials(
+                    &mut relay_client,
+                    &mut relay_upstream,
+                    &ctx,
+                    &generation_guard,
+                    None,
+                )
+                .await
+            }
+            .with_subscriber(subscriber),
+        );
 
         app.write_all(
             b"GET /v1/projects HTTP/1.1\r\nHost: api.example.test\r\nAuthorization: Bearer stale-token\r\nConnection: close\r\n\r\n",
@@ -9448,6 +9648,48 @@ network_policies:
             .expect("relay should finish")
             .unwrap()
             .unwrap();
+        provider.force_flush().expect("flush spans");
+
+        let attributes = exporter
+            .get_finished_spans()
+            .expect("finished spans")
+            .into_iter()
+            .find(|span| span.name == "openshell.http.enforcement")
+            .expect("HTTP enforcement span")
+            .attributes
+            .into_iter()
+            .map(|attribute| {
+                (
+                    attribute.key.as_str().to_string(),
+                    attribute.value.to_string(),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(
+            attributes["openshell.provider.environment.revision"],
+            expected_snapshot.revision.to_string()
+        );
+        assert_eq!(
+            attributes["openshell.provider.credential.installation.id"],
+            expected_snapshot.installation_id
+        );
+        let request_event = ocsf
+            .json_events()
+            .into_iter()
+            .find(|event| {
+                event["message"]
+                    .as_str()
+                    .is_some_and(|message| message.starts_with("HTTP_REQUEST "))
+            })
+            .expect("passthrough HTTP activity event");
+        assert_eq!(
+            request_event["metadata"]["correlation_uid"],
+            attributes["openshell.request.id"]
+        );
+        assert_eq!(
+            request_event["unmapped"]["policy_runtime_generation"],
+            expected_generation
+        );
 
         fixture.assert_one_request("api.example.test\t8080\t/v1/**\tprovider:access_token");
     }
@@ -10427,24 +10669,39 @@ network_policies:
         let tunnel_engine = engine
             .clone_engine_for_tunnel(engine.current_generation())
             .unwrap();
+        let expected_generation = tunnel_engine
+            .generation_guard()
+            .captured_generation()
+            .to_string();
         let configs = encoded_slash_scoping_configs();
         let (activity_tx, mut activity_rx) = tokio::sync::mpsc::channel(1);
         let ctx = L7EvalContext {
             activity_tx: Some(activity_tx),
             ..encoded_slash_scoping_ctx()
         };
+        let exporter = opentelemetry_sdk::trace::InMemorySpanExporterBuilder::new().build();
+        let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+            .with_simple_exporter(exporter.clone())
+            .build();
+        let subscriber = tracing_subscriber::registry().with(openshell_otel::layer(
+            &provider,
+            "route-selection-resource-correlation-test",
+        ));
         let (mut app, mut relay_client) = tokio::io::duplex(8192);
         let (mut relay_upstream, mut upstream) = tokio::io::duplex(8192);
-        let relay = tokio::spawn(async move {
-            relay_with_route_selection(
-                &configs,
-                tunnel_engine,
-                &mut relay_client,
-                &mut relay_upstream,
-                &ctx,
-            )
-            .await
-        });
+        let relay = tokio::spawn(
+            async move {
+                relay_with_route_selection(
+                    &configs,
+                    tunnel_engine,
+                    &mut relay_client,
+                    &mut relay_upstream,
+                    &ctx,
+                )
+                .await
+            }
+            .with_subscriber(subscriber),
+        );
 
         app.write_all(
             b"GET /other HTTP/1.1\r\nHost: gateway.example.test\r\nConnection: close\r\n\r\n",
@@ -10492,6 +10749,28 @@ network_policies:
             .expect("relay should finish")
             .unwrap()
             .unwrap();
+        provider.force_flush().expect("flush spans");
+        let attributes = exporter
+            .get_finished_spans()
+            .expect("finished spans")
+            .into_iter()
+            .find(|span| span.name == "openshell.http.enforcement")
+            .expect("HTTP enforcement span")
+            .attributes
+            .into_iter()
+            .map(|attribute| {
+                (
+                    attribute.key.as_str().to_string(),
+                    attribute.value.to_string(),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(
+            attributes["openshell.policy.runtime_generation"],
+            expected_generation
+        );
+        assert!(!attributes.contains_key("openshell.policy.hash"));
+        assert!(!attributes.contains_key("openshell.endpoint.id"));
     }
 
     /// Canonicalization runs before the matching config is known, so
@@ -12429,7 +12708,15 @@ network_policies:
                 &provider,
                 "mcp-production-correlation-test",
             ));
-            let (config, tunnel_engine, ctx) = mcp_sessionless_test_relay_context();
+            let (mut config, tunnel_engine, ctx) = mcp_sessionless_test_relay_context();
+            config.policy_hash = "a".repeat(64);
+            config.endpoint_id = format!("endpoint:v1:{}", "b".repeat(64));
+            let expected_generation = tunnel_engine
+                .generation_guard()
+                .captured_generation()
+                .to_string();
+            let expected_policy_hash = config.policy_hash.clone();
+            let expected_endpoint_id = config.endpoint_id.clone();
             let body = sessionless_mcp_body(
                 "tools/call",
                 serde_json::json!({"name": SENTINEL, "arguments": {"secret": SENTINEL}}),
@@ -12540,6 +12827,12 @@ network_policies:
                 })
                 .collect::<BTreeMap<_, _>>();
             assert_eq!(attributes["openshell.l7.protocol"], "mcp");
+            assert_eq!(
+                attributes["openshell.policy.runtime_generation"],
+                expected_generation
+            );
+            assert_eq!(attributes["openshell.policy.hash"], expected_policy_hash);
+            assert_eq!(attributes["openshell.endpoint.id"], expected_endpoint_id);
             assert_eq!(
                 attributes["openshell.jsonrpc.effective.message_kind"],
                 "call"

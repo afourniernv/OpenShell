@@ -162,6 +162,11 @@ impl OcsfEvent {
         self.base_mut().metadata.correlation_uid = Some(uid.into());
     }
 
+    /// Add a field that is not represented by the typed OCSF event class.
+    pub fn add_unmapped(&mut self, key: &str, value: impl Into<serde_json::Value>) {
+        self.base_mut().add_unmapped(key, value);
+    }
+
     fn base_mut(&mut self) -> &mut BaseEventData {
         match self {
             Self::NetworkActivity(e) => &mut e.base,
@@ -225,6 +230,30 @@ mod tests {
         let deserialized: OcsfEvent = serde_json::from_value(json).unwrap();
         assert!(matches!(deserialized, OcsfEvent::HttpActivity(_)));
         assert_eq!(deserialized.class_uid(), 4002);
+    }
+
+    #[test]
+    fn add_unmapped_preserves_existing_fields() {
+        let ctx = test_sandbox_context();
+        let mut event = HttpActivityBuilder::new(&ctx)
+            .activity(ActivityId::Reset)
+            .action(ActionId::Allowed)
+            .severity(SeverityId::Informational)
+            .http_request(HttpRequest::new(
+                "GET",
+                Url::new("https", "example.com", "/", 443),
+            ))
+            .unmapped("existing", "value")
+            .build();
+
+        event.add_unmapped("resource_revision", "18446744073709551615");
+
+        let json = serde_json::to_value(event).unwrap();
+        assert_eq!(json["unmapped"]["existing"], "value");
+        assert_eq!(
+            json["unmapped"]["resource_revision"],
+            "18446744073709551615"
+        );
     }
 
     #[test]

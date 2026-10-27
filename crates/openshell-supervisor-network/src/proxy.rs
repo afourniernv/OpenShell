@@ -5502,6 +5502,9 @@ async fn inject_token_grant_for_forward_request(
     let Some(snapshot) = crate::l7::token_grant_injection::pin_live_credentials(l7_ctx) else {
         return Ok(request.raw_header);
     };
+    if let Some(correlation) = correlation {
+        correlation.record_provider_credential_snapshot(&snapshot);
+    }
     Ok(crate::l7::token_grant_injection::inject_for_selectors(
         request,
         l7_ctx,
@@ -5887,6 +5890,7 @@ async fn handle_forward_proxy(
     )?;
     let correlation =
         crate::l7::correlation::RequestCorrelation::new(&correlation_request, &l7_ctx);
+    correlation.record_policy_runtime_generation(forward_generation_guard.captured_generation());
     correlation.record_policy_decision("allow");
     correlation.record_enforcement_action("allow");
     forward_request_bytes = correlation_request.raw_header;
@@ -6031,6 +6035,10 @@ async fn handle_forward_proxy(
             .await?;
             return Ok(());
         };
+        correlation.record_selected_policy_endpoint(
+            &l7_config.config.policy_hash,
+            &l7_config.config.endpoint_id,
+        );
         endpoint_observer = crate::l7::EndpointObserver::begin_captured(
             l7_ctx.endpoint_observation_tx.as_ref(),
             &l7_config.config,
@@ -14478,6 +14486,90 @@ network_policies:
         assert!(rewritten.contains("Authorization: Bearer grant-token\r\n"));
         assert!(!rewritten.contains("stale-token"));
         assert_eq!(authorization_header_count(&rewritten), 1);
+        fixture.assert_one_request("api.example.test\t8080\t/v1/**\tprovider:access_token");
+    }
+
+    #[tokio::test]
+    async fn forward_proxy_token_grant_records_the_atomically_pinned_provider_snapshot() {
+        use std::collections::BTreeMap;
+        use tracing::instrument::WithSubscriber as _;
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let (mut ctx, fixture) = forward_token_grant_context(Ok("grant-token"));
+        let expected_snapshot = ctx
+            .provider_credentials
+            .as_ref()
+            .expect("provider state")
+            .snapshot();
+        let raw = b"GET http://api.example.test:8080/v1/projects HTTP/1.1\r\nHost: api.example.test:8080\r\nAuthorization: Bearer stale-token\r\nConnection: close\r\n\r\n".to_vec();
+        let request = crate::l7::provider::L7Request {
+            action: "GET".into(),
+            target: "/v1/projects".into(),
+            query_params: TestHashMap::new(),
+            raw_header: raw.clone(),
+            body_length: crate::l7::provider::BodyLength::None,
+        };
+        let exporter = opentelemetry_sdk::trace::InMemorySpanExporterBuilder::new().build();
+        let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+            .with_simple_exporter(exporter.clone())
+            .build();
+        let subscriber = tracing_subscriber::registry().with(openshell_otel::layer(
+            &provider,
+            "forward-provider-resource-correlation-test",
+        ));
+
+        async {
+            tracing::callsite::rebuild_interest_cache();
+            let correlation = crate::l7::correlation::RequestCorrelation::with_request_id(
+                &request,
+                &ctx,
+                FORWARD_REQUEST_ID.into(),
+            );
+            let with_token = inject_token_grant_for_forward_request(
+                "GET",
+                "/v1/projects",
+                raw,
+                &mut ctx,
+                None,
+                FORWARD_REQUEST_ID,
+                None,
+                Some(&correlation),
+            )
+            .await
+            .expect("forward token grant should inject");
+            assert!(
+                String::from_utf8_lossy(&with_token)
+                    .contains("Authorization: Bearer grant-token\r\n")
+            );
+            correlation.record_final_http_outcome("allowed");
+        }
+        .with_subscriber(subscriber)
+        .await;
+        provider.force_flush().expect("flush spans");
+
+        let attributes = exporter
+            .get_finished_spans()
+            .expect("finished spans")
+            .into_iter()
+            .find(|span| span.name == "openshell.http.enforcement")
+            .expect("HTTP enforcement span")
+            .attributes
+            .into_iter()
+            .map(|attribute| {
+                (
+                    attribute.key.as_str().to_string(),
+                    attribute.value.to_string(),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(
+            attributes["openshell.provider.environment.revision"],
+            expected_snapshot.revision.to_string()
+        );
+        assert_eq!(
+            attributes["openshell.provider.credential.installation.id"],
+            expected_snapshot.installation_id
+        );
         fixture.assert_one_request("api.example.test\t8080\t/v1/**\tprovider:access_token");
     }
 
