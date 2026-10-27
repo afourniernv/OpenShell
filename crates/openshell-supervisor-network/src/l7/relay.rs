@@ -1923,7 +1923,11 @@ where
                         return Ok(());
                     }
                 };
-                crate::l7::middleware::emit_websocket_preflight_events(ctx, &preflight);
+                crate::l7::middleware::emit_websocket_preflight_events(
+                    ctx,
+                    &preflight,
+                    correlation.as_ref(),
+                );
                 if preflight.terminal_reason.is_some() {
                     if let Some(correlation) = correlation.as_ref() {
                         correlation.record_enforcement_action("block");
@@ -2754,7 +2758,11 @@ where
                         return Ok(());
                     }
                 };
-                crate::l7::middleware::emit_websocket_preflight_events(ctx, &preflight);
+                crate::l7::middleware::emit_websocket_preflight_events(
+                    ctx,
+                    &preflight,
+                    Some(&correlation),
+                );
                 if preflight.terminal_reason.is_some() {
                     correlation.record_enforcement_action("block");
                     correlation.record_response_status(403);
@@ -9101,8 +9109,44 @@ network_policies:
         };
         let failure_events = middleware_events(&ctx, &req, &external_failure_outcome);
         let serialized = serde_json::to_string(&failure_events).expect("serialize failure events");
-        assert!(serialized.contains("header_mutation_invalid_name"));
+        assert!(serialized.contains("middleware_failed_closed"));
+        assert!(!serialized.contains("header_mutation_invalid_name"));
         assert!(!serialized.contains(RAW_SECRET));
+
+        let fail_open_outcome = ChainOutcome {
+            allowed: true,
+            reason: format!("middleware_failed:{RAW_SECRET}"),
+            body: Vec::new(),
+            header_mutations: Vec::new(),
+            findings: Vec::new(),
+            metadata: BTreeMap::new(),
+            applied: vec![MiddlewareInvocation {
+                name: "content-guard".into(),
+                implementation: "example/content-guard".into(),
+                decision: openshell_core::proto::Decision::Allow,
+                transformed: false,
+                failed: true,
+            }],
+            denial: None,
+            termination: ChainTermination::Completed,
+        };
+        let fail_open_events = middleware_events(&ctx, &req, &fail_open_outcome);
+        let fail_open_http = fail_open_events
+            .iter()
+            .find(|event| event.class_uid() == 4002)
+            .expect("expected fail-open HTTP Activity event");
+        assert_eq!(fail_open_http.base().status, Some(StatusId::Failure));
+        assert_eq!(fail_open_http.base().severity, SeverityId::Medium);
+        assert_eq!(
+            fail_open_http.base().status_detail.as_deref(),
+            Some("middleware_failed_open")
+        );
+        assert_eq!(fail_open_http.to_json().unwrap()["action"], "Allowed");
+        assert!(
+            !serde_json::to_string(&fail_open_events)
+                .unwrap()
+                .contains(RAW_SECRET)
+        );
     }
 
     #[tokio::test]

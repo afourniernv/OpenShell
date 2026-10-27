@@ -6702,7 +6702,11 @@ async fn handle_forward_proxy(
                 return Ok(());
             }
         };
-        crate::l7::middleware::emit_websocket_preflight_events(&l7_ctx, &preflight);
+        crate::l7::middleware::emit_websocket_preflight_events(
+            &l7_ctx,
+            &preflight,
+            Some(&correlation),
+        );
         if preflight.terminal_reason.is_some() {
             correlation.record_enforcement_action("block");
             correlation.record_response_status(403);

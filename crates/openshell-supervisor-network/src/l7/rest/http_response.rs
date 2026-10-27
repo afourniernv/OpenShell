@@ -5,7 +5,7 @@
 
 use super::*;
 use crate::l7::correlation::{
-    MiddlewareObservation, MiddlewareOutcome, MiddlewarePhase, RequestCorrelation,
+    MiddlewareObservation, MiddlewareOutcome, MiddlewarePhase, RequestCorrelation, emit_ocsf,
 };
 
 /// Default wall-clock bound shared by whole-body stages in one response.
@@ -609,6 +609,7 @@ where
                 &middleware.target,
                 status_code,
                 false,
+                response_correlation,
             );
             send_response_delivery_failure(
                 client,
@@ -663,6 +664,7 @@ where
                 &middleware.target,
                 status_code,
                 false,
+                response_correlation,
             );
             send_response_delivery_failure(
                 client,
@@ -699,7 +701,7 @@ where
         "HTTP response middleware preflight completed"
     );
     for event in crate::l7::middleware::middleware_finding_events(&preflight.findings) {
-        openshell_ocsf::ocsf_emit!(event);
+        emit_ocsf(response_correlation, event);
     }
     if !preflight.allowed {
         emit_http_response_middleware_invocations(
@@ -707,6 +709,7 @@ where
             &middleware.target,
             status_code,
             &preflight.invocations,
+            response_correlation,
         );
         let denied =
             preflight.denial.is_some() || response_invocations_blocked(&preflight.invocations);
@@ -735,6 +738,7 @@ where
                 &middleware.target,
                 status_code,
                 false,
+                response_correlation,
             );
             send_response_delivery_failure(
                 client,
@@ -753,6 +757,7 @@ where
         &middleware.target,
         status_code,
         &preflight.invocations,
+        response_correlation,
     );
 
     let Some(mut session) = preflight.session else {
@@ -804,6 +809,7 @@ where
                     &middleware.target,
                     status_code,
                     &error.diagnostics,
+                    response_correlation,
                 );
                 send_response_delivery_failure(
                     client,
@@ -832,9 +838,10 @@ where
             &middleware.target,
             status_code,
             &finish.invocations,
+            response_correlation,
         );
         for event in crate::l7::middleware::middleware_finding_events(&finish.findings) {
-            openshell_ocsf::ocsf_emit!(event);
+            emit_ocsf(response_correlation, event);
         }
         if finish.strip_stale_integrity_headers {
             strip_response_integrity_headers(&mut headers);
@@ -967,6 +974,7 @@ where
                     &middleware.target,
                     status_code,
                     true,
+                    response_correlation,
                 );
                 if middleware_stop.is_some_and(|stop| stop.failure.denial.is_some()) {
                     record_committed_response_error(
@@ -1001,6 +1009,7 @@ where
                     &middleware.target,
                     status_code,
                     false,
+                    response_correlation,
                 );
                 send_response_delivery_failure(
                     client,
@@ -1049,6 +1058,7 @@ where
                 &middleware.target,
                 status_code,
                 &error.diagnostics,
+                response_correlation,
             );
             if committed {
                 emit_http_response_middleware_failure(
@@ -1056,6 +1066,7 @@ where
                     &middleware.target,
                     status_code,
                     true,
+                    response_correlation,
                 );
                 if error.denial.is_some() {
                     record_committed_response_error(
@@ -1092,6 +1103,7 @@ where
                     &middleware.target,
                     status_code,
                     false,
+                    response_correlation,
                 );
                 send_response_delivery_failure(
                     client,
@@ -1125,9 +1137,10 @@ where
         &middleware.target,
         status_code,
         &finish.invocations,
+        response_correlation,
     );
     for event in crate::l7::middleware::middleware_finding_events(&finish.findings) {
-        openshell_ocsf::ocsf_emit!(event);
+        emit_ocsf(response_correlation, event);
     }
 
     if whole_body && !committed {
@@ -1393,22 +1406,23 @@ fn emit_http_response_middleware_invocations(
     target: &HttpRequestTarget,
     status_code: u16,
     invocations: &[openshell_supervisor_middleware::HttpResponseInvocation],
+    correlation: Option<&RequestCorrelation>,
 ) {
     for event in
         http_response_middleware_invocation_events(policy_name, target, status_code, invocations)
     {
-        openshell_ocsf::ocsf_emit!(event);
+        emit_ocsf(correlation, event);
     }
     for invocation in invocations {
         if let Some(event) =
             http_response_middleware_fail_open_finding_event(policy_name, target, invocation)
         {
-            openshell_ocsf::ocsf_emit!(event);
+            emit_ocsf(correlation, event);
         }
         if let Some(event) =
             http_response_middleware_block_finding_event(policy_name, target, invocation)
         {
-            openshell_ocsf::ocsf_emit!(event);
+            emit_ocsf(correlation, event);
         }
     }
 }
@@ -1418,15 +1432,17 @@ fn emit_http_response_diagnostics(
     target: &HttpRequestTarget,
     status_code: u16,
     diagnostics: &openshell_supervisor_middleware::HttpResponseDiagnostics,
+    correlation: Option<&RequestCorrelation>,
 ) {
     emit_http_response_middleware_invocations(
         policy_name,
         target,
         status_code,
         &diagnostics.invocations,
+        correlation,
     );
     for event in crate::l7::middleware::middleware_finding_events(&diagnostics.findings) {
-        openshell_ocsf::ocsf_emit!(event);
+        emit_ocsf(correlation, event);
     }
 }
 
@@ -1594,6 +1610,7 @@ fn emit_http_response_middleware_failure(
     target: &HttpRequestTarget,
     status_code: u16,
     committed: bool,
+    correlation: Option<&RequestCorrelation>,
 ) {
     let status_code = status_code.to_string();
     let event = openshell_ocsf::DetectionFindingBuilder::new(ocsf_ctx())
@@ -1621,7 +1638,7 @@ fn emit_http_response_middleware_failure(
             "HTTP response middleware failed before response commitment"
         })
         .build();
-    openshell_ocsf::ocsf_emit!(event);
+    emit_ocsf(correlation, event);
 }
 
 #[derive(Debug)]
@@ -2219,6 +2236,7 @@ async fn expire_whole_body_deadline<C: AsyncWrite + Unpin>(
         framing.target,
         framing.status_code,
         &diagnostics,
+        framing.response_correlation,
     );
     let output = output.map_err(ResponseMiddlewareStop::new)?;
     deliver_response_units(client, output, framing, session.requires_whole_body()).await
@@ -2368,6 +2386,7 @@ async fn process_response_unit<C: AsyncWrite + Unpin>(
         framing.target,
         framing.status_code,
         &diagnostics,
+        framing.response_correlation,
     );
     let output = output.map_err(ResponseMiddlewareStop::new)?;
     deliver_response_units(client, output, framing, session.requires_whole_body()).await
@@ -3051,20 +3070,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn response_middleware_denial_records_that_upstream_was_reached() {
+    async fn branch08_response_middleware_denial_records_that_upstream_was_reached() {
         use tracing_subscriber::layer::SubscriberExt as _;
 
         let exporter = opentelemetry_sdk::trace::InMemorySpanExporterBuilder::new().build();
         let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
             .with_simple_exporter(exporter.clone())
             .build();
-        let subscriber = tracing_subscriber::registry().with(openshell_otel::layer(
-            &provider,
-            "response-correlation-test",
-        ));
-        let correlation = tracing::subscriber::with_default(subscriber, || {
-            test_correlation_for_method("response-denied", "POST")
-        });
+        let ocsf = openshell_ocsf::test_support::OcsfCapture::default();
+        let subscriber = tracing_subscriber::registry()
+            .with(openshell_otel::layer(
+                &provider,
+                "response-correlation-test",
+            ))
+            .with(ocsf.clone());
+        let _subscriber = tracing::subscriber::set_default(subscriber);
+        tracing::callsite::rebuild_interest_cache();
+        let correlation = test_correlation_for_method("response-denied", "POST");
         let runner =
             openshell_supervisor_middleware::ChainRunner::new(Arc::new(BlockingResponseMiddleware));
         let chain = vec![openshell_supervisor_middleware::ChainEntry {
@@ -3153,6 +3175,18 @@ mod tests {
         assert_eq!(
             attributes["openshell.error.stage"],
             "response_middleware_preflight"
+        );
+        let events = ocsf
+            .json_events()
+            .into_iter()
+            .filter(|event| event["firewall_rule"]["type"] == "supervisor-middleware")
+            .collect::<Vec<_>>();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["metadata"]["correlation_uid"], "response-denied");
+        assert_eq!(events[0]["action"], "Denied");
+        assert_eq!(
+            events[0]["unmapped"]["response_middleware_outcome"],
+            "blockdelivery"
         );
     }
 

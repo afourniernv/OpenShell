@@ -868,6 +868,14 @@ impl RequestCorrelation {
     }
 }
 
+pub fn emit_ocsf(correlation: Option<&RequestCorrelation>, event: OcsfEvent) {
+    if let Some(correlation) = correlation {
+        correlation.emit(event);
+    } else {
+        ocsf_emit!(event);
+    }
+}
+
 fn policy_endpoint_resources(
     policy_hash: &str,
     endpoint_id: &str,
