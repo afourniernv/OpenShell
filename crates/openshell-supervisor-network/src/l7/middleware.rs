@@ -639,14 +639,17 @@ pub async fn apply_middleware_chain_for_scheme_with_request_id<
             Vec::new(),
             request_id,
         );
-        let outcome = runner
-            .evaluate_described_with_policy_admitted(
-                &chain,
-                input,
-                openshell_supervisor_middleware::TransformedBodyPolicy::NotPolicyRelevant,
-                admission,
-            )
-            .await?;
+        let evaluation = runner.evaluate_described_with_policy_admitted(
+            &chain,
+            input,
+            openshell_supervisor_middleware::TransformedBodyPolicy::NotPolicyRelevant,
+            admission,
+        );
+        let outcome = if let Some(correlation) = correlation {
+            correlation.within_span(evaluation).await?
+        } else {
+            evaluation.await?
+        };
         observe_request_chain_outcome(correlation, &outcome);
         emit_middleware_events(ctx, &req, &outcome, correlation);
         return Ok(if outcome.allowed {
@@ -694,14 +697,17 @@ pub async fn apply_middleware_chain_for_scheme_with_request_id<
     // The explicitly selected transformation policy either re-checks every
     // replacement or documents that this protocol's policy is body-independent.
     // An ALLOW outcome therefore means the final body is policy-compliant.
-    let outcome = runner
-        .evaluate_described_with_policy_admitted(
-            &chain,
-            input,
-            transformed_body_policy,
-            Some(admission),
-        )
-        .await?;
+    let evaluation = runner.evaluate_described_with_policy_admitted(
+        &chain,
+        input,
+        transformed_body_policy,
+        Some(admission),
+    );
+    let outcome = if let Some(correlation) = correlation {
+        correlation.within_span(evaluation).await?
+    } else {
+        evaluation.await?
+    };
     observe_request_chain_outcome(correlation, &outcome);
     emit_middleware_events(ctx, &req, &outcome, correlation);
     if !outcome.allowed {

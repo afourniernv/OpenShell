@@ -639,10 +639,14 @@ where
         connection_nominated_headers: parsed.connection_nominated,
     };
     let preflight_result = if parsed.representable {
-        middleware
+        let preflight = middleware
             .runner
-            .preflight_described_http_response(described, input)
-            .await
+            .preflight_described_http_response(described, input);
+        if let Some(correlation) = response_correlation {
+            correlation.within_span(preflight).await
+        } else {
+            preflight.await
+        }
     } else {
         Ok(middleware
             .runner

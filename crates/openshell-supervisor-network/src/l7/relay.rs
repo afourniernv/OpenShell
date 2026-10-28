@@ -1903,6 +1903,7 @@ where
                     engine.middleware_runner(),
                     ctx,
                     ctx.websocket_scheme(),
+                    correlation.as_ref(),
                 )
                 .await;
                 let preflight = match preflight {
@@ -2190,6 +2191,7 @@ pub(crate) async fn websocket_middleware_preflight(
     runner: &openshell_supervisor_middleware::ChainRunner,
     ctx: &L7EvalContext,
     scheme: &str,
+    correlation: Option<&RequestCorrelation>,
 ) -> Result<openshell_supervisor_middleware::WebSocketPreflightResult> {
     let header_end = req
         .raw_header
@@ -2204,8 +2206,14 @@ pub(crate) async fn websocket_middleware_preflight(
         req,
         scheme,
         requested_subprotocols,
+        correlation.map(RequestCorrelation::request_id),
     );
-    runner.preflight_websocket(chain, input).await
+    let preflight = runner.preflight_websocket(chain, input);
+    if let Some(correlation) = correlation {
+        correlation.within_span(preflight).await
+    } else {
+        preflight.await
+    }
 }
 
 /// Build the WebSocket preflight input from the sandbox and evaluation
@@ -2218,10 +2226,11 @@ fn websocket_preflight_input(
     req: &crate::l7::provider::L7Request,
     scheme: &str,
     requested_subprotocols: Vec<String>,
+    request_id: Option<&str>,
 ) -> openshell_supervisor_middleware::WebSocketPreflightInput {
     openshell_supervisor_middleware::WebSocketPreflightInput {
         session_id: uuid::Uuid::new_v4().to_string(),
-        request_id: uuid::Uuid::new_v4().to_string(),
+        request_id: request_id.map_or_else(|| uuid::Uuid::new_v4().to_string(), str::to_string),
         sandbox_id: sandbox.sandbox_id.clone(),
         sandbox_name: sandbox.sandbox_name.clone(),
         workspace: ctx.workspace.clone(),
@@ -2744,6 +2753,7 @@ where
                     engine.middleware_runner(),
                     ctx,
                     ctx.websocket_scheme(),
+                    Some(&correlation),
                 )
                 .await;
                 let preflight = match preflight {
@@ -5021,12 +5031,20 @@ network_policies:
             body_length: crate::l7::provider::BodyLength::None,
         };
 
-        let input =
-            websocket_preflight_input(&sandbox, &eval, &req, "wss", vec!["chat".to_string()]);
+        let input = websocket_preflight_input(
+            &sandbox,
+            &eval,
+            &req,
+            "wss",
+            vec!["chat".to_string()],
+            Some("request-123"),
+        );
 
         assert_eq!(input.sandbox_id, "sbx-123");
         assert_eq!(input.sandbox_name, "nightly-build");
         assert_eq!(input.workspace, "team-a");
+        assert_eq!(input.request_id, "request-123");
+        assert_ne!(input.session_id, input.request_id);
     }
 
     #[test]

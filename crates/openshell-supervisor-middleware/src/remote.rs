@@ -23,7 +23,31 @@ use tonic::{Request, Response, Status};
 
 use crate::MIDDLEWARE_GRPC_MESSAGE_BYTES;
 
-type ExtensionChannel = InterceptedService<Channel, BearerTokenInterceptor>;
+type ExtensionChannel = InterceptedService<Channel, MiddlewareClientInterceptor>;
+
+#[derive(Clone, Debug)]
+struct MiddlewareClientInterceptor {
+    bearer: BearerTokenInterceptor,
+    trace_context: openshell_otel::TraceContextInterceptor,
+}
+
+impl MiddlewareClientInterceptor {
+    fn new(bearer: BearerTokenInterceptor) -> Self {
+        Self {
+            bearer,
+            trace_context: openshell_otel::TraceContextInterceptor,
+        }
+    }
+}
+
+impl tonic::service::Interceptor for MiddlewareClientInterceptor {
+    fn call(&mut self, mut request: Request<()>) -> std::result::Result<Request<()>, Status> {
+        request.metadata_mut().remove("traceparent");
+        request.metadata_mut().remove("tracestate");
+        let request = tonic::service::Interceptor::call(&mut self.bearer, request)?;
+        tonic::service::Interceptor::call(&mut self.trace_context, request)
+    }
+}
 
 /// Adapts the borrowed runtime request contract to the owned protobuf service
 /// contract only when dispatch crosses a gRPC-shaped boundary.
@@ -147,7 +171,8 @@ impl RemoteMiddlewareService {
             })?;
         let interceptor =
             bearer.map_or_else(BearerTokenInterceptor::disabled, |slot| slot.interceptor());
-        let channel = InterceptedService::new(channel, interceptor);
+        let channel =
+            InterceptedService::new(channel, MiddlewareClientInterceptor::new(interceptor));
 
         Ok(Self {
             client: SupervisorMiddlewareClient::new(channel.clone())
@@ -212,5 +237,58 @@ impl SupervisorMiddlewareEndpoint for RemoteMiddlewareService {
             .await?
             .into_inner();
         Ok(Box::pin(responses))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use tonic::service::Interceptor as _;
+    use tracing_subscriber::layer::SubscriberExt as _;
+
+    use super::*;
+
+    #[test]
+    fn client_interceptor_replaces_untrusted_trace_context_and_keeps_bearer() {
+        let slot = BearerTokenSlot::new("middleware-secret", i64::MAX).unwrap();
+        let mut interceptor = MiddlewareClientInterceptor::new(slot.interceptor());
+        let forged = "00-11111111111111111111111111111111-2222222222222222-01";
+        let provider = openshell_otel::SdkTracerProvider::builder().build();
+        let subscriber = tracing_subscriber::registry()
+            .with(openshell_otel::layer(&provider, "middleware-client-test"));
+        let (request, expected_traceparent) = tracing::subscriber::with_default(subscriber, || {
+            let span = tracing::info_span!("middleware.client");
+            let _entered = span.enter();
+            let expected_traceparent = openshell_otel::current_trace_context_carrier()
+                .and_then(|carrier| carrier.get("traceparent").cloned())
+                .expect("active host span has trace context");
+            let mut request = Request::new(());
+            request
+                .metadata_mut()
+                .insert("traceparent", forged.parse().unwrap());
+            request
+                .metadata_mut()
+                .insert("tracestate", "vendor=untrusted".parse().unwrap());
+            (interceptor.call(request).unwrap(), expected_traceparent)
+        });
+
+        assert_eq!(
+            request.metadata().get("authorization").unwrap(),
+            "Bearer middleware-secret"
+        );
+        let traceparent = request
+            .metadata()
+            .get("traceparent")
+            .expect("active host span is propagated")
+            .to_str()
+            .unwrap();
+        assert_ne!(traceparent, forged);
+        assert_eq!(traceparent, expected_traceparent);
+        assert_ne!(
+            request
+                .metadata()
+                .get("tracestate")
+                .and_then(|value| value.to_str().ok()),
+            Some("vendor=untrusted")
+        );
     }
 }

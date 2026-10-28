@@ -5,6 +5,7 @@
 
 use std::{
     collections::BTreeSet,
+    future::Future,
     sync::{
         Mutex,
         atomic::{AtomicBool, Ordering},
@@ -16,6 +17,7 @@ use openshell_ocsf::{
     ActionId, ActivityId, DispositionId, Endpoint, HttpActivityBuilder, HttpRequest, OcsfEvent,
     SeverityId, StatusId, ocsf_emit,
 };
+use tracing::Instrument as _;
 
 use crate::l7::provider::L7Request;
 use crate::l7::relay::L7EvalContext;
@@ -458,6 +460,13 @@ impl RequestCorrelation {
     #[must_use]
     pub(crate) fn request_id(&self) -> &str {
         &self.request_id
+    }
+
+    pub(crate) async fn within_span<F>(&self, future: F) -> F::Output
+    where
+        F: Future,
+    {
+        future.instrument(self.span.clone()).await
     }
 
     pub(crate) fn record_policy_decision(&self, decision: &str) {
@@ -1237,6 +1246,35 @@ mod tests {
         assert_ne!(first.request_id(), second.request_id());
         assert!(uuid::Uuid::parse_str(first.request_id()).is_ok());
         assert!(uuid::Uuid::parse_str(second.request_id()).is_ok());
+    }
+
+    #[test]
+    fn request_span_stays_current_across_future_yields() {
+        tracing::subscriber::with_default(tracing_subscriber::registry(), || {
+            let correlation = RequestCorrelation::new(
+                &request(),
+                &L7EvalContext {
+                    host: "example.test".into(),
+                    port: 443,
+                    ..Default::default()
+                },
+            );
+            let expected = correlation.span.id().expect("request span has an id");
+            let mut yielded = false;
+            let current = futures::executor::block_on(correlation.within_span(
+                futures::future::poll_fn(|cx| {
+                    if yielded {
+                        std::task::Poll::Ready(tracing::Span::current().id())
+                    } else {
+                        yielded = true;
+                        cx.waker().wake_by_ref();
+                        std::task::Poll::Pending
+                    }
+                }),
+            ));
+
+            assert_eq!(current, Some(expected));
+        });
     }
 
     #[test]
