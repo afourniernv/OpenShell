@@ -278,10 +278,10 @@ pub(crate) fn configured_user_environment() -> HashMap<String, String> {
 /// PTY and pipe spawn paths so both apply the same layering: the inherited
 /// sandbox environment minus the reserved `OPENSHELL_` namespace, the
 /// declared user environment, supervisor-only and proxy variables stripped,
-/// provider placeholders, TLS trust paths, and finally the OTLP relay
-/// default, applied last so a provider cannot redirect traces, and only
-/// while the relay is active and neither the declared environment nor the
-/// image names an OTLP endpoint of its own.
+/// provider placeholders, TLS trust paths, and finally the trace-specific
+/// OTLP relay default, applied last so a provider cannot redirect exports. The
+/// default applies only while the relay is active and neither the declared
+/// environment nor the image names an OTLP endpoint of its own.
 #[allow(clippy::too_many_arguments)]
 fn compose_canonical_process_environment(
     cmd: &mut Command,
@@ -1220,11 +1220,15 @@ mod tests {
         command
             .args(["--exact", test_path, "--nocapture"])
             .env(marker, "1");
-        // A harness that exports OTLP endpoints must not look like an image
-        // that ships one.
+        // A harness that exports OTLP configuration must not look like an
+        // image that ships it.
         for key in [
             openshell_core::sandbox_env::OTEL_EXPORTER_OTLP_ENDPOINT,
+            openshell_core::sandbox_env::OTEL_EXPORTER_OTLP_PROTOCOL,
             openshell_core::sandbox_env::OTEL_EXPORTER_OTLP_TRACES_ENDPOINT,
+            openshell_core::sandbox_env::OTEL_EXPORTER_OTLP_TRACES_PROTOCOL,
+            openshell_core::sandbox_env::OTEL_EXPORTER_OTLP_COMPRESSION,
+            openshell_core::sandbox_env::OTEL_EXPORTER_OTLP_TRACES_COMPRESSION,
         ] {
             command.env_remove(key);
         }
@@ -1384,7 +1388,8 @@ mod tests {
         use openshell_core::sandbox_env::{
             OTEL_EXPORTER_OTLP_COMPRESSION, OTEL_EXPORTER_OTLP_ENDPOINT,
             OTEL_EXPORTER_OTLP_PROTOCOL, OTEL_EXPORTER_OTLP_TRACES_COMPRESSION,
-            OTEL_EXPORTER_OTLP_TRACES_ENDPOINT, OTLP_RELAY_ENDPOINT,
+            OTEL_EXPORTER_OTLP_TRACES_ENDPOINT, OTEL_EXPORTER_OTLP_TRACES_PROTOCOL,
+            OTLP_RELAY_TRACES_ENDPOINT,
         };
         const COLLECTOR_HOST: &str = "collector.invalid";
         if run_in_isolated_child(
@@ -1447,40 +1452,47 @@ mod tests {
             ])
         };
 
-        // Relay active, no endpoint in the creation request: only the
-        // generic default is set, compression is disabled, and a provider
-        // cannot redirect traces.
+        // Relay active, no endpoint in the creation request: only
+        // trace-specific defaults are set, trace compression is disabled,
+        // and a provider cannot redirect telemetry through a generic endpoint.
         let variables = probe(
             HashMap::from([
                 (OTEL_EXPORTER_OTLP_PROTOCOL.into(), "grpc".into()),
+                (OTEL_EXPORTER_OTLP_TRACES_PROTOCOL.into(), "grpc".into()),
+                (OTEL_EXPORTER_OTLP_COMPRESSION.into(), "gzip".into()),
                 (OTEL_EXPORTER_OTLP_TRACES_COMPRESSION.into(), "gzip".into()),
             ]),
             provider_redirect(),
             true,
         );
-        for key in [
-            OTEL_EXPORTER_OTLP_COMPRESSION,
-            OTEL_EXPORTER_OTLP_TRACES_COMPRESSION,
-        ] {
-            assert_eq!(
-                get(&variables, key).as_deref(),
-                Some("none"),
-                "the relay refuses compressed bodies, so {key} is disabled: {variables:?}"
-            );
-        }
-        assert_eq!(
-            get(&variables, OTEL_EXPORTER_OTLP_ENDPOINT).as_deref(),
-            Some(OTLP_RELAY_ENDPOINT),
-            "the relay endpoint wins over a provider's: {variables:?}"
+        assert!(
+            !variables.contains_key(OTEL_EXPORTER_OTLP_ENDPOINT),
+            "the provider's generic endpoint is removed: {variables:?}"
         );
         assert_eq!(
             get(&variables, OTEL_EXPORTER_OTLP_PROTOCOL).as_deref(),
-            Some("http/protobuf"),
-            "a declared protocol without an endpoint is replaced: {variables:?}"
+            Some("grpc"),
+            "a generic protocol is left for other signals: {variables:?}"
         );
-        assert!(
-            !variables.contains_key(OTEL_EXPORTER_OTLP_TRACES_ENDPOINT),
-            "no signal-specific endpoint is injected, and a provider's is removed: {variables:?}"
+        assert_eq!(
+            get(&variables, OTEL_EXPORTER_OTLP_COMPRESSION).as_deref(),
+            Some("gzip"),
+            "generic compression is left for other signals: {variables:?}"
+        );
+        assert_eq!(
+            get(&variables, OTEL_EXPORTER_OTLP_TRACES_ENDPOINT).as_deref(),
+            Some(OTLP_RELAY_TRACES_ENDPOINT),
+            "the trace relay endpoint wins over a provider's: {variables:?}"
+        );
+        assert_eq!(
+            get(&variables, OTEL_EXPORTER_OTLP_TRACES_PROTOCOL).as_deref(),
+            Some("http/protobuf"),
+            "the relay requires OTLP HTTP/protobuf: {variables:?}"
+        );
+        assert_eq!(
+            get(&variables, OTEL_EXPORTER_OTLP_TRACES_COMPRESSION).as_deref(),
+            Some("none"),
+            "the relay refuses compressed trace bodies: {variables:?}"
         );
         assert!(
             !variables
@@ -1489,16 +1501,56 @@ mod tests {
             "a provider endpoint overrode the relay: {variables:?}"
         );
 
-        // Relay inactive: nothing points at the relay address.
+        // Relay inactive: no defaults are injected and nothing points at the
+        // relay address.
         let variables = probe(HashMap::new(), HashMap::new(), false);
-        assert!(
-            !variables.contains_key(OTEL_EXPORTER_OTLP_ENDPOINT),
-            "no endpoint is injected while the relay is inactive: {variables:?}"
-        );
+        for key in [
+            OTEL_EXPORTER_OTLP_ENDPOINT,
+            OTEL_EXPORTER_OTLP_PROTOCOL,
+            OTEL_EXPORTER_OTLP_TRACES_ENDPOINT,
+            OTEL_EXPORTER_OTLP_TRACES_PROTOCOL,
+        ] {
+            assert!(
+                !variables.contains_key(key),
+                "{key} was injected while the relay is inactive: {variables:?}"
+            );
+        }
         assert!(
             !variables.values().any(|value| value.contains("192.0.0.8")),
             "the relay address must not appear: {variables:?}"
         );
+
+        // Endpoint keys opt out by presence, including an explicitly empty
+        // value that asks an SDK not to inherit an image-level destination.
+        for key in [
+            OTEL_EXPORTER_OTLP_ENDPOINT,
+            OTEL_EXPORTER_OTLP_TRACES_ENDPOINT,
+        ] {
+            let variables = probe(
+                HashMap::from([(key.to_string(), String::new())]),
+                HashMap::new(),
+                true,
+            );
+            assert_eq!(
+                get(&variables, key).as_deref(),
+                Some(""),
+                "the empty endpoint is preserved: {variables:?}"
+            );
+            assert!(
+                !variables.contains_key(OTEL_EXPORTER_OTLP_TRACES_PROTOCOL),
+                "an endpoint opt-out must suppress the relay protocol: {variables:?}"
+            );
+            if key == OTEL_EXPORTER_OTLP_ENDPOINT {
+                assert!(
+                    !variables.contains_key(OTEL_EXPORTER_OTLP_TRACES_ENDPOINT),
+                    "the generic opt-out must suppress the trace endpoint: {variables:?}"
+                );
+            }
+            assert!(
+                !variables.values().any(|value| value.contains("192.0.0.8")),
+                "the relay address must not appear: {variables:?}"
+            );
+        }
 
         // The creation request names its own endpoint: every caller value
         // stays as declared and nothing points at the relay.
@@ -1545,7 +1597,9 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn canonical_process_keeps_tls_mode_precedence_with_the_relay() {
-        use openshell_core::sandbox_env::{OTEL_EXPORTER_OTLP_ENDPOINT, OTLP_RELAY_ENDPOINT};
+        use openshell_core::sandbox_env::{
+            OTEL_EXPORTER_OTLP_TRACES_ENDPOINT, OTLP_RELAY_TRACES_ENDPOINT,
+        };
         if run_in_isolated_child(
             "OPENSHELL_TEST_TLS_MODE_ENV_CHILD",
             "process::tests::canonical_process_keeps_tls_mode_precedence_with_the_relay",
@@ -1592,9 +1646,9 @@ mod tests {
             let variables = probe_environment(cmd);
             assert_eq!(
                 variables
-                    .get(OTEL_EXPORTER_OTLP_ENDPOINT)
+                    .get(OTEL_EXPORTER_OTLP_TRACES_ENDPOINT)
                     .map(String::as_str),
-                Some(OTLP_RELAY_ENDPOINT),
+                Some(OTLP_RELAY_TRACES_ENDPOINT),
                 "the relay default applies in {mode:?}: {variables:?}"
             );
             variables
@@ -1674,6 +1728,15 @@ mod tests {
             !variables.contains_key(OTEL_EXPORTER_OTLP_PROTOCOL),
             "no relay protocol is injected next to an image endpoint: {variables:?}"
         );
+        for key in [
+            openshell_core::sandbox_env::OTEL_EXPORTER_OTLP_TRACES_ENDPOINT,
+            openshell_core::sandbox_env::OTEL_EXPORTER_OTLP_TRACES_PROTOCOL,
+        ] {
+            assert!(
+                !variables.contains_key(key),
+                "an image endpoint must suppress {key}: {variables:?}"
+            );
+        }
     }
 
     #[cfg(unix)]

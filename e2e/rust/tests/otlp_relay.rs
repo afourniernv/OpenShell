@@ -27,6 +27,8 @@ use serial_test::serial;
 
 const ENV_ENDPOINT: &str = "OTEL_EXPORTER_OTLP_ENDPOINT";
 const ENV_PROTOCOL: &str = "OTEL_EXPORTER_OTLP_PROTOCOL";
+const ENV_TRACES_ENDPOINT: &str = "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT";
+const ENV_TRACES_PROTOCOL: &str = "OTEL_EXPORTER_OTLP_TRACES_PROTOCOL";
 const ENV_COLLECTOR: &str = "OPENSHELL_OTLP_ENDPOINT";
 
 /// Posts the base64 body from `OTLP_BODY_B64` to the relay and prints the
@@ -35,7 +37,7 @@ const ENV_COLLECTOR: &str = "OPENSHELL_OTLP_ENDPOINT";
 const EXPORT_SCRIPT: &str = r#"
 import base64, os, requests
 body = base64.b64decode(os.environ["OTLP_BODY_B64"])
-url = os.environ["OTEL_EXPORTER_OTLP_ENDPOINT"] + "/v1/traces"
+url = os.environ["OTEL_EXPORTER_OTLP_TRACES_ENDPOINT"]
 response = requests.post(url, data=body, headers={"Content-Type": "application/x-protobuf"}, timeout=10)
 print("STATUS", response.status_code)
 for key, value in sorted(os.environ.items()):
@@ -50,7 +52,7 @@ fn exit_script(body_b64: &str) -> String {
         r#"
 import base64, os, requests
 body = base64.b64decode("{body_b64}")
-url = os.environ["OTEL_EXPORTER_OTLP_ENDPOINT"] + "/v1/traces"
+url = os.environ["OTEL_EXPORTER_OTLP_TRACES_ENDPOINT"]
 response = requests.post(url, data=body, headers={{"Content-Type": "application/x-protobuf"}}, timeout=10)
 raise SystemExit(0 if response.status_code == 200 else 1)
 "#
@@ -62,7 +64,7 @@ raise SystemExit(0 if response.status_code == 200 else 1)
 /// raising.
 const INERT_SCRIPT: &str = r#"
 import os, requests
-print("ENDPOINT", os.environ.get("OTEL_EXPORTER_OTLP_ENDPOINT", "unset"))
+print("TRACES_ENDPOINT", os.environ.get("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", "unset"))
 url = "http://192.0.0.8:4318/v1/traces"
 try:
     response = requests.post(url, data=b"", headers={"Content-Type": "application/x-protobuf"}, timeout=3)
@@ -280,14 +282,24 @@ async fn agent_span_reaches_collector_with_attribution() {
         output.contains("STATUS 200"),
         "relay must accept the export:\n{output}"
     );
-    // US1-S3: the exact values a standard SDK needs.
+    // US1-S3: the exact trace-specific values a standard SDK needs.
     assert!(
-        output.contains(&format!("ENV {ENV_ENDPOINT}=http://192.0.0.8:4318")),
-        "the relay endpoint is set for the workload:\n{output}"
+        output.contains(&format!(
+            "ENV {ENV_TRACES_ENDPOINT}=http://192.0.0.8:4318/v1/traces"
+        )),
+        "the trace relay endpoint is set for the workload:\n{output}"
     );
     assert!(
-        output.contains(&format!("ENV {ENV_PROTOCOL}=http/protobuf")),
-        "the exporter protocol is set for the workload:\n{output}"
+        output.contains(&format!("ENV {ENV_TRACES_PROTOCOL}=http/protobuf")),
+        "the trace exporter protocol is set for the workload:\n{output}"
+    );
+    assert!(
+        !output.contains(&format!("ENV {ENV_ENDPOINT}=")),
+        "the trace-only relay must not set the generic endpoint:\n{output}"
+    );
+    assert!(
+        !output.contains(&format!("ENV {ENV_PROTOCOL}=")),
+        "the trace-only relay must not set the generic protocol:\n{output}"
     );
     // US1-S4: neither the variable nor the address itself is present anywhere.
     assert!(
@@ -326,8 +338,8 @@ async fn relay_is_inert_without_collector() {
             .expect("sandbox attempts an export without a collector");
     let output = sandbox.create_output.clone();
     assert!(
-        output.contains("ENDPOINT unset"),
-        "no relay endpoint is injected while the relay is inactive:\n{output}"
+        output.contains("TRACES_ENDPOINT unset"),
+        "no trace relay endpoint is injected while the relay is inactive:\n{output}"
     );
     assert!(
         output.contains("ERROR ConnectionError"),

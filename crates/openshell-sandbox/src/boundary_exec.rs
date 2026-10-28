@@ -801,7 +801,7 @@ mod tests {
     }
 
     #[test]
-    fn exec_children_see_the_relay_endpoint_unless_the_exec_overrides_it() {
+    fn exec_children_see_the_trace_relay_endpoint_unless_the_exec_overrides_it() {
         let executor = executor();
         let spec = |env: Vec<(String, String)>| ExecSpec {
             program: "/bin/true".to_string(),
@@ -817,28 +817,30 @@ mod tests {
         assert_eq!(
             env_of(
                 &command,
-                openshell_core::sandbox_env::OTEL_EXPORTER_OTLP_ENDPOINT
+                openshell_core::sandbox_env::OTEL_EXPORTER_OTLP_TRACES_ENDPOINT
             )
             .as_deref(),
-            Some(openshell_core::sandbox_env::OTLP_RELAY_ENDPOINT)
+            Some(openshell_core::sandbox_env::OTLP_RELAY_TRACES_ENDPOINT)
         );
         assert_eq!(
             env_of(
                 &command,
-                openshell_core::sandbox_env::OTEL_EXPORTER_OTLP_PROTOCOL
+                openshell_core::sandbox_env::OTEL_EXPORTER_OTLP_TRACES_PROTOCOL
             )
             .as_deref(),
             Some("http/protobuf")
         );
 
-        assert_eq!(
-            env_of(
-                &command,
-                openshell_core::sandbox_env::OTEL_EXPORTER_OTLP_TRACES_ENDPOINT
-            ),
-            None,
-            "only the generic default is injected"
-        );
+        for key in [
+            openshell_core::sandbox_env::OTEL_EXPORTER_OTLP_ENDPOINT,
+            openshell_core::sandbox_env::OTEL_EXPORTER_OTLP_PROTOCOL,
+        ] {
+            assert_eq!(
+                env_of(&command, key),
+                None,
+                "the trace-only relay must not inject {key}"
+            );
+        }
 
         // A per-exec environment is a developer's explicit instruction and
         // is applied last (contracts/sandbox-environment.md). An endpoint in
@@ -864,6 +866,43 @@ mod tests {
             ),
             None
         );
+        for key in [
+            openshell_core::sandbox_env::OTEL_EXPORTER_OTLP_TRACES_ENDPOINT,
+            openshell_core::sandbox_env::OTEL_EXPORTER_OTLP_TRACES_PROTOCOL,
+        ] {
+            assert_eq!(
+                env_of(&command, key),
+                None,
+                "the exec endpoint must suppress {key}"
+            );
+        }
+
+        // Endpoint keys opt out by presence, so an explicitly empty endpoint
+        // also suppresses both trace defaults.
+        let command = executor
+            .command(&spec(vec![(
+                openshell_core::sandbox_env::OTEL_EXPORTER_OTLP_ENDPOINT.to_string(),
+                String::new(),
+            )]))
+            .expect("resolve exec");
+        assert_eq!(
+            env_of(
+                &command,
+                openshell_core::sandbox_env::OTEL_EXPORTER_OTLP_ENDPOINT
+            )
+            .as_deref(),
+            Some("")
+        );
+        for key in [
+            openshell_core::sandbox_env::OTEL_EXPORTER_OTLP_TRACES_ENDPOINT,
+            openshell_core::sandbox_env::OTEL_EXPORTER_OTLP_TRACES_PROTOCOL,
+        ] {
+            assert_eq!(
+                env_of(&command, key),
+                None,
+                "the empty exec endpoint must suppress {key}"
+            );
+        }
     }
 
     #[test]
@@ -882,6 +921,8 @@ mod tests {
         for key in [
             openshell_core::sandbox_env::OTEL_EXPORTER_OTLP_ENDPOINT,
             openshell_core::sandbox_env::OTEL_EXPORTER_OTLP_PROTOCOL,
+            openshell_core::sandbox_env::OTEL_EXPORTER_OTLP_TRACES_ENDPOINT,
+            openshell_core::sandbox_env::OTEL_EXPORTER_OTLP_TRACES_PROTOCOL,
         ] {
             assert_eq!(
                 env_of(&command, key),
