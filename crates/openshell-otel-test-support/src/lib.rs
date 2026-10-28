@@ -36,10 +36,21 @@ pub mod relay {
     /// `span_name` and the given string resource attributes.
     #[must_use]
     pub fn encoded_trace_request(span_name: &str, attributes: &[(&str, &str)]) -> Vec<u8> {
+        encoded_trace_request_with_span_attributes(span_name, attributes, &[])
+    }
+
+    /// Protobuf-encoded `ExportTraceServiceRequest` with one span named
+    /// `span_name` and the given string resource and span attributes.
+    #[must_use]
+    pub fn encoded_trace_request_with_span_attributes(
+        span_name: &str,
+        resource_attributes: &[(&str, &str)],
+        span_attributes: &[(&str, &str)],
+    ) -> Vec<u8> {
         ExportTraceServiceRequest {
             resource_spans: vec![ResourceSpans {
                 resource: Some(Resource {
-                    attributes: attributes
+                    attributes: resource_attributes
                         .iter()
                         .map(|(key, value)| string_attribute(key, value))
                         .collect(),
@@ -48,6 +59,10 @@ pub mod relay {
                 scope_spans: vec![ScopeSpans {
                     spans: vec![Span {
                         name: span_name.to_string(),
+                        attributes: span_attributes
+                            .iter()
+                            .map(|(key, value)| string_attribute(key, value))
+                            .collect(),
                         ..Default::default()
                     }],
                     ..Default::default()

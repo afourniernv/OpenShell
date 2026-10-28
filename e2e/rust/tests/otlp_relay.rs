@@ -22,7 +22,10 @@ use openshell_e2e::harness::sandbox::SandboxGuard;
 use openshell_otel_test_support::OtlpTestServer;
 use openshell_otel_test_support::relay::{
     SANDBOX_ID_KEY, SOURCE_KEY, SOURCE_VALUE, encoded_trace_request,
+    encoded_trace_request_with_span_attributes,
 };
+use opentelemetry_proto::tonic::common::v1::any_value::Value;
+use opentelemetry_proto::tonic::trace::v1::Span;
 use serial_test::serial;
 
 const ENV_ENDPOINT: &str = "OTEL_EXPORTER_OTLP_ENDPOINT";
@@ -30,6 +33,10 @@ const ENV_PROTOCOL: &str = "OTEL_EXPORTER_OTLP_PROTOCOL";
 const ENV_TRACES_ENDPOINT: &str = "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT";
 const ENV_TRACES_PROTOCOL: &str = "OTEL_EXPORTER_OTLP_TRACES_PROTOCOL";
 const ENV_COLLECTOR: &str = "OPENSHELL_OTLP_ENDPOINT";
+const REPORTED_DECISION_ID_KEY: &str = "relay.guard.report.id";
+const REPORTED_DECISION_KEY: &str = "relay.guard.decision";
+const REPORTED_DENIAL_ID: &str = "guardrails-pre-egress-e2e-7f3e5d96";
+const REPORTED_DENIAL_SPAN: &str = "relay.guardrails.request.denied";
 
 /// Posts the base64 body from `OTLP_BODY_B64` to the relay and prints the
 /// status plus the complete environment, one `ENV key=value` line each, so
@@ -114,6 +121,36 @@ fn encoded_request(span_name: &str) -> String {
         ],
     );
     base64::engine::general_purpose::STANDARD.encode(request)
+}
+
+fn encoded_reported_denial() -> String {
+    let request = encoded_trace_request_with_span_attributes(
+        REPORTED_DENIAL_SPAN,
+        &[
+            ("service.name", "e2e-agent"),
+            (SANDBOX_ID_KEY, "resource-spoofed-sandbox"),
+            (SOURCE_KEY, "resource-spoofed-source"),
+        ],
+        &[
+            (SANDBOX_ID_KEY, "workload-claimed-sandbox"),
+            (SOURCE_KEY, "relay"),
+            (REPORTED_DECISION_ID_KEY, REPORTED_DENIAL_ID),
+            (REPORTED_DECISION_KEY, "deny"),
+        ],
+    );
+    base64::engine::general_purpose::STANDARD.encode(request)
+}
+
+fn string_span_attributes(span: &Span) -> HashMap<String, String> {
+    span.attributes
+        .iter()
+        .filter_map(|attribute| {
+            let Value::StringValue(value) = attribute.value.as_ref()?.value.as_ref()? else {
+                return None;
+            };
+            Some((attribute.key.clone(), value.clone()))
+        })
+        .collect()
 }
 
 /// The harness CLI runner with a `Result` for the failure path.
@@ -319,6 +356,86 @@ async fn agent_span_reaches_collector_with_attribution() {
         .expect("span reaches the collector stub within 5 s");
     assert_no_duplicate_resource_keys(&collector);
     assert_attribution(&spans["e2e-span"], &id);
+
+    sandbox.cleanup().await;
+    drop(collector.shutdown().await);
+}
+
+#[tokio::test]
+#[serial]
+async fn pre_egress_denial_span_remains_workload_reported() {
+    let Some(endpoint) = collector_endpoint() else {
+        eprintln!("OPENSHELL_E2E_OTLP_ENDPOINT is unset; skipping the collector case");
+        return;
+    };
+    let collector = OtlpTestServer::start_on(collector_bind_addr(&endpoint)).await;
+
+    let body = format!("OTLP_BODY_B64={}", encoded_reported_denial());
+    let mut sandbox = SandboxGuard::create(&[
+        "--env",
+        &body,
+        "--no-auto-providers",
+        "--",
+        "python3",
+        "-c",
+        EXPORT_SCRIPT,
+    ])
+    .await
+    .expect("sandbox exports a workload-reported pre-egress denial");
+    assert!(
+        sandbox.create_output.contains("STATUS 200"),
+        "relay must accept the export:\n{}",
+        sandbox.create_output
+    );
+
+    let id = sandbox_id(&sandbox.name).await.expect("sandbox id");
+    let spans = wait_for_spans(&collector, &[REPORTED_DENIAL_SPAN], Duration::from_secs(5))
+        .await
+        .expect("workload-reported denial reaches the collector");
+    assert_no_duplicate_resource_keys(&collector);
+    assert_attribution(&spans[REPORTED_DENIAL_SPAN], &id);
+
+    let received = collector.received();
+    let span = received
+        .spans
+        .iter()
+        .find(|span| span.name == REPORTED_DENIAL_SPAN)
+        .expect("reported denial span");
+    let attributes = string_span_attributes(span);
+    assert_eq!(
+        attributes.get(SANDBOX_ID_KEY).map(String::as_str),
+        Some("workload-claimed-sandbox")
+    );
+    assert_eq!(
+        attributes.get(SOURCE_KEY).map(String::as_str),
+        Some("relay")
+    );
+    assert_eq!(
+        attributes.get(REPORTED_DECISION_ID_KEY).map(String::as_str),
+        Some(REPORTED_DENIAL_ID)
+    );
+    assert_eq!(
+        attributes.get(REPORTED_DECISION_KEY).map(String::as_str),
+        Some("deny")
+    );
+
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let logs = run_cli(&[
+        "logs",
+        &sandbox.name,
+        "-n",
+        "500",
+        "--since",
+        "5m",
+        "--source",
+        "sandbox",
+    ])
+    .await
+    .expect("sandbox logs after reported denial");
+    assert!(
+        !logs.contains(REPORTED_DENIAL_ID),
+        "a workload-reported denial must not be synthesized into authoritative OpenShell OCSF:\n{logs}"
+    );
 
     sandbox.cleanup().await;
     drop(collector.shutdown().await);
