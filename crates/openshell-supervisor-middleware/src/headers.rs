@@ -217,6 +217,36 @@ fn enforce_size_limit(mutation_bytes: usize) -> Result<(), HeaderMutationError> 
     Ok(())
 }
 
+/// Apply existing response-header protections to a completed middleware response.
+pub(crate) fn validate_buffered_response_headers(
+    headers: &[HttpHeader],
+) -> Result<(), HeaderMutationError> {
+    let mut bytes = 0usize;
+    for header in headers {
+        let name = validate_name(&header.name)?;
+        if is_request_protected(&name) || name == "x-api-key" {
+            return Err(HeaderMutationError::Protected { name });
+        }
+        validate_authority(
+            HeaderAuthority::Response,
+            MutationKind::Write,
+            &header.name,
+            &name,
+        )?;
+        if !is_safe_value(&header.value) {
+            return Err(HeaderMutationError::UnsafeValue { name });
+        }
+        if header_value_contains_reserved_credential_marker(&header.value) {
+            return Err(HeaderMutationError::CredentialPlaceholder { name });
+        }
+        bytes = bytes
+            .saturating_add(name.len())
+            .saturating_add(header.value.len());
+        enforce_size_limit(bytes)?;
+    }
+    Ok(())
+}
+
 fn validate_name(name: &str) -> Result<String, HeaderMutationError> {
     let lower = name.to_ascii_lowercase();
     if lower.is_empty() || !lower.bytes().all(is_name_token_byte) {

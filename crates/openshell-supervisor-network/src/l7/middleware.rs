@@ -15,6 +15,11 @@ use tokio::io::{AsyncRead, AsyncWrite};
 
 pub enum MiddlewareApplyResult {
     Allowed(crate::l7::provider::L7Request),
+    /// A validated response that replaces forwarding this request.
+    Respond {
+        request: crate::l7::provider::L7Request,
+        response: openshell_core::proto::BufferedHttpResponse,
+    },
     Denied {
         denial: Option<openshell_supervisor_middleware::MiddlewareDenial>,
     },
@@ -58,6 +63,7 @@ impl HttpMiddlewareExchange {
         ctx: &L7EvalContext,
         scheme: &str,
         transformed_body_policy: openshell_supervisor_middleware::TransformedBodyPolicy<'_>,
+        allow_terminal_response: bool,
     ) -> Result<MiddlewareApplyResult>
     where
         C: AsyncRead + AsyncWrite + Unpin + Send,
@@ -71,6 +77,7 @@ impl HttpMiddlewareExchange {
             &self.runner,
             &self.generation_guard,
             transformed_body_policy,
+            allow_terminal_response,
             &self.request_id,
         )
         .await
@@ -105,6 +112,32 @@ impl HttpMiddlewareExchange {
             generation_guard: Some(&self.generation_guard),
             whole_body_timeout: super::rest::DEFAULT_HTTP_RESPONSE_WHOLE_BODY_TIMEOUT,
         }
+    }
+
+    /// Deliver a terminal response through the same pre-return hooks as upstream bytes.
+    pub async fn respond<C: AsyncRead + AsyncWrite + Unpin + Send>(
+        &self,
+        request: &crate::l7::provider::L7Request,
+        response: openshell_core::proto::BufferedHttpResponse,
+        client: &mut C,
+        ctx: &L7EvalContext,
+        scheme: &str,
+        protocol: Option<crate::l7::L7Protocol>,
+    ) -> Result<()> {
+        if protocol.is_some_and(|protocol| protocol != crate::l7::L7Protocol::Rest)
+            || request.action == "CONNECT"
+            || crate::l7::rest::request_is_websocket_upgrade(&request.raw_header)
+        {
+            let target = openshell_core::secrets::redact_target_for_policy(&request.target)?;
+            return send_middleware_rejection_response(request, client, ctx, None, &target).await;
+        }
+        crate::l7::rest::relay_buffered_middleware_response(
+            request,
+            response,
+            client,
+            self.response_relay(request, ctx, scheme),
+        )
+        .await
     }
 }
 
@@ -514,6 +547,7 @@ pub async fn apply_middleware_chain_with_request_id<C: AsyncRead + AsyncWrite + 
     runner: &openshell_supervisor_middleware::ChainRunner,
     generation_guard: &PolicyGenerationGuard,
     transformed_body_policy: openshell_supervisor_middleware::TransformedBodyPolicy<'_>,
+    allow_terminal_response: bool,
     request_id: &str,
 ) -> Result<MiddlewareApplyResult> {
     apply_middleware_chain_for_scheme_with_request_id(
@@ -525,6 +559,7 @@ pub async fn apply_middleware_chain_with_request_id<C: AsyncRead + AsyncWrite + 
         runner,
         generation_guard,
         transformed_body_policy,
+        allow_terminal_response,
         request_id,
     )
     .await
@@ -542,113 +577,148 @@ pub async fn apply_middleware_chain_for_scheme_with_request_id<
     runner: &openshell_supervisor_middleware::ChainRunner,
     generation_guard: &PolicyGenerationGuard,
     transformed_body_policy: openshell_supervisor_middleware::TransformedBodyPolicy<'_>,
+    allow_terminal_response: bool,
     request_id: &str,
 ) -> Result<MiddlewareApplyResult> {
     if chain.is_empty() {
         return Ok(MiddlewareApplyResult::Allowed(req));
     }
-    let chain = runner.describe_chain(&chain).await?;
-    let admission = if chain.is_empty() {
-        None
-    } else {
-        let outcome = runner.reserve_middleware_work().await?;
-        match outcome {
-            openshell_supervisor_middleware::MiddlewareWorkAdmissionOutcome::Admitted(
-                admission,
-            ) => Some(admission),
-            openshell_supervisor_middleware::MiddlewareWorkAdmissionOutcome::QueueExhausted => {
-                emit_middleware_admission_exhausted(ctx);
-                return Ok(MiddlewareApplyResult::AdmissionExhausted);
-            }
+    // A terminal stage can dispatch upstream calls, so revocation must cancel
+    // middleware work rather than wait until the later forwarding boundary.
+    generation_guard.ensure_current()?;
+    let apply = async {
+        let chain = runner.describe_chain(&chain).await?;
+        if (!allow_terminal_response
+            || req.action == "CONNECT"
+            || crate::l7::rest::request_has_upgrade_header(&req.raw_header))
+            && chain
+                .iter()
+                .any(openshell_supervisor_middleware::DescribedChainEntry::may_respond)
+        {
+            emit_middleware_uninspectable(ctx, "terminal response requires ordinary REST", true);
+            return Ok(MiddlewareApplyResult::Denied { denial: None });
         }
-    };
-    let Some(max_body_bytes) = middleware_chain_body_limit(&chain) else {
-        // No entry resolved to a registered binding, so nothing inspects the
-        // body. Apply each entry's `on_error` policy without buffering (an
-        // unresolved binding is handled before the body is read) and forward
-        // the original request unchanged if the chain allows.
+        let admission = if chain.is_empty() {
+            None
+        } else {
+            let outcome = runner.reserve_middleware_work().await?;
+            match outcome {
+                openshell_supervisor_middleware::MiddlewareWorkAdmissionOutcome::Admitted(
+                    admission,
+                ) => Some(admission),
+                openshell_supervisor_middleware::MiddlewareWorkAdmissionOutcome::QueueExhausted => {
+                    emit_middleware_admission_exhausted(ctx);
+                    return Ok(MiddlewareApplyResult::AdmissionExhausted);
+                }
+            }
+        };
+        let Some(max_body_bytes) = middleware_chain_body_limit(&chain) else {
+            // No entry resolved to a registered binding, so nothing inspects the
+            // body. Apply each entry's `on_error` policy without buffering (an
+            // unresolved binding is handled before the body is read) and forward
+            // the original request unchanged if the chain allows.
+            let input = middleware_request_input_with_id(
+                openshell_ocsf::ctx::ctx(),
+                scheme,
+                &req,
+                ctx,
+                Vec::new(),
+                Vec::new(),
+                String::new(),
+                Vec::new(),
+                request_id,
+            );
+            let outcome = runner
+                .evaluate_described_with_policy_admitted(
+                    &chain,
+                    input,
+                    openshell_supervisor_middleware::TransformedBodyPolicy::NotPolicyRelevant,
+                    admission,
+                )
+                .await?;
+            emit_middleware_events(ctx, &req, &outcome);
+            if let Some(response) = outcome.response {
+                return Ok(MiddlewareApplyResult::Respond {
+                    request: req,
+                    response,
+                });
+            }
+            return Ok(if outcome.allowed {
+                MiddlewareApplyResult::Allowed(req)
+            } else {
+                MiddlewareApplyResult::Denied {
+                    denial: outcome.denial,
+                }
+            });
+        };
+        // Admission was reserved above, before reading any request body. Keeping
+        // the guard through evaluation bounds aggregate buffered input across HTTP
+        // requests and WebSocket messages.
+        let admission = admission.expect("resolved middleware chain reserved work admission");
+        let buffered = match crate::l7::rest::buffer_request_body_for_middleware(
+            &req,
+            client,
+            Some(generation_guard),
+            max_body_bytes,
+        )
+        .await?
+        {
+            crate::l7::rest::BufferResult::Buffered(buffered) => buffered,
+            crate::l7::rest::BufferResult::OverCapacity { recoverable } => {
+                return Ok(resolve_unbuffered_body(ctx, req, &chain, recoverable));
+            }
+        };
+        let headers = safe_middleware_headers(&buffered.headers)?;
+        let query = raw_query_from_request_headers(&buffered.headers)?;
         let input = middleware_request_input_with_id(
             openshell_ocsf::ctx::ctx(),
             scheme,
             &req,
             ctx,
-            Vec::new(),
-            Vec::new(),
-            String::new(),
-            Vec::new(),
+            headers.visible,
+            headers.connection_nominated,
+            query,
+            buffered.body,
             request_id,
         );
+        // The explicitly selected transformation policy either re-checks every
+        // replacement or documents that this protocol's policy is body-independent.
+        // An ALLOW outcome therefore means the final body is policy-compliant.
         let outcome = runner
             .evaluate_described_with_policy_admitted(
                 &chain,
                 input,
-                openshell_supervisor_middleware::TransformedBodyPolicy::NotPolicyRelevant,
-                admission,
+                transformed_body_policy,
+                Some(admission),
             )
             .await?;
         emit_middleware_events(ctx, &req, &outcome);
-        return Ok(if outcome.allowed {
-            MiddlewareApplyResult::Allowed(req)
-        } else {
-            MiddlewareApplyResult::Denied {
-                denial: outcome.denial,
-            }
-        });
-    };
-    // Admission was reserved above, before reading any request body. Keeping
-    // the guard through evaluation bounds aggregate buffered input across HTTP
-    // requests and WebSocket messages.
-    let admission = admission.expect("resolved middleware chain reserved work admission");
-    let buffered = match crate::l7::rest::buffer_request_body_for_middleware(
-        &req,
-        client,
-        Some(generation_guard),
-        max_body_bytes,
-    )
-    .await?
-    {
-        crate::l7::rest::BufferResult::Buffered(buffered) => buffered,
-        crate::l7::rest::BufferResult::OverCapacity { recoverable } => {
-            return Ok(resolve_unbuffered_body(ctx, req, &chain, recoverable));
+        if let Some(response) = outcome.response {
+            return Ok(MiddlewareApplyResult::Respond {
+                request: req,
+                response,
+            });
         }
+        if !outcome.allowed {
+            return Ok(MiddlewareApplyResult::Denied {
+                denial: outcome.denial,
+            });
+        }
+        let rebuilt = crate::l7::rest::rebuild_request_with_buffered_body(
+            &req,
+            &buffered.headers,
+            &outcome.body,
+            &outcome.header_mutations,
+        )?;
+        Ok(MiddlewareApplyResult::Allowed(rebuilt))
     };
-    let headers = safe_middleware_headers(&buffered.headers)?;
-    let query = raw_query_from_request_headers(&buffered.headers)?;
-    let input = middleware_request_input_with_id(
-        openshell_ocsf::ctx::ctx(),
-        scheme,
-        &req,
-        ctx,
-        headers.visible,
-        headers.connection_nominated,
-        query,
-        buffered.body,
-        request_id,
-    );
-    // The explicitly selected transformation policy either re-checks every
-    // replacement or documents that this protocol's policy is body-independent.
-    // An ALLOW outcome therefore means the final body is policy-compliant.
-    let outcome = runner
-        .evaluate_described_with_policy_admitted(
-            &chain,
-            input,
-            transformed_body_policy,
-            Some(admission),
-        )
-        .await?;
-    emit_middleware_events(ctx, &req, &outcome);
-    if !outcome.allowed {
-        return Ok(MiddlewareApplyResult::Denied {
-            denial: outcome.denial,
-        });
+    tokio::select! {
+        biased;
+        () = generation_guard.wait_until_stale() => {
+            Err(miette!("policy generation changed during middleware execution"))
+        }
+        result = apply => result,
     }
-    let rebuilt = crate::l7::rest::rebuild_request_with_buffered_body(
-        &req,
-        &buffered.headers,
-        &outcome.body,
-        &outcome.header_mutations,
-    )?;
-    Ok(MiddlewareApplyResult::Allowed(rebuilt))
 }
 
 pub async fn send_middleware_rejection_response<C: AsyncRead + AsyncWrite + Unpin + Send>(
@@ -896,7 +966,10 @@ pub(super) fn middleware_events(
 ) -> Vec<openshell_ocsf::OcsfEvent> {
     let mut events = Vec::new();
     for invocation in &outcome.applied {
-        let allowed = invocation.decision == openshell_core::proto::Decision::Allow;
+        let allowed = matches!(
+            invocation.decision,
+            openshell_core::proto::Decision::Allow | openshell_core::proto::Decision::Respond
+        );
         let mut event = HttpActivityBuilder::new(openshell_ocsf::ctx::ctx())
             .activity(ActivityId::Other)
             .action(if allowed {
@@ -923,6 +996,9 @@ pub(super) fn middleware_events(
                 "MIDDLEWARE {} {} decision={:?}",
                 invocation.name, invocation.implementation, invocation.decision
             ));
+        if invocation.decision == openshell_core::proto::Decision::Respond {
+            event = event.unmapped("handled_locally", true);
+        }
         if !allowed && !outcome.reason.is_empty() {
             event = event
                 .status(StatusId::Failure)

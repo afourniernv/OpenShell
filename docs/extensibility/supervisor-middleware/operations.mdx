@@ -107,6 +107,23 @@ OpenShell applies each middleware's changes as a unit. If one change is invalid,
 </Accordion>
 </AccordionGroup>
 
+### Buffered Execution Prototype
+
+This branch adds an experimental `DECISION_RESPOND` action for REST requests.
+It requires `openshell.supervisor-middleware.buffered-response` in the service's
+supported and required capabilities. Released 0.1.5 gateways do not support it.
+
+An execution service returns `HttpRequestResult.response` with a status, safe
+end-to-end headers, and a bounded body. OpenShell runs the configured response
+middleware, then returns the answer without injecting credentials or forwarding
+the original request payload. The service must be the final applicable request
+stage and use `fail_closed`. It owns its outgoing calls and provider credentials;
+sandbox egress rules do not constrain those calls automatically.
+
+The prototype does not support streaming, upgrades, or execution through MCP and
+GraphQL middleware paths. A timeout stops admission, but cannot undo a provider
+call the service already dispatched. Do not retry execution automatically.
+
 ### Responses
 
 OpenShell calls your service after the external service responds and before the sandbox receives the response. At preflight, your service can skip inspection, block delivery, or choose how to inspect the response. During inspection, it can change or block the response.

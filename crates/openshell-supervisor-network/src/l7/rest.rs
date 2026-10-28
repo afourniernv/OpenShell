@@ -71,6 +71,55 @@ const RELAY_BUF_SIZE: usize = 8192;
 const MAX_CHUNK_LINE_BYTES: usize = MAX_HEADER_BYTES;
 const MAX_CHUNK_TRAILER_FIELDS: usize = 128;
 const RESPONSE_UNIT_COALESCE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(2);
+
+/// Reuse response parsing and pre-return enforcement without writing to the original upstream.
+pub(crate) async fn relay_buffered_middleware_response<C: AsyncWrite + Unpin>(
+    request: &L7Request,
+    response: openshell_core::proto::BufferedHttpResponse,
+    client: &mut C,
+    middleware: HttpResponseMiddlewareRelay<'_>,
+) -> Result<()> {
+    if !(200..=599).contains(&response.status_code)
+        || request.action == "CONNECT"
+        || request_is_websocket_upgrade(&request.raw_header)
+    {
+        return Err(miette!("unsupported terminal middleware response"));
+    }
+    let status = http::StatusCode::from_u16(u16::try_from(response.status_code).into_diagnostic()?)
+        .into_diagnostic()?;
+    let mut head = format!(
+        "HTTP/1.1 {} {}\r\n",
+        status.as_u16(),
+        status.canonical_reason().unwrap_or("Response")
+    );
+    for header in &response.headers {
+        let name = http::HeaderName::from_bytes(header.name.as_bytes()).into_diagnostic()?;
+        http::HeaderValue::from_str(&header.value).into_diagnostic()?;
+        write!(head, "{name}: {}\r\n", header.value).into_diagnostic()?;
+    }
+    write!(
+        head,
+        "Content-Length: {}\r\nConnection: close\r\n\r\n",
+        response.body.len()
+    )
+    .into_diagnostic()?;
+    if head.len() > MAX_HEADER_BYTES {
+        return Err(miette!("terminal middleware response headers exceed limit"));
+    }
+    let mut upstream = head.as_bytes().chain(response.body.as_slice());
+    relay_response(
+        &request.action,
+        &mut upstream,
+        client,
+        RelayResponseOptions {
+            client_requested_upgrade: false,
+            ..Default::default()
+        },
+        Some(middleware),
+    )
+    .await?;
+    Ok(())
+}
 const HTTP_METHOD_PREFIXES: &[&[u8]] = &[
     b"GET ",
     b"HEAD ",
@@ -2468,7 +2517,7 @@ pub(crate) fn upgrade_refusal_for_protocol(
 /// upstream `101` may reach the client. A refusal based on this test therefore
 /// covers every request either one treats as an upgrade. Headers that are not
 /// UTF-8 return false; the shared relay rejects them before forwarding.
-fn request_has_upgrade_header(raw_header: &[u8]) -> bool {
+pub(crate) fn request_has_upgrade_header(raw_header: &[u8]) -> bool {
     let header_end = raw_header
         .windows(4)
         .position(|w| w == b"\r\n\r\n")
@@ -3779,6 +3828,8 @@ mod tests {
     struct ResponseRelayService {
         script: ResponseRelayScript,
         request_only: bool,
+        terminal_request: bool,
+        request_calls: Option<Arc<std::sync::atomic::AtomicUsize>>,
         body_gate: Option<ResponseBodyGate>,
         captured_preflight_headers: Option<Arc<std::sync::Mutex<Vec<HttpHeader>>>>,
     }
@@ -3792,7 +3843,7 @@ mod tests {
     #[tonic::async_trait]
     impl openshell_supervisor_middleware::InProcessMiddleware for ResponseRelayService {
         async fn describe(&self) -> MiddlewareManifest {
-            MiddlewareManifest {
+            let mut manifest = MiddlewareManifest {
                 name: "test/response-relay".into(),
                 service_version: "test".into(),
                 bindings: vec![MiddlewareBinding {
@@ -3816,7 +3867,22 @@ mod tests {
                     "test",
                     [],
                 )),
+            };
+            if self.terminal_request {
+                manifest.bindings.push(MiddlewareBinding {
+                    operation: SupervisorMiddlewareOperation::HttpRequest as i32,
+                    phase: SupervisorMiddlewarePhase::PreCredentials as i32,
+                    max_payload_bytes: 4096,
+                    request_timeout: None,
+                });
+                let capability =
+                    openshell_core::extension_protocol::SUPERVISOR_MIDDLEWARE_BUFFERED_RESPONSE
+                        .to_string();
+                let extension = manifest.extension.as_mut().unwrap();
+                extension.supported_capabilities.push(capability.clone());
+                extension.required_capabilities.push(capability);
             }
+            manifest
         }
 
         async fn validate_config(
@@ -3831,6 +3897,23 @@ mod tests {
             &self,
             _request: openshell_supervisor_middleware::HttpRequestView<'_>,
         ) -> Result<HttpRequestResult> {
+            if let Some(calls) = &self.request_calls {
+                calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            if self.terminal_request {
+                return Ok(HttpRequestResult {
+                    decision: Decision::Respond as i32,
+                    response: Some(openshell_core::proto::BufferedHttpResponse {
+                        status_code: 200,
+                        headers: vec![HttpHeader {
+                            name: "cache-control".into(),
+                            value: "public".into(),
+                        }],
+                        body: b"hello".to_vec(),
+                    }),
+                    ..Default::default()
+                });
+            }
             Ok(HttpRequestResult {
                 decision: Decision::Allow as i32,
                 ..Default::default()
@@ -6611,6 +6694,8 @@ mod tests {
             openshell_supervisor_middleware::ChainRunner::new(Arc::new(ResponseRelayService {
                 script: ResponseRelayScript::HeadersOnly,
                 request_only: true,
+                terminal_request: false,
+                request_calls: None,
                 body_gate: None,
                 captured_preflight_headers: None,
             }));
@@ -6673,6 +6758,8 @@ mod tests {
             openshell_supervisor_middleware::ChainRunner::new(Arc::new(ResponseRelayService {
                 script: ResponseRelayScript::HeadersOnly,
                 request_only: false,
+                terminal_request: false,
+                request_calls: None,
                 body_gate: None,
                 captured_preflight_headers: Some(Arc::clone(&captured)),
             }));
@@ -6815,6 +6902,8 @@ mod tests {
             openshell_supervisor_middleware::ChainRunner::new(Arc::new(ResponseRelayService {
                 script,
                 request_only: false,
+                terminal_request: false,
+                request_calls: None,
                 body_gate: None,
                 captured_preflight_headers: None,
             }));
@@ -6867,6 +6956,212 @@ mod tests {
             openshell_supervisor_middleware::OnError::FailClosed,
         )
         .await
+    }
+
+    /// Unsupported protocols and revoked policy refuse an executor before dispatch.
+    #[tokio::test]
+    async fn terminal_executor_is_rejected_before_request_rpc() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let runner =
+            openshell_supervisor_middleware::ChainRunner::new(Arc::new(ResponseRelayService {
+                script: ResponseRelayScript::HeadersOnly,
+                request_only: false,
+                terminal_request: true,
+                request_calls: Some(Arc::clone(&calls)),
+                body_gate: None,
+                captured_preflight_headers: None,
+            }));
+        let chain = vec![openshell_supervisor_middleware::ChainEntry {
+            name: "executor".into(),
+            implementation: "test/response-relay".into(),
+            order: 0,
+            config: prost_types::Struct::default(),
+            on_error: openshell_supervisor_middleware::OnError::FailClosed,
+        }];
+        let engine = OpaEngine::from_strings(TEST_POLICY, "network_policies: {}\n").unwrap();
+        for revoked in [false, true] {
+            let guard = engine
+                .generation_guard(engine.current_generation())
+                .unwrap();
+            if revoked {
+                engine.enter_fail_closed("test policy revoked").unwrap();
+            }
+            let request = request_from_buffered_http("POST", "/v1/chat/completions", "/v1/chat/completions",
+            b"POST /v1/chat/completions HTTP/1.1\r\nHost: api.example.test\r\nContent-Length: 2\r\n\r\n{}".to_vec()).unwrap();
+            let (_app, mut client) = tokio::io::duplex(8192);
+            let result = crate::l7::middleware::apply_middleware_chain_with_request_id(
+                request,
+                &mut client,
+                &crate::l7::relay::L7EvalContext::default(),
+                chain.clone(),
+                &runner,
+                &guard,
+                openshell_supervisor_middleware::TransformedBodyPolicy::NotPolicyRelevant,
+                revoked,
+                "request-1",
+            )
+            .await;
+            if revoked {
+                assert!(
+                    result
+                        .err()
+                        .unwrap()
+                        .to_string()
+                        .contains("policy generation is stale")
+                );
+            } else {
+                assert!(matches!(
+                    result.unwrap(),
+                    crate::l7::middleware::MiddlewareApplyResult::Denied { .. }
+                ));
+            }
+            assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 0);
+        }
+
+        engine.exit_fail_closed().unwrap();
+        let guard = engine
+            .generation_guard(engine.current_generation())
+            .unwrap();
+        let request = request_from_buffered_http("POST", "/v1/chat/completions", "/v1/chat/completions",
+            b"POST /v1/chat/completions HTTP/1.1\r\nHost: api.example.test\r\nContent-Length: 2\r\nExpect: 100-continue\r\n\r\n".to_vec()).unwrap();
+        let (mut app, mut client) = tokio::io::duplex(8192);
+        let apply = tokio::spawn(async move {
+            crate::l7::middleware::apply_middleware_chain_with_request_id(
+                request,
+                &mut client,
+                &crate::l7::relay::L7EvalContext::default(),
+                chain,
+                &runner,
+                &guard,
+                openshell_supervisor_middleware::TransformedBodyPolicy::NotPolicyRelevant,
+                true,
+                "request-pending-body",
+            )
+            .await
+        });
+        assert_eq!(
+            read_http_header_block(&mut app).await,
+            b"HTTP/1.1 100 Continue\r\n\r\n"
+        );
+        engine.enter_fail_closed("test policy revoked").unwrap();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(1), apply)
+            .await
+            .expect("revocation must cancel middleware without waiting for the body")
+            .unwrap();
+        assert!(
+            result
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("policy generation changed")
+        );
+        assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 0);
+    }
+
+    /// Terminal responses must neither forward the request nor skip response policy.
+    #[tokio::test]
+    async fn terminal_middleware_response_never_forwards_and_runs_response_hooks() {
+        for script in [
+            ResponseRelayScript::HeadersOnly,
+            ResponseRelayScript::BlockPreflight,
+        ] {
+            let policy = r"
+network_middlewares:
+  response:
+    middleware: test/response-relay
+    on_error: fail_closed
+    endpoints:
+      include: [api.example.test]
+network_policies:
+  rest_api:
+    endpoints:
+      - host: api.example.test
+        port: 8080
+        protocol: rest
+        enforcement: enforce
+        rules:
+          - allow: { method: POST, path: /v1/chat/completions }
+    binaries:
+      - path: /usr/bin/curl
+";
+            let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let engine = OpaEngine::from_strings(TEST_POLICY, policy).unwrap();
+            engine.set_middleware_runner_for_tests(
+                openshell_supervisor_middleware::ChainRunner::new(Arc::new(ResponseRelayService {
+                    script,
+                    request_only: false,
+                    terminal_request: true,
+                    request_calls: None,
+                    body_gate: None,
+                    captured_preflight_headers: Some(Arc::clone(&captured)),
+                })),
+            );
+            let input = crate::opa::NetworkInput {
+                host: "api.example.test".into(),
+                port: 8080,
+                binary_path: "/usr/bin/curl".into(),
+                binary_sha256: String::new(),
+                ancestors: vec![],
+                cmdline_paths: vec![],
+            };
+            let (endpoint, generation) = engine
+                .query_endpoint_config_with_generation(&input)
+                .unwrap();
+            let config = crate::l7::parse_l7_config(&endpoint.unwrap()).unwrap();
+            let engine = engine.clone_engine_for_tunnel(generation).unwrap();
+            let ctx = crate::l7::relay::L7EvalContext {
+                host: input.host,
+                port: input.port,
+                binary_path: "/usr/bin/curl".into(),
+                request_default_port: Some(80),
+                policy_name: "rest_api".into(),
+                ..Default::default()
+            };
+            let (mut app, mut client) = tokio::io::duplex(8192);
+            let (mut upstream, mut original_provider) = tokio::io::duplex(8192);
+            let relay = tokio::spawn(async move {
+                crate::l7::relay::relay_with_inspection(
+                    &config,
+                    engine,
+                    &mut client,
+                    &mut upstream,
+                    &ctx,
+                )
+                .await
+            });
+            app.write_all(b"POST /v1/chat/completions HTTP/1.1\r\nHost: api.example.test:8080\r\nContent-Length: 2\r\n\r\n{}").await.unwrap();
+            let mut delivered = Vec::new();
+            tokio::time::timeout(
+                std::time::Duration::from_secs(3),
+                app.read_to_end(&mut delivered),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            relay.await.unwrap().unwrap();
+            let mut original = Vec::new();
+            original_provider.read_to_end(&mut original).await.unwrap();
+            assert!(
+                original.is_empty(),
+                "original provider received request bytes"
+            );
+            assert!(
+                !captured.lock().unwrap().is_empty(),
+                "pre-return hook was skipped"
+            );
+            let delivered = String::from_utf8(delivered).unwrap();
+            if matches!(script, ResponseRelayScript::HeadersOnly) {
+                assert!(delivered.starts_with("HTTP/1.1 200 "), "{delivered}");
+                assert!(
+                    delivered.contains("cache-control: private\r\n"),
+                    "{delivered}"
+                );
+                assert!(delivered.ends_with("\r\n\r\nhello"), "{delivered}");
+            } else {
+                assert!(delivered.starts_with("HTTP/1.1 403 "), "{delivered}");
+                assert!(!delivered.contains("hello"));
+            }
+        }
     }
 
     async fn run_response_middleware_relay_with_error(
@@ -7095,6 +7390,8 @@ mod tests {
             openshell_supervisor_middleware::ChainRunner::new(Arc::new(ResponseRelayService {
                 script,
                 request_only: false,
+                terminal_request: false,
+                request_calls: None,
                 body_gate: Some(ResponseBodyGate {
                     entered: Arc::clone(&entered),
                     release: Arc::clone(&release),

@@ -636,6 +636,9 @@ enum Decision {
   // Reject the current request or message. The operation-specific result
   // defines the enclosing protocol behavior.
   DECISION_DENY = 2;
+  // Complete an HTTP request with response instead of forwarding it. Requires
+  // openshell.supervisor-middleware.buffered-response negotiation and fail_closed.
+  DECISION_RESPOND = 3;
 }
 
 // Finding is an audit-safe observation produced during evaluation.
@@ -685,9 +688,21 @@ message HeaderMutation {
   }
 }
 
-// HttpRequestResult contains the decision and optional request mutations.
+// A completed, bounded HTTP response. OpenShell owns framing and runs the
+// configured PRE_RETURN middleware before delivery.
+message BufferedHttpResponse {
+  // Final status from 200 through 599, excluding partial responses (206).
+  uint32 status_code = 1;
+  // End-to-end headers only; credential, framing, coding, and range headers
+  // cannot be supplied. Limits match request middleware headers.
+  repeated HttpHeader headers = 2;
+  // Buffered, unencoded response body, limited to the binding payload limit.
+  bytes body = 3;
+}
+
+// HttpRequestResult contains a decision, request mutations, or a terminal response.
 message HttpRequestResult {
-  // Allow or deny decision for this request.
+  // Allow, deny, or complete this request with a response.
   Decision decision = 1;
   // Free-form service diagnostic. OpenShell does not relay this text into
   // denied responses or security logs. Limited to 4 KiB before discarding.
@@ -719,4 +734,8 @@ message HttpRequestResult {
   // letters, digits, and underscores, with a maximum length of 64 bytes.
   // OpenShell may return this code to the requester, unlike free-form reason.
   string reason_code = 8;
+  // Required only for RESPOND. That action cannot include request mutations and
+  // must be the final applicable PRE_CREDENTIALS stage. Original forwarding and
+  // credential injection never run after a terminal response.
+  BufferedHttpResponse response = 9;
 }

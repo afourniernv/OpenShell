@@ -1823,6 +1823,9 @@ impl ForwardMiddlewarePipeline<'_> {
                 self.ctx,
                 self.scheme,
                 transformed_body_policy,
+                self.l7_reevaluation
+                    .as_ref()
+                    .is_none_or(|l7| l7.config.protocol == crate::l7::L7Protocol::Rest),
             )
             .await
     }
@@ -6320,6 +6323,21 @@ async fn handle_forward_proxy(
         };
         forward_request_bytes = match pipeline.apply(request, client).await? {
             crate::l7::middleware::MiddlewareApplyResult::Allowed(request) => request.raw_header,
+            crate::l7::middleware::MiddlewareApplyResult::Respond { request, response } => {
+                middleware_exchange
+                    .respond(
+                        &request,
+                        response,
+                        client,
+                        &l7_ctx,
+                        &scheme,
+                        forward_l7_reeval
+                            .as_ref()
+                            .map(|(config, _)| config.protocol),
+                    )
+                    .await?;
+                return Ok(());
+            }
             crate::l7::middleware::MiddlewareApplyResult::Denied { denial, .. } => {
                 emit_activity_simple(activity_tx, true, "middleware");
                 let response = denial.as_ref().map_or_else(
@@ -10589,7 +10607,8 @@ network_policies:
             crate::l7::middleware::MiddlewareApplyResult::Denied { denial } => {
                 assert!(denial.is_none());
             }
-            crate::l7::middleware::MiddlewareApplyResult::Allowed(_) => {
+            crate::l7::middleware::MiddlewareApplyResult::Allowed(_)
+            | crate::l7::middleware::MiddlewareApplyResult::Respond { .. } => {
                 panic!("policy-invalid transformed request must be denied")
             }
             crate::l7::middleware::MiddlewareApplyResult::AdmissionExhausted => {
@@ -10686,7 +10705,8 @@ network_policies:
         let (outcome, ()) = tokio::join!(pipeline.apply(request, &mut client), revoke);
         let request = match outcome.expect("middleware pipeline") {
             crate::l7::middleware::MiddlewareApplyResult::Allowed(request) => request,
-            crate::l7::middleware::MiddlewareApplyResult::Denied { .. } => {
+            crate::l7::middleware::MiddlewareApplyResult::Denied { .. }
+            | crate::l7::middleware::MiddlewareApplyResult::Respond { .. } => {
                 panic!("blocking middleware should allow after release")
             }
             crate::l7::middleware::MiddlewareApplyResult::AdmissionExhausted => {

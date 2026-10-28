@@ -1,5 +1,10 @@
 # Network supervisor
 
+Buffered-response middleware can finish ordinary REST or plaintext HTTP requests
+without forwarding them or injecting upstream credentials. Its response still
+passes through the normal response parser and pre-return middleware. Executors
+are rejected before invocation on MCP, JSON-RPC, GraphQL, and upgrade requests.
+
 This crate forbids unsafe code, including its local tests. Typed socket APIs
 provide original-destination lookup for transparent proxying.
 

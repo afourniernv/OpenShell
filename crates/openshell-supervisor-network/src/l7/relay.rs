@@ -1441,11 +1441,31 @@ where
                 engine.middleware_runner(),
                 engine.generation_guard(),
                 openshell_supervisor_middleware::TransformedBodyPolicy::Reevaluate(&validate),
+                config.protocol == L7Protocol::Rest,
                 &request_id,
             )
             .await;
             let req = match middleware_result? {
                 MiddlewareApplyResult::Allowed(request) => request,
+                MiddlewareApplyResult::Respond { request, response } => {
+                    let exchange = crate::l7::middleware::HttpMiddlewareExchange::new(
+                        request_id,
+                        response_chain,
+                        engine.middleware_runner().clone(),
+                        engine.generation_guard().clone(),
+                    );
+                    exchange
+                        .respond(
+                            &request,
+                            response,
+                            client,
+                            ctx,
+                            ctx.request_scheme(),
+                            Some(config.protocol),
+                        )
+                        .await?;
+                    return Ok(());
+                }
                 MiddlewareApplyResult::Denied { denial, .. } => {
                     if let Some(observer) = observer.as_ref() {
                         observer.observe(EndpointResult::PolicyDenied);
@@ -2188,11 +2208,31 @@ where
                 engine.middleware_runner(),
                 engine.generation_guard(),
                 openshell_supervisor_middleware::TransformedBodyPolicy::NotPolicyRelevant,
+                config.protocol == L7Protocol::Rest,
                 &request_id,
             )
             .await;
             let req = match middleware_result? {
                 MiddlewareApplyResult::Allowed(request) => request,
+                MiddlewareApplyResult::Respond { request, response } => {
+                    let exchange = crate::l7::middleware::HttpMiddlewareExchange::new(
+                        request_id,
+                        response_chain,
+                        engine.middleware_runner().clone(),
+                        engine.generation_guard().clone(),
+                    );
+                    exchange
+                        .respond(
+                            &request,
+                            response,
+                            client,
+                            ctx,
+                            ctx.request_scheme(),
+                            Some(config.protocol),
+                        )
+                        .await?;
+                    return Ok(());
+                }
                 MiddlewareApplyResult::Denied { denial, .. } => {
                     let denied_request = crate::l7::provider::L7Request {
                         action: request_info.action.clone(),
@@ -2617,11 +2657,17 @@ where
                 engine.middleware_runner(),
                 engine.generation_guard(),
                 openshell_supervisor_middleware::TransformedBodyPolicy::Reevaluate(&validate),
+                false,
                 &request_id,
             )
             .await?
             {
                 MiddlewareApplyResult::Allowed(request) => request,
+                MiddlewareApplyResult::Respond { .. } => {
+                    return Err(miette!(
+                        "terminal middleware response is unsupported for JSON-RPC or MCP"
+                    ));
+                }
                 MiddlewareApplyResult::Denied { denial, .. } => {
                     if let Some(observer) = observer.as_ref() {
                         observer.observe(EndpointResult::PolicyDenied);
@@ -2899,11 +2945,17 @@ where
                 engine.middleware_runner(),
                 engine.generation_guard(),
                 openshell_supervisor_middleware::TransformedBodyPolicy::Reevaluate(&validate),
+                false,
                 &request_id,
             )
             .await?
             {
                 MiddlewareApplyResult::Allowed(request) => request,
+                MiddlewareApplyResult::Respond { .. } => {
+                    return Err(miette!(
+                        "terminal middleware response is unsupported for GraphQL"
+                    ));
+                }
                 MiddlewareApplyResult::Denied { denial, .. } => {
                     let denied_request = crate::l7::provider::L7Request {
                         action: request_info.action.clone(),
@@ -3610,10 +3662,17 @@ where
                     ctx,
                     ctx.request_scheme(),
                     openshell_supervisor_middleware::TransformedBodyPolicy::NotPolicyRelevant,
+                    true,
                 )
                 .await?;
             let request = match result {
                 MiddlewareApplyResult::Allowed(request) => request,
+                MiddlewareApplyResult::Respond { request, response } => {
+                    exchange
+                        .respond(&request, response, client, ctx, ctx.request_scheme(), None)
+                        .await?;
+                    return Ok(());
+                }
                 MiddlewareApplyResult::Denied { denial, .. } => {
                     let denied_request = crate::l7::provider::L7Request {
                         action: "HTTP".into(),
@@ -7386,6 +7445,7 @@ network_policies:
             &runner,
             tunnel_engine.generation_guard(),
             openshell_supervisor_middleware::TransformedBodyPolicy::NotPolicyRelevant,
+            true,
             "test-request-id",
         )
         .await
@@ -7399,7 +7459,7 @@ network_policies:
                     "redactor must replace the body: {raw}"
                 );
             }
-            MiddlewareApplyResult::Denied { .. } => {
+            MiddlewareApplyResult::Denied { .. } | MiddlewareApplyResult::Respond { .. } => {
                 panic!("body within the largest stage limit must not fail the chain")
             }
             MiddlewareApplyResult::AdmissionExhausted => {
@@ -7502,6 +7562,7 @@ network_policies:
                 &runner,
                 tunnel_engine.generation_guard(),
                 openshell_supervisor_middleware::TransformedBodyPolicy::NotPolicyRelevant,
+                true,
                 "test-request-id",
             )
             .await
@@ -7689,6 +7750,7 @@ network_policies:
         };
         let outcome = ChainOutcome {
             allowed: true,
+            response: None,
             reason: String::new(),
             // The transformed body still holds the raw secret; emission must never
             // serialize it.
@@ -7782,6 +7844,7 @@ network_policies:
 
         let denied_outcome = ChainOutcome {
             allowed: false,
+            response: None,
             reason: "middleware_denied:content-guard:content_match".into(),
             body: Vec::new(),
             header_mutations: Vec::new(),

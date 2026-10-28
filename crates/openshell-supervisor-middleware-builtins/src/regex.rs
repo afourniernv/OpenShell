@@ -103,6 +103,7 @@ pub fn evaluate_http_request(
     let (findings, metadata) = findings_and_metadata(&matches);
     let has_body = !matches.is_empty();
     let result = HttpRequestResult {
+        response: None,
         decision: Decision::Allow as i32,
         reason: String::new(),
         body: match body {

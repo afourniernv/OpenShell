@@ -22,6 +22,10 @@ pub const COMPUTE_LAUNCH_AUTHENTICATION: &str = "openshell.compute.launch-authen
 /// Driver stages operator-selected external isolation routes for the supervisor.
 pub const COMPUTE_ISOLATION_BACKEND: &str = "openshell.compute.isolation-backend";
 
+/// Request middleware may finish execution with a buffered HTTP response.
+pub const SUPERVISOR_MIDDLEWARE_BUFFERED_RESPONSE: &str =
+    "openshell.supervisor-middleware.buffered-response";
+
 const MAX_IMPLEMENTATION_NAME_BYTES: usize = 128;
 const MAX_IMPLEMENTATION_VERSION_BYTES: usize = 128;
 const MAX_CAPABILITY_BYTES: usize = 128;
@@ -125,6 +129,9 @@ pub fn gateway_metadata(family: ExtensionFamily) -> PeerMetadata {
     if family == ExtensionFamily::Compute {
         supported_capabilities.push(COMPUTE_LAUNCH_AUTHENTICATION.to_string());
         supported_capabilities.push(COMPUTE_ISOLATION_BACKEND.to_string());
+    }
+    if family == ExtensionFamily::SupervisorMiddleware {
+        supported_capabilities.push(SUPERVISOR_MIDDLEWARE_BUFFERED_RESPONSE.to_string());
     }
     PeerMetadata {
         protocol_version: Some(ProtocolVersion {

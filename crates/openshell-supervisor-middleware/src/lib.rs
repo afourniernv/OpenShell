@@ -31,14 +31,16 @@ use miette::{Result, miette};
 use prost::Message;
 
 use openshell_core::extension_protocol::{
-    ExtensionFamily, NegotiatedExtension, gateway_metadata, negotiate,
+    ExtensionFamily, NegotiatedExtension, SUPERVISOR_MIDDLEWARE_BUFFERED_RESPONSE,
+    gateway_metadata, negotiate,
 };
 use openshell_core::proto::middleware::v1::supervisor_middleware_server::SupervisorMiddleware;
 use openshell_core::proto::{
-    Decision, Finding, HeaderMutation, HttpHeader, HttpRequestEvaluation, HttpRequestTarget,
-    MiddlewareBinding, MiddlewareDescribeRequest, MiddlewareManifest, NetworkMiddlewareConfig,
-    RequestContext, SandboxPolicy, SupervisorMiddlewareOperation, SupervisorMiddlewarePhase,
-    SupervisorMiddlewareService, ValidateConfigRequest, ValidateConfigResponse,
+    BufferedHttpResponse, Decision, Finding, HeaderMutation, HttpHeader, HttpRequestEvaluation,
+    HttpRequestTarget, MiddlewareBinding, MiddlewareDescribeRequest, MiddlewareManifest,
+    NetworkMiddlewareConfig, RequestContext, SandboxPolicy, SupervisorMiddlewareOperation,
+    SupervisorMiddlewarePhase, SupervisorMiddlewareService, ValidateConfigRequest,
+    ValidateConfigResponse,
 };
 use tokio::sync::{OnceCell, OwnedSemaphorePermit, Semaphore};
 use tonic::{Request, Response as TonicResponse, Status as TonicStatus};
@@ -413,6 +415,14 @@ struct DescribedChain {
 }
 
 impl DescribedChainEntry {
+    /// Whether this stage requires the negotiated terminal-response capability.
+    pub fn may_respond(&self) -> bool {
+        self.service
+            .as_ref()
+            .and_then(|service| service.manifest.get())
+            .is_some_and(requires_buffered_response)
+    }
+
     pub fn max_payload_bytes(&self) -> usize {
         self.max_payload_bytes
     }
@@ -482,6 +492,8 @@ pub struct HttpRequestInput {
 #[derive(Debug, Clone)]
 pub struct ChainOutcome {
     pub allowed: bool,
+    /// Terminal execution result. The original request must not be forwarded.
+    pub response: Option<BufferedHttpResponse>,
     pub reason: String,
     pub body: Vec<u8>,
     /// Ordered, validated mutations to replay against the original raw request.
@@ -901,6 +913,17 @@ fn validate_manifest_bindings(
     manifest: &MiddlewareManifest,
     operator_max_payload_bytes: Option<usize>,
 ) -> Result<()> {
+    if manifest.extension.as_ref().is_some_and(|extension| {
+        extension
+            .supported_capabilities
+            .iter()
+            .any(|capability| capability == SUPERVISOR_MIDDLEWARE_BUFFERED_RESPONSE)
+    }) != requires_buffered_response(manifest)
+    {
+        return Err(miette!(
+            "{source} must support and require its buffered-response capability"
+        ));
+    }
     if manifest.bindings.is_empty() {
         return Err(miette!("{source} describes no bindings"));
     }
@@ -931,6 +954,15 @@ fn validate_manifest_bindings(
         }
     }
     Ok(())
+}
+
+fn requires_buffered_response(manifest: &MiddlewareManifest) -> bool {
+    manifest.extension.as_ref().is_some_and(|extension| {
+        extension
+            .required_capabilities
+            .iter()
+            .any(|capability| capability == SUPERVISOR_MIDDLEWARE_BUFFERED_RESPONSE)
+    })
 }
 
 fn middleware_proto_timeout_or_default(
@@ -1055,6 +1087,28 @@ fn validate_request_view(request: HttpRequestView<'_>) -> std::result::Result<()
 fn validate_response_envelope(
     result: &openshell_core::proto::HttpRequestResult,
 ) -> std::result::Result<(), &'static str> {
+    if (result.decision == Decision::Respond as i32) != result.response.is_some() {
+        return Err("response_terminal_action_invalid");
+    }
+    if let Some(response) = &result.response {
+        if result.has_body || !result.body.is_empty() || !result.header_mutations.is_empty() {
+            return Err("response_terminal_request_mutations");
+        }
+        if !(200..=599).contains(&response.status_code)
+            || response.status_code == 206
+            || (matches!(response.status_code, 204 | 304) && !response.body.is_empty())
+        {
+            return Err("response_terminal_status_invalid");
+        }
+        if response.body.len() > MAX_MIDDLEWARE_PAYLOAD_BYTES {
+            return Err("response_body_over_capacity");
+        }
+        if response.headers.len() > MAX_MIDDLEWARE_HEADERS {
+            return Err("response_header_count_over_capacity");
+        }
+        headers::validate_buffered_response_headers(&response.headers)
+            .map_err(|error| error.code())?;
+    }
     if result.body.len() > MAX_MIDDLEWARE_PAYLOAD_BYTES {
         return Err("response_body_over_capacity");
     }
@@ -1582,6 +1636,20 @@ impl ChainRunner {
             });
         }
         ensure_chain_capacity(described_entries.len())?;
+        if operation == SupervisorMiddlewareOperation::HttpRequest
+            && phase == SupervisorMiddlewarePhase::PreCredentials
+        {
+            for (index, entry) in described_entries.iter().enumerate() {
+                if entry.may_respond()
+                    && (entry.entry.on_error != OnError::FailClosed
+                        || index + 1 != described_entries.len())
+                {
+                    return Err(miette!(
+                        "buffered-response middleware must be fail_closed and the last request stage"
+                    ));
+                }
+            }
+        }
         Ok(DescribedChain {
             entries: described_entries,
             unbound,
@@ -1743,6 +1811,7 @@ impl ChainRunner {
                             metadata,
                             applied,
                             denial: None,
+                            response: None,
                         });
                     }
                 }
@@ -1760,6 +1829,7 @@ impl ChainRunner {
                             metadata,
                             applied,
                             denial: None,
+                            response: None,
                         });
                     }
                 }
@@ -1786,6 +1856,7 @@ impl ChainRunner {
                             metadata,
                             applied,
                             denial: None,
+                            response: None,
                         });
                     }
                 }
@@ -1807,6 +1878,7 @@ impl ChainRunner {
                             metadata,
                             applied,
                             denial: None,
+                            response: None,
                         });
                     }
                 }
@@ -1837,12 +1909,29 @@ impl ChainRunner {
                                 metadata,
                                 applied,
                                 denial: None,
+                                response: None,
                             });
                         }
                     }
                 }
             };
 
+            // A terminal response must never fall through under fail_open,
+            // including one returned by an undeclared executor.
+            if result.response.is_some() || result.decision == Decision::Respond as i32 {
+                if !entry.may_respond() || entry.entry.on_error != OnError::FailClosed {
+                    return Err(miette!("unnegotiated buffered middleware response"));
+                }
+                if result
+                    .response
+                    .as_ref()
+                    .is_some_and(|response| response.body.len() > entry.max_payload_bytes)
+                {
+                    return Err(miette!(
+                        "buffered middleware response exceeds binding limit"
+                    ));
+                }
+            }
             if let Err(reason) = validate_response_envelope(&result) {
                 match apply_on_error(entry, reason, &mut applied) {
                     OnErrorAction::FailOpen => continue,
@@ -1856,6 +1945,7 @@ impl ChainRunner {
                             metadata,
                             applied,
                             denial: None,
+                            response: None,
                         });
                     }
                 }
@@ -1866,7 +1956,7 @@ impl ChainRunner {
                 .process_result(&entry.entry.implementation, &mut result);
 
             let decision = match Decision::try_from(result.decision) {
-                Ok(decision @ (Decision::Allow | Decision::Deny)) => decision,
+                Ok(decision @ (Decision::Allow | Decision::Deny | Decision::Respond)) => decision,
                 Ok(Decision::Unspecified) | Err(_) => {
                     match apply_on_error(entry, "invalid_response_decision", &mut applied) {
                         OnErrorAction::FailOpen => continue,
@@ -1880,19 +1970,20 @@ impl ChainRunner {
                                 metadata,
                                 applied,
                                 denial: None,
+                                response: None,
                             });
                         }
                     }
                 }
             };
 
-            if decision == Decision::Deny {
+            if decision != Decision::Allow {
                 let reason_code =
                     (!result.reason_code.is_empty()).then(|| result.reason_code.clone());
-                let denial = MiddlewareDenial {
+                let denial = (decision == Decision::Deny).then(|| MiddlewareDenial {
                     config_name: entry.entry.name.clone(),
                     reason_code,
-                };
+                });
                 for finding in result.findings {
                     findings.push(NamespacedFinding {
                         middleware: entry.entry.name.clone(),
@@ -1914,16 +2005,16 @@ impl ChainRunner {
                 });
                 return Ok(ChainOutcome {
                     allowed: false,
-                    reason: middleware_denial_reason(
-                        &denial.config_name,
-                        denial.reason_code.as_deref(),
-                    ),
+                    response: result.response,
+                    reason: denial.as_ref().map_or_else(String::new, |denial| {
+                        middleware_denial_reason(&denial.config_name, denial.reason_code.as_deref())
+                    }),
                     body,
                     header_mutations,
                     findings,
                     metadata,
                     applied,
-                    denial: Some(denial),
+                    denial,
                 });
             }
 
@@ -1940,6 +2031,7 @@ impl ChainRunner {
                             metadata,
                             applied,
                             denial: None,
+                            response: None,
                         });
                     }
                 }
@@ -1974,6 +2066,7 @@ impl ChainRunner {
                                     metadata,
                                     applied,
                                     denial: None,
+                                    response: None,
                                 });
                             }
                         }
@@ -2036,6 +2129,7 @@ impl ChainRunner {
                         metadata,
                         applied,
                         denial: None,
+                        response: None,
                     });
                 }
             }
@@ -2050,6 +2144,7 @@ impl ChainRunner {
             metadata,
             applied,
             denial: None,
+            response: None,
         })
     }
 }
@@ -2752,6 +2847,20 @@ mod tests {
             &self,
             _request: Request<MiddlewareDescribeRequest>,
         ) -> std::result::Result<tonic::Response<MiddlewareManifest>, tonic::Status> {
+            let mut extension = openshell_core::extension_protocol::extension_metadata(
+                ExtensionFamily::SupervisorMiddleware,
+                "openshell/test-middleware",
+                "test",
+                [],
+            );
+            if self.result.response.is_some() {
+                extension
+                    .supported_capabilities
+                    .push(SUPERVISOR_MIDDLEWARE_BUFFERED_RESPONSE.into());
+                extension
+                    .required_capabilities
+                    .push(SUPERVISOR_MIDDLEWARE_BUFFERED_RESPONSE.into());
+            }
             Ok(tonic::Response::new(MiddlewareManifest {
                 name: self.manifest_name.clone(),
                 service_version: "test".into(),
@@ -2762,12 +2871,7 @@ mod tests {
                     request_timeout: None,
                 }],
                 expected_audience: String::new(),
-                extension: Some(openshell_core::extension_protocol::extension_metadata(
-                    ExtensionFamily::SupervisorMiddleware,
-                    "openshell/test-middleware",
-                    "test",
-                    [],
-                )),
+                extension: Some(extension),
             }))
         }
 
@@ -3128,7 +3232,130 @@ mod tests {
             findings: Vec::new(),
             metadata: HashMap::new(),
             reason_code: String::new(),
+            response: None,
         }
+    }
+
+    fn terminal_result() -> openshell_core::proto::HttpRequestResult {
+        openshell_core::proto::HttpRequestResult {
+            decision: Decision::Respond as i32,
+            response: Some(BufferedHttpResponse {
+                status_code: 200,
+                headers: vec![HttpHeader {
+                    name: "content-type".into(),
+                    value: "application/json".into(),
+                }],
+                body: b"{\"answer\":\"private\"}".to_vec(),
+            }),
+            ..allow_result()
+        }
+    }
+
+    #[tokio::test]
+    async fn buffered_response_is_terminal_and_cannot_fail_open() {
+        let runner =
+            ChainRunner::new_protobuf_for_tests(Arc::new(scripted_service(terminal_result())));
+        let closed = entry("execute", OnError::FailClosed);
+        let outcome = runner
+            .evaluate(std::slice::from_ref(&closed), input("payload"))
+            .await
+            .expect("terminal execution");
+        assert!(
+            !outcome.allowed,
+            "terminal response must not authorize forwarding"
+        );
+        assert_eq!(outcome.response, terminal_result().response);
+        assert!(outcome.denial.is_none());
+        assert_eq!(outcome.applied[0].decision, Decision::Respond);
+        assert!(
+            runner
+                .describe_chain(&[entry("execute", OnError::FailOpen)])
+                .await
+                .is_err()
+        );
+        let mut later = closed.clone();
+        later.order = 1;
+        later.name = "later".into();
+        assert!(runner.describe_chain(&[closed, later]).await.is_err());
+    }
+
+    #[test]
+    fn buffered_response_rejects_invalid_envelopes_and_unsafe_headers() {
+        assert!(validate_response_envelope(&terminal_result()).is_ok());
+        for status in [101, 204, 206, 304, 600] {
+            let mut result = terminal_result();
+            result.response.as_mut().expect("response").status_code = status;
+            assert!(
+                validate_response_envelope(&result).is_err(),
+                "status {status}"
+            );
+        }
+        for (name, value) in [
+            ("Host", "other"),
+            ("content-length", "0"),
+            ("authorization", "secret"),
+            ("set-cookie", "secret"),
+            ("content-type", "ok\r\nx-secret: value"),
+        ] {
+            let mut result = terminal_result();
+            result.response.as_mut().expect("response").headers = vec![HttpHeader {
+                name: name.into(),
+                value: value.into(),
+            }];
+            assert!(
+                validate_response_envelope(&result).is_err(),
+                "header {name}"
+            );
+        }
+        let mut result = terminal_result();
+        result.has_body = true;
+        assert!(validate_response_envelope(&result).is_err());
+        result.has_body = false;
+        result.decision = Decision::Allow as i32;
+        assert!(
+            validate_response_envelope(&result).is_err(),
+            "old peers must not treat response as ALLOW"
+        );
+    }
+
+    #[tokio::test]
+    async fn buffered_response_requires_peer_capability_and_respects_binding_limit() {
+        let mut service = scripted_service(terminal_result());
+        let manifest = service
+            .describe(Request::new(MiddlewareDescribeRequest::default()))
+            .await
+            .expect("describe")
+            .into_inner();
+        let mut old_gateway = gateway_metadata(ExtensionFamily::SupervisorMiddleware);
+        old_gateway
+            .supported_capabilities
+            .retain(|capability| capability != SUPERVISOR_MIDDLEWARE_BUFFERED_RESPONSE);
+        assert!(
+            negotiate(
+                ExtensionFamily::SupervisorMiddleware,
+                "execute",
+                &old_gateway,
+                manifest.extension
+            )
+            .is_err()
+        );
+        service.max_body_bytes = 2;
+        let runner = ChainRunner::new_protobuf_for_tests(Arc::new(service));
+        assert!(
+            runner
+                .evaluate(&[entry("execute", OnError::FailClosed)], input(""))
+                .await
+                .is_err()
+        );
+        let mut undeclared = terminal_result();
+        undeclared.response = None;
+        let runner = ChainRunner::new_protobuf_for_tests(Arc::new(scripted_service(undeclared)));
+        assert!(
+            runner
+                .evaluate(&[entry("execute", OnError::FailOpen)], input(""))
+                .await
+                .is_err()
+        );
     }
 
     /// A middleware that records every evaluation it receives and allows the
