@@ -43,6 +43,8 @@ use openshell_ocsf::ctx::ctx as ocsf_ctx;
 use sha1::{Digest, Sha1};
 use std::collections::{HashMap, HashSet};
 use std::fmt::{self, Write as _};
+use std::future::Future;
+use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tracing::debug;
 
@@ -93,10 +95,130 @@ pub(crate) const UNSUPPORTED_JSONRPC_UPGRADE_DETAIL: &str =
 pub(crate) const UNSUPPORTED_GRAPHQL_UPGRADE_DETAIL: &str = "HTTP upgrade is not supported for GraphQL endpoints; serve GraphQL over WebSocket from a separate protocol: websocket endpoint on another path or port";
 const MIN_HTTP2_PREFACE_DETECTION_BYTES: usize = 8;
 
-/// Idle timeout for `relay_until_eof`.  If no data arrives within this window
-/// the body is considered complete.  Prevents blocking on servers that keep
-/// the TCP connection alive after the response body (common with CDN keep-alive).
+/// Idle timeout for an unframed, close-delimited response body.
 const RELAY_EOF_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+async fn guarded_relay_read<T>(
+    guard: Option<&PolicyGenerationGuard>,
+    read: impl Future<Output = Result<T>>,
+) -> Result<T> {
+    let Some(guard) = guard else {
+        return read.await;
+    };
+    let mut read = std::pin::pin!(read);
+    tokio::select! {
+        result = &mut read => result,
+        () = guard.wait_until_stale() => {
+            if guard.is_stale() {
+                Err(RelayError::PolicyReloaded(format!(
+                    "policy generation changed [captured_generation:{} current_generation:{}]",
+                    guard.captured_generation(),
+                    guard.current_generation(),
+                )).into())
+            } else {
+                read.await
+            }
+        },
+    }
+}
+
+fn ensure_relay_generation_current(guard: &PolicyGenerationGuard) -> Result<()> {
+    guard
+        .ensure_current()
+        .map_err(|error| RelayError::PolicyReloaded(error.to_string()).into())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RelayWriteStage {
+    Write,
+    Flush,
+    Shutdown,
+    InterimWrite,
+    InterimFlush,
+}
+
+#[derive(Debug, Error)]
+enum RelayError {
+    #[error("HTTP relay read failed: {0}")]
+    Read(#[source] std::io::Error),
+    #[error("HTTP relay write failed: {source}")]
+    Write {
+        #[source]
+        source: std::io::Error,
+        stage: RelayWriteStage,
+    },
+    #[error("{detail}")]
+    Protocol { code: &'static str, detail: String },
+    #[error("{0}")]
+    Truncated(&'static str),
+    #[error("HTTP response body idle timeout")]
+    IdleTimeout,
+    #[error("{0}")]
+    PolicyReloaded(String),
+}
+
+impl RelayError {
+    fn read(source: std::io::Error) -> Self {
+        Self::Read(source)
+    }
+
+    fn write(source: std::io::Error) -> Self {
+        Self::Write {
+            source,
+            stage: RelayWriteStage::Write,
+        }
+    }
+
+    fn flush(source: std::io::Error) -> Self {
+        Self::Write {
+            source,
+            stage: RelayWriteStage::Flush,
+        }
+    }
+
+    fn shutdown(source: std::io::Error) -> Self {
+        Self::Write {
+            source,
+            stage: RelayWriteStage::Shutdown,
+        }
+    }
+
+    fn interim_write(source: std::io::Error) -> Self {
+        Self::Write {
+            source,
+            stage: RelayWriteStage::InterimWrite,
+        }
+    }
+
+    fn interim_flush(source: std::io::Error) -> Self {
+        Self::Write {
+            source,
+            stage: RelayWriteStage::InterimFlush,
+        }
+    }
+
+    fn protocol(code: &'static str, detail: impl Into<String>) -> Self {
+        Self::Protocol {
+            code,
+            detail: detail.into(),
+        }
+    }
+}
+
+impl miette::Diagnostic for RelayError {
+    fn code<'a>(&'a self) -> Option<Box<dyn fmt::Display + 'a>> {
+        match self {
+            Self::Protocol { code, .. } => Some(Box::new(code)),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RelayUntilEofOutcome {
+    Complete,
+    IdleTimeout,
+}
 
 /// HTTP/1.1 REST protocol provider.
 ///
@@ -3728,16 +3850,24 @@ where
         let to_read = usize::try_from(remaining)
             .unwrap_or(buf.len())
             .min(buf.len());
-        let n = reader.read(&mut buf[..to_read]).await.into_diagnostic()?;
-        if n == 0 {
-            return Err(miette!(
-                "Connection closed with {remaining} bytes remaining"
-            ));
-        }
+        let n = guarded_relay_read(generation_guard, async {
+            reader
+                .read(&mut buf[..to_read])
+                .await
+                .map_err(RelayError::read)
+                .map_err(miette::Report::new)
+        })
+        .await?;
         if let Some(guard) = generation_guard {
-            guard.ensure_current()?;
+            ensure_relay_generation_current(guard)?;
         }
-        writer.write_all(&buf[..n]).await.into_diagnostic()?;
+        if n == 0 {
+            return Err(RelayError::Truncated("HTTP body ended before Content-Length").into());
+        }
+        writer
+            .write_all(&buf[..n])
+            .await
+            .map_err(RelayError::write)?;
         remaining -= n as u64;
     }
     Ok(())
@@ -3771,6 +3901,7 @@ where
         let size_line = input
             .read_line(
                 reader,
+                generation_guard,
                 "Chunked body ended before chunk-size line",
                 "Chunk-size line exceeds limit",
             )
@@ -3785,6 +3916,7 @@ where
                 let trailer_line = input
                     .read_line(
                         reader,
+                        generation_guard,
                         "Chunked body ended before trailer terminator",
                         "Chunk trailer line exceeds limit",
                     )
@@ -3836,10 +3968,18 @@ where
             .await?;
         let terminator = [
             input
-                .read_byte(reader, "Chunked body ended before chunk terminator")
+                .read_byte(
+                    reader,
+                    generation_guard,
+                    "Chunked body ended before chunk terminator",
+                )
                 .await?,
             input
-                .read_byte(reader, "Chunked body ended before chunk terminator")
+                .read_byte(
+                    reader,
+                    generation_guard,
+                    "Chunked body ended before chunk terminator",
+                )
                 .await?,
         ];
         if terminator != *b"\r\n" {
@@ -3873,6 +4013,7 @@ impl<'a> ChunkedRelayInput<'a> {
     async fn read_line<R>(
         &mut self,
         reader: &mut R,
+        generation_guard: Option<&PolicyGenerationGuard>,
         eof_message: &'static str,
         limit_message: &'static str,
     ) -> Result<Vec<u8>>
@@ -3884,7 +4025,10 @@ impl<'a> ChunkedRelayInput<'a> {
             if line.len() == MAX_CHUNK_LINE_BYTES {
                 return Err(miette!(limit_message));
             }
-            line.push(self.read_byte(reader, eof_message).await?);
+            line.push(
+                self.read_byte(reader, generation_guard, eof_message)
+                    .await?,
+            );
             if line.ends_with(b"\r\n") {
                 line.truncate(line.len() - 2);
                 return Ok(line);
@@ -3921,24 +4065,33 @@ impl<'a> ChunkedRelayInput<'a> {
             }
             let start = self.pending.len();
             self.pending.resize(start + to_read, 0);
-            let read = reader
-                .read(&mut self.pending[start..])
-                .await
-                .into_diagnostic()?;
+            let read = guarded_relay_read(generation_guard, async {
+                reader
+                    .read(&mut self.pending[start..])
+                    .await
+                    .map_err(RelayError::read)
+                    .map_err(miette::Report::new)
+            })
+            .await?;
             if read == 0 {
                 self.pending.truncate(start);
-                return Err(miette!(eof_message));
+                return Err(RelayError::Truncated(eof_message).into());
             }
             self.pending.truncate(start + read);
             if let Some(guard) = generation_guard {
-                guard.ensure_current()?;
+                ensure_relay_generation_current(guard)?;
             }
             remaining -= read;
         }
         Ok(())
     }
 
-    async fn read_byte<R>(&mut self, reader: &mut R, eof_message: &'static str) -> Result<u8>
+    async fn read_byte<R>(
+        &mut self,
+        reader: &mut R,
+        generation_guard: Option<&PolicyGenerationGuard>,
+        eof_message: &'static str,
+    ) -> Result<u8>
     where
         R: AsyncRead + Unpin,
     {
@@ -3948,13 +4101,19 @@ impl<'a> ChunkedRelayInput<'a> {
             self.pending.push(byte);
             return Ok(byte);
         }
-        let byte = match reader.read_u8().await {
-            Ok(byte) => byte,
-            Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => {
-                return Err(miette!(eof_message));
+        let byte = guarded_relay_read(generation_guard, async {
+            match reader.read_u8().await {
+                Ok(byte) => Ok(byte),
+                Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => {
+                    Err(RelayError::Truncated(eof_message).into())
+                }
+                Err(error) => Err(RelayError::read(error).into()),
             }
-            Err(error) => return Err(error).into_diagnostic(),
-        };
+        })
+        .await?;
+        if let Some(guard) = generation_guard {
+            ensure_relay_generation_current(guard)?;
+        }
         self.pending.push(byte);
         Ok(byte)
     }
@@ -3971,9 +4130,12 @@ impl<'a> ChunkedRelayInput<'a> {
             return Ok(());
         }
         if let Some(guard) = generation_guard {
-            guard.ensure_current()?;
+            ensure_relay_generation_current(guard)?;
         }
-        writer.write_all(&self.pending).await.into_diagnostic()?;
+        writer
+            .write_all(&self.pending)
+            .await
+            .map_err(RelayError::write)?;
         self.pending.clear();
         Ok(())
     }
@@ -4177,26 +4339,48 @@ fn is_bodiless_response(request_method: &str, status_code: u16) -> bool {
 /// no Transfer-Encoding) where the body is delimited by connection close.
 /// An idle timeout prevents blocking when servers keep the TCP connection
 /// alive longer than expected (e.g. CDN keep-alive timers).
-async fn relay_until_eof<R, W>(reader: &mut R, writer: &mut W) -> Result<()>
+async fn relay_until_eof<R, W>(
+    reader: &mut R,
+    writer: &mut W,
+    generation_guard: Option<&PolicyGenerationGuard>,
+) -> Result<RelayUntilEofOutcome>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
     let mut buf = [0u8; RELAY_BUF_SIZE];
     loop {
-        match tokio::time::timeout(RELAY_EOF_IDLE_TIMEOUT, reader.read(&mut buf)).await {
-            Ok(Ok(0)) => return Ok(()),
+        match tokio::time::timeout(
+            RELAY_EOF_IDLE_TIMEOUT,
+            guarded_relay_read(generation_guard, async {
+                reader
+                    .read(&mut buf)
+                    .await
+                    .map_err(|error| RelayError::read(error).into())
+            }),
+        )
+        .await
+        {
             Ok(Ok(n)) => {
-                writer.write_all(&buf[..n]).await.into_diagnostic()?;
-                writer.flush().await.into_diagnostic()?;
+                if let Some(guard) = generation_guard {
+                    ensure_relay_generation_current(guard)?;
+                }
+                if n == 0 {
+                    return Ok(RelayUntilEofOutcome::Complete);
+                }
+                writer
+                    .write_all(&buf[..n])
+                    .await
+                    .map_err(RelayError::write)?;
+                writer.flush().await.map_err(RelayError::flush)?;
             }
-            Ok(Err(e)) => return Err(miette::miette!("{e}")),
+            Ok(Err(error)) => return Err(error),
             Err(_) => {
                 debug!(
                     "relay_until_eof idle timeout after {:?}",
                     RELAY_EOF_IDLE_TIMEOUT
                 );
-                return Ok(());
+                return Ok(RelayUntilEofOutcome::IdleTimeout);
             }
         }
     }
@@ -4206,19 +4390,35 @@ where
 ///
 /// Used for server-sent events, where long idle gaps are part of the protocol
 /// and do not mean the response body is complete.
-async fn relay_until_eof_without_idle_timeout<R, W>(reader: &mut R, writer: &mut W) -> Result<()>
+async fn relay_until_eof_without_idle_timeout<R, W>(
+    reader: &mut R,
+    writer: &mut W,
+    generation_guard: Option<&PolicyGenerationGuard>,
+) -> Result<()>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
     let mut buf = [0u8; RELAY_BUF_SIZE];
     loop {
-        let n = reader.read(&mut buf).await.into_diagnostic()?;
+        let n = guarded_relay_read(generation_guard, async {
+            reader
+                .read(&mut buf)
+                .await
+                .map_err(|error| RelayError::read(error).into())
+        })
+        .await?;
+        if let Some(guard) = generation_guard {
+            ensure_relay_generation_current(guard)?;
+        }
         if n == 0 {
             return Ok(());
         }
-        writer.write_all(&buf[..n]).await.into_diagnostic()?;
-        writer.flush().await.into_diagnostic()?;
+        writer
+            .write_all(&buf[..n])
+            .await
+            .map_err(RelayError::write)?;
+        writer.flush().await.map_err(RelayError::flush)?;
     }
 }
 
@@ -4298,6 +4498,40 @@ mod tests {
     const VALID_WS_KEY: &str = "dGhlIHNhbXBsZSBub25jZQ==";
     const VALID_WS_ACCEPT: &str = "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=";
     const TEXT_OPCODE: u8 = 0x1;
+
+    #[tokio::test]
+    async fn guarded_relay_read_ignores_closed_generation_channel_while_current() {
+        use tokio::io::AsyncWriteExt as _;
+
+        let engine =
+            OpaEngine::from_strings(TEST_POLICY, "network_policies: {}\n").expect("test policy");
+        let guard = engine
+            .generation_guard(engine.current_generation())
+            .expect("generation guard");
+        drop(engine);
+        assert!(!guard.is_stale());
+
+        let (mut reader, mut writer) = tokio::io::duplex(1);
+        let send = tokio::spawn(async move {
+            tokio::task::yield_now().await;
+            writer.write_all(b"x").await.expect("seed guarded read");
+        });
+        let mut byte = [0u8; 1];
+
+        let read = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            guarded_relay_read(Some(&guard), async {
+                reader.read(&mut byte).await.into_diagnostic()
+            }),
+        )
+        .await
+        .expect("closed generation sender must not cancel a current read")
+        .expect("guarded read");
+        send.await.expect("seed task");
+
+        assert_eq!(read, 1);
+        assert_eq!(byte, *b"x");
+    }
 
     #[derive(Debug, Clone, Copy)]
     enum ResponseRelayScript {
@@ -9234,7 +9468,7 @@ mod tests {
     async fn relay_rejects_unsolicited_101_without_client_upgrade_header() {
         // Client sends a normal GET without Upgrade headers.
         // Upstream responds with 101 (non-compliant). The relay should
-        // reject the upgrade and return Consumed instead.
+        // reject the upgrade as a protocol failure.
         let (mut proxy_to_upstream, mut upstream_side) = tokio::io::duplex(8192);
         let (mut _app_side, mut proxy_to_client) = tokio::io::duplex(8192);
 
@@ -9282,10 +9516,12 @@ mod tests {
         .await
         .expect("relay must not deadlock");
 
-        let outcome = result.expect("relay should succeed");
+        let error = result.expect_err("unsolicited 101 should be rejected");
         assert!(
-            matches!(outcome, RelayOutcome::Consumed),
-            "unsolicited 101 should be rejected as Consumed, got {outcome:?}"
+            error
+                .to_string()
+                .contains("without a client upgrade request"),
+            "{error}"
         );
 
         upstream_task.await.expect("upstream task should complete");
