@@ -985,6 +985,7 @@ where
         &preflight.invocations,
         preflight.headers != original_headers,
         preflight.session_capacity_exhausted,
+        false,
     );
     debug!(
         configured_stage_count = middleware.chain.len(),
@@ -1159,6 +1160,7 @@ where
             &finish.invocations,
             finish.strip_stale_integrity_headers,
             false,
+            finish.diagnostics_truncated,
         );
         let mut headers = preflight.headers;
         emit_http_response_middleware_invocations(
@@ -1171,6 +1173,12 @@ where
         for event in crate::l7::middleware::middleware_finding_events(&finish.findings) {
             emit_ocsf(response_correlation, event);
         }
+        emit_http_response_diagnostic_truncation(
+            middleware.policy_name,
+            &middleware.target,
+            finish.diagnostics_truncated,
+            response_correlation,
+        );
         if finish.strip_stale_integrity_headers {
             strip_response_integrity_headers(&mut headers);
         }
@@ -1467,6 +1475,7 @@ where
         &finish.invocations,
         finish.strip_stale_integrity_headers || finish.trailers != input_trailers,
         false,
+        finish.diagnostics_truncated,
     );
     emit_http_response_middleware_invocations(
         middleware.policy_name,
@@ -1478,6 +1487,12 @@ where
     for event in crate::l7::middleware::middleware_finding_events(&finish.findings) {
         emit_ocsf(response_correlation, event);
     }
+    emit_http_response_diagnostic_truncation(
+        middleware.policy_name,
+        &middleware.target,
+        finish.diagnostics_truncated,
+        response_correlation,
+    );
 
     if whole_body && !committed {
         let mut headers = preflight.headers;
@@ -1677,13 +1692,17 @@ fn observe_response_middleware(
     invocations: &[openshell_supervisor_middleware::HttpResponseInvocation],
     mutated: bool,
     admission_exhausted: bool,
+    diagnostics_truncated: bool,
 ) {
     let Some(correlation) = correlation else {
         return;
     };
     correlation.observe_middleware(
         MiddlewarePhase::Response,
-        response_middleware_observation(invocations, mutated, admission_exhausted),
+        MiddlewareObservation {
+            diagnostics_truncated,
+            ..response_middleware_observation(invocations, mutated, admission_exhausted)
+        },
     );
 }
 
@@ -1719,7 +1738,13 @@ fn observe_response_diagnostics(
     correlation: Option<&RequestCorrelation>,
     diagnostics: &openshell_supervisor_middleware::HttpResponseDiagnostics,
 ) {
-    observe_response_middleware(correlation, &diagnostics.invocations, false, false);
+    observe_response_middleware(
+        correlation,
+        &diagnostics.invocations,
+        false,
+        false,
+        diagnostics.diagnostics_truncated,
+    );
 }
 
 fn observe_response_admission_exhaustion(
@@ -1949,6 +1974,47 @@ fn emit_http_response_diagnostics(
     for event in crate::l7::middleware::middleware_finding_events(&diagnostics.findings) {
         emit_ocsf(correlation, event);
     }
+    emit_http_response_diagnostic_truncation(
+        policy_name,
+        target,
+        diagnostics.diagnostics_truncated,
+        correlation,
+    );
+}
+
+fn emit_http_response_diagnostic_truncation(
+    policy_name: &str,
+    target: &HttpRequestTarget,
+    diagnostics_truncated: bool,
+    correlation: Option<&RequestCorrelation>,
+) {
+    if !diagnostics_truncated {
+        return;
+    }
+    emit_ocsf(
+        correlation,
+        http_response_diagnostic_truncation_event(policy_name, target),
+    );
+}
+
+fn http_response_diagnostic_truncation_event(
+    policy_name: &str,
+    target: &HttpRequestTarget,
+) -> openshell_ocsf::OcsfEvent {
+    openshell_ocsf::DetectionFindingBuilder::new(ocsf_ctx())
+        .severity(openshell_ocsf::SeverityId::Low)
+        .finding_info(openshell_ocsf::FindingInfo::new(
+            "openshell.middleware.http_response_diagnostics_truncated",
+            "HTTP response middleware diagnostics truncated",
+        ))
+        .evidence_pairs(&[
+            ("policy", policy_name),
+            ("host", target.host.as_str()),
+            ("phase", "pre_return"),
+        ])
+        .unmapped("phase", "pre_return")
+        .message("HTTP response middleware diagnostic evidence exceeded the session budget")
+        .build()
 }
 
 pub(super) fn http_response_middleware_invocation_events(
@@ -3209,8 +3275,9 @@ mod tests {
     use super::{
         DEFAULT_HTTP_RESPONSE_WHOLE_BODY_TIMEOUT, HttpResponseMiddlewareRelay,
         RelayResponseOptions, ResponseFraming, WebSocketResponseValidation,
-        parse_connection_keep_alive, parse_response_head_for_middleware, relay_response,
-        response_is_http_10, response_middleware_failure_denial, response_middleware_observation,
+        http_response_diagnostic_truncation_event, parse_connection_keep_alive,
+        parse_response_head_for_middleware, relay_response, response_is_http_10,
+        response_middleware_failure_denial, response_middleware_observation,
         serialize_response_head, validate_http_response_header_block,
     };
     use crate::l7::correlation::MiddlewareObservation;
@@ -6437,6 +6504,33 @@ mod tests {
                 ..Default::default()
             }
         );
+    }
+
+    #[test]
+    fn response_diagnostic_truncation_event_is_bounded() {
+        let event = http_response_diagnostic_truncation_event(
+            "test-policy",
+            &HttpRequestTarget {
+                scheme: "https".into(),
+                host: "example.test".into(),
+                port: 443,
+                method: "GET".into(),
+                path: "/private".into(),
+                query: "secret=value".into(),
+            },
+        )
+        .to_json()
+        .expect("serialize truncation event");
+
+        assert_eq!(event["severity"], "Low");
+        assert_eq!(
+            event["finding_info"]["uid"],
+            "openshell.middleware.http_response_diagnostics_truncated"
+        );
+        assert_eq!(event["unmapped"]["phase"], "pre_return");
+        let encoded = serde_json::to_string(&event).expect("encode truncation event");
+        assert!(!encoded.contains("/private"));
+        assert!(!encoded.contains("secret=value"));
     }
 
     #[tokio::test]

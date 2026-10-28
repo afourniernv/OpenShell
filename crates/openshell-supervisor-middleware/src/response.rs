@@ -13,7 +13,7 @@ use validation::{
     validate_body_result, validate_trailers_result,
 };
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
 use futures::StreamExt as _;
@@ -31,9 +31,10 @@ use openshell_core::proto::{
 };
 
 use super::{
-    ChainEntry, ChainRunner, DescribedChainEntry, MAX_MIDDLEWARE_CHAIN_TIMEOUT,
-    MAX_MIDDLEWARE_CONTEXT_BYTES, MAX_MIDDLEWARE_FINDING_BYTES, MAX_MIDDLEWARE_FINDINGS_PER_STAGE,
-    MAX_MIDDLEWARE_HEADER_BYTES, MAX_MIDDLEWARE_HEADER_MUTATION_WIRE_BYTES, MAX_MIDDLEWARE_HEADERS,
+    ChainEntry, ChainRunner, DescribedChainEntry, MAX_MIDDLEWARE_CHAIN_FINDINGS,
+    MAX_MIDDLEWARE_CHAIN_STAGES, MAX_MIDDLEWARE_CHAIN_TIMEOUT, MAX_MIDDLEWARE_CONTEXT_BYTES,
+    MAX_MIDDLEWARE_FINDING_BYTES, MAX_MIDDLEWARE_FINDINGS_PER_STAGE, MAX_MIDDLEWARE_HEADER_BYTES,
+    MAX_MIDDLEWARE_HEADER_MUTATION_WIRE_BYTES, MAX_MIDDLEWARE_HEADERS,
     MAX_MIDDLEWARE_METADATA_BYTES, MAX_MIDDLEWARE_METADATA_ENTRIES, MAX_MIDDLEWARE_REASON_BYTES,
     MAX_MIDDLEWARE_REASON_CODE_BYTES, MAX_MIDDLEWARE_TARGET_BYTES, MiddlewareDiagnosticPolicy,
     MiddlewareSessionAdmission, MiddlewareSessionPermit, NamespacedFinding, OnError, headers,
@@ -166,6 +167,7 @@ pub struct HttpResponseFinish {
     pub findings: Vec<NamespacedFinding>,
     pub metadata: BTreeMap<String, BTreeMap<String, String>>,
     pub invocations: Vec<HttpResponseInvocation>,
+    pub diagnostics_truncated: bool,
 }
 
 #[derive(Debug, Default)]
@@ -173,6 +175,104 @@ pub struct HttpResponseDiagnostics {
     pub findings: Vec<NamespacedFinding>,
     pub metadata: BTreeMap<String, BTreeMap<String, String>>,
     pub invocations: Vec<HttpResponseInvocation>,
+    pub diagnostics_truncated: bool,
+}
+
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct FindingKey {
+    middleware: String,
+    r#type: String,
+    label: String,
+    count: u32,
+    confidence: String,
+    severity: String,
+}
+
+#[derive(Debug, Default)]
+struct HttpResponseDiagnosticBudget {
+    findings: BTreeSet<FindingKey>,
+    finding_count: usize,
+    routine_invocations: usize,
+    terminal_invocations: usize,
+    truncation_pending: bool,
+    truncation_reported: bool,
+}
+
+impl HttpResponseDiagnosticBudget {
+    fn from_preflight(findings: &[NamespacedFinding]) -> Self {
+        let mut budget = Self {
+            finding_count: findings.len(),
+            ..Self::default()
+        };
+        budget
+            .findings
+            .extend(findings.iter().map(FindingKey::from));
+        budget
+    }
+
+    fn retain_finding(&mut self, finding: &NamespacedFinding) -> bool {
+        let key = FindingKey::from(finding);
+        if self.findings.contains(&key) {
+            return false;
+        }
+        if self.finding_count >= MAX_MIDDLEWARE_CHAIN_FINDINGS {
+            self.mark_truncated();
+            return false;
+        }
+        self.findings.insert(key);
+        self.finding_count += 1;
+        true
+    }
+
+    fn retain_invocation(&mut self, invocation: &HttpResponseInvocation) -> bool {
+        let routine = matches!(
+            invocation.outcome,
+            HttpResponseInvocationOutcome::PassThrough | HttpResponseInvocationOutcome::Transform
+        );
+        let (count, limit) = if routine {
+            (self.routine_invocations, MAX_MIDDLEWARE_CHAIN_FINDINGS)
+        } else {
+            (self.terminal_invocations, MAX_MIDDLEWARE_CHAIN_STAGES)
+        };
+        if count >= limit {
+            self.mark_truncated();
+            return false;
+        }
+        if routine {
+            self.routine_invocations += 1;
+        } else {
+            self.terminal_invocations += 1;
+        }
+        true
+    }
+
+    fn mark_truncated(&mut self) {
+        if !self.truncation_reported {
+            self.truncation_pending = true;
+        }
+    }
+
+    fn take_truncation_signal(&mut self) -> bool {
+        if !self.truncation_pending || self.truncation_reported {
+            return false;
+        }
+        self.truncation_pending = false;
+        self.truncation_reported = true;
+        true
+    }
+}
+
+impl From<&NamespacedFinding> for FindingKey {
+    fn from(finding: &NamespacedFinding) -> Self {
+        Self {
+            middleware: finding.middleware.clone(),
+            r#type: finding.finding.r#type.clone(),
+            label: finding.finding.label.clone(),
+            count: finding.finding.count,
+            confidence: finding.finding.confidence.clone(),
+            severity: finding.finding.severity.clone(),
+        }
+    }
 }
 
 struct HttpResponseStageTransport {
@@ -242,6 +342,7 @@ pub struct HttpResponseSession {
     findings: Vec<NamespacedFinding>,
     metadata: BTreeMap<String, BTreeMap<String, String>>,
     invocations: Vec<HttpResponseInvocation>,
+    diagnostic_budget: HttpResponseDiagnosticBudget,
     session_admission: Option<MiddlewareSessionPermit>,
     body_transformed: bool,
     retained_body_bytes: usize,
@@ -257,6 +358,13 @@ impl HttpResponseSession {
             findings: std::mem::take(&mut self.findings),
             metadata: std::mem::take(&mut self.metadata),
             invocations: std::mem::take(&mut self.invocations),
+            diagnostics_truncated: self.diagnostic_budget.take_truncation_signal(),
+        }
+    }
+
+    fn record_invocation(&mut self, invocation: HttpResponseInvocation) {
+        if self.diagnostic_budget.retain_invocation(&invocation) {
+            self.invocations.push(invocation);
         }
     }
 
@@ -448,6 +556,7 @@ impl HttpResponseSession {
         };
         self.end_all(MiddlewareSessionEndReason::Normal).await;
         self.session_admission.take();
+        let diagnostics_truncated = self.diagnostic_budget.take_truncation_signal();
         Ok(HttpResponseFinish {
             body_units: released,
             trailers,
@@ -455,6 +564,7 @@ impl HttpResponseSession {
             findings: self.findings,
             metadata: self.metadata,
             invocations: self.invocations,
+            diagnostics_truncated,
         })
     }
 
@@ -648,27 +758,28 @@ impl HttpResponseSession {
             }
             self.retained_body_bytes = retained;
         }
-        let stage = &mut self.stages[index];
-        collect_diagnostics(
-            stage,
+        collect_session_diagnostics(
+            &self.stages[index],
             decision.findings,
             decision.metadata,
             &mut self.findings,
             &mut self.metadata,
+            &mut self.diagnostic_budget,
         );
         let reason_code = (!decision.reason_code.is_empty()).then_some(decision.reason_code);
         match decision.action {
             BodyAction::PassThrough => {
                 let output_size = original.len();
-                self.invocations.push(body_invocation_with_reason(
-                    stage,
+                let invocation = body_invocation_with_reason(
+                    &self.stages[index],
                     HttpResponseInvocationOutcome::PassThrough,
                     sequence,
                     input_size,
                     output_size,
                     false,
                     reason_code,
-                ));
+                );
+                self.record_invocation(invocation);
                 Ok((!original.is_empty())
                     .then_some(original)
                     .into_iter()
@@ -676,15 +787,16 @@ impl HttpResponseSession {
             }
             BodyAction::Transform(replacement) => {
                 self.body_transformed = true;
-                self.invocations.push(body_invocation_with_reason(
-                    stage,
+                let invocation = body_invocation_with_reason(
+                    &self.stages[index],
                     HttpResponseInvocationOutcome::Transform,
                     sequence,
                     input_size,
                     replacement.len(),
                     true,
                     reason_code,
-                ));
+                );
+                self.record_invocation(invocation);
                 Ok((!replacement.is_empty())
                     .then_some(replacement)
                     .into_iter()
@@ -699,24 +811,30 @@ impl HttpResponseSession {
                         replacement
                     }
                 };
-                stage.mode = StageMode::HeadersOnly;
-                self.invocations.push(body_invocation_with_reason(
-                    stage,
-                    HttpResponseInvocationOutcome::SkipRemaining,
-                    sequence,
-                    input_size,
-                    output.len(),
-                    transformed,
-                    reason_code,
-                ));
-                stage.end(MiddlewareSessionEndReason::Normal).await;
+                let invocation = {
+                    let stage = &mut self.stages[index];
+                    stage.mode = StageMode::HeadersOnly;
+                    let invocation = body_invocation_with_reason(
+                        stage,
+                        HttpResponseInvocationOutcome::SkipRemaining,
+                        sequence,
+                        input_size,
+                        output.len(),
+                        transformed,
+                        reason_code,
+                    );
+                    stage.end(MiddlewareSessionEndReason::Normal).await;
+                    invocation
+                };
+                self.record_invocation(invocation);
                 self.release_admission_if_idle();
                 Ok((!output.is_empty()).then_some(output).into_iter().collect())
             }
             BodyAction::BlockDelivery => {
+                let stage = &self.stages[index];
                 let config_name = stage.entry.entry.name.clone();
                 let denial_reason = middleware_denial_reason(&config_name, reason_code.as_deref());
-                self.invocations.push(body_invocation_with_reason(
+                let invocation = body_invocation_with_reason(
                     stage,
                     HttpResponseInvocationOutcome::BlockDelivery,
                     sequence,
@@ -724,7 +842,8 @@ impl HttpResponseSession {
                     0,
                     false,
                     reason_code.clone(),
-                ));
+                );
+                self.record_invocation(invocation);
                 self.end_all(MiddlewareSessionEndReason::MiddlewareDenial)
                     .await;
                 Err(HttpResponseMiddlewareFailure {
@@ -747,16 +866,15 @@ impl HttpResponseSession {
         sequence: Option<u64>,
         original: Vec<u8>,
     ) -> Result<Vec<Vec<u8>>, HttpResponseMiddlewareFailure> {
-        let stage = &mut self.stages[index];
-        let fail_open = stage.entry.on_error() == OnError::FailOpen;
+        let fail_open = self.stages[index].entry.on_error() == OnError::FailOpen;
         let outcome = if fail_open {
             HttpResponseInvocationOutcome::FailOpen
         } else {
             HttpResponseInvocationOutcome::FailClosed
         };
-        self.invocations.push(HttpResponseInvocation {
-            config_name: stage.entry.entry.name.clone(),
-            implementation: stage.entry.entry.implementation.clone(),
+        let invocation = HttpResponseInvocation {
+            config_name: self.stages[index].entry.entry.name.clone(),
+            implementation: self.stages[index].entry.entry.implementation.clone(),
             outcome,
             sequence,
             input_size: original.len(),
@@ -766,10 +884,11 @@ impl HttpResponseSession {
             stage_disabled: true,
             reason_code: None,
             failure_category: Some(response_failure_category(reason).into()),
-        });
-        stage
+        };
+        self.stages[index]
             .end(MiddlewareSessionEndReason::MiddlewareFailure)
             .await;
+        self.record_invocation(invocation);
         self.release_admission_if_idle();
         if fail_open {
             if original.is_empty() {
@@ -857,17 +976,17 @@ impl HttpResponseSession {
             trailers = decision.headers;
             let output_size = encoded_header_bytes(&trailers);
             let reason_code = (!decision.reason_code.is_empty()).then_some(decision.reason_code);
-            let stage = &mut self.stages[index];
-            collect_diagnostics(
-                stage,
+            collect_session_diagnostics(
+                &self.stages[index],
                 decision.findings,
                 decision.metadata,
                 &mut self.findings,
                 &mut self.metadata,
+                &mut self.diagnostic_budget,
             );
-            self.invocations.push(HttpResponseInvocation {
-                config_name: stage.entry.entry.name.clone(),
-                implementation: stage.entry.entry.implementation.clone(),
+            let invocation = HttpResponseInvocation {
+                config_name: self.stages[index].entry.entry.name.clone(),
+                implementation: self.stages[index].entry.entry.implementation.clone(),
                 outcome: HttpResponseInvocationOutcome::Trailers,
                 sequence: None,
                 input_size,
@@ -877,7 +996,8 @@ impl HttpResponseSession {
                 stage_disabled: false,
                 reason_code,
                 failure_category: None,
-            });
+            };
+            self.record_invocation(invocation);
         }
         Ok(trailers)
     }
@@ -888,11 +1008,10 @@ impl HttpResponseSession {
         reason: &str,
         original: Vec<HttpHeader>,
     ) -> Result<Vec<HttpHeader>, HttpResponseMiddlewareFailure> {
-        let stage = &mut self.stages[index];
-        let fail_open = stage.entry.on_error() == OnError::FailOpen;
-        self.invocations.push(HttpResponseInvocation {
-            config_name: stage.entry.entry.name.clone(),
-            implementation: stage.entry.entry.implementation.clone(),
+        let fail_open = self.stages[index].entry.on_error() == OnError::FailOpen;
+        let invocation = HttpResponseInvocation {
+            config_name: self.stages[index].entry.entry.name.clone(),
+            implementation: self.stages[index].entry.entry.implementation.clone(),
             outcome: if fail_open {
                 HttpResponseInvocationOutcome::FailOpen
             } else {
@@ -906,10 +1025,11 @@ impl HttpResponseSession {
             stage_disabled: true,
             reason_code: None,
             failure_category: Some(response_failure_category(reason).into()),
-        });
-        stage
+        };
+        self.stages[index]
             .end(MiddlewareSessionEndReason::MiddlewareFailure)
             .await;
+        self.record_invocation(invocation);
         self.release_admission_if_idle();
         if fail_open {
             Ok(original)
@@ -1042,6 +1162,29 @@ fn collect_diagnostics(
             metadata.into_iter().collect(),
         );
     }
+}
+
+fn collect_session_diagnostics(
+    stage: &HttpResponseStage,
+    findings: Vec<Finding>,
+    metadata: std::collections::HashMap<String, String>,
+    all_findings: &mut Vec<NamespacedFinding>,
+    all_metadata: &mut BTreeMap<String, BTreeMap<String, String>>,
+    budget: &mut HttpResponseDiagnosticBudget,
+) {
+    let mut current_findings = Vec::new();
+    collect_diagnostics(
+        stage,
+        findings,
+        metadata,
+        &mut current_findings,
+        all_metadata,
+    );
+    all_findings.extend(
+        current_findings
+            .into_iter()
+            .filter(|finding| budget.retain_finding(finding)),
+    );
 }
 
 fn collect_preflight_diagnostics(
@@ -1269,10 +1412,21 @@ mod tests {
         InvalidSkipReason,
         TrailerMutation,
         InvalidTrailerMutation,
+        DiagnosticBudget,
     }
 
     struct ResponseService {
         script: Script,
+    }
+
+    fn diagnostic_finding(index: usize) -> Finding {
+        Finding {
+            r#type: format!("diagnostic-{index}"),
+            label: "bounded diagnostic".into(),
+            count: 1,
+            confidence: "high".into(),
+            severity: "medium".into(),
+        }
     }
 
     struct PreflightLifecycleService {
@@ -1530,7 +1684,8 @@ mod tests {
                                     | Script::DeleteBody
                                     | Script::SkipBody
                                     | Script::TrailerMutation
-                                    | Script::InvalidTrailerMutation => {
+                                    | Script::InvalidTrailerMutation
+                                    | Script::DiagnosticBudget => {
                                         (HttpResponseBodyMode::StreamBytes, Vec::new())
                                     }
                                     Script::WholeBody => {
@@ -1552,6 +1707,13 @@ mod tests {
                                                         },
                                                     ),
                                                 ),
+                                                findings: matches!(
+                                                    selected_script,
+                                                    Script::DiagnosticBudget
+                                                )
+                                                .then(|| diagnostic_finding(0))
+                                                .into_iter()
+                                                .collect(),
                                                 ..Default::default()
                                             },
                                         ),
@@ -1567,6 +1729,11 @@ mod tests {
                             else {
                                 break;
                             };
+                            let diagnostic_sequence = usize::try_from(body.sequence)
+                                .expect("test sequence fits in usize");
+                            let diagnostic_budget_exhausted =
+                                matches!(selected_script, Script::DiagnosticBudget)
+                                    && diagnostic_sequence > MAX_MIDDLEWARE_CHAIN_FINDINGS;
                             let replacement = match selected_script {
                                 Script::Expansion => vec![b'x'; 128 * 1024],
                                 Script::DeleteBody => Vec::new(),
@@ -1575,7 +1742,8 @@ mod tests {
                                 | Script::InvalidSequence
                                 | Script::LargeStream
                                 | Script::TrailerMutation
-                                | Script::InvalidTrailerMutation => data.to_ascii_uppercase(),
+                                | Script::InvalidTrailerMutation
+                                | Script::DiagnosticBudget => data.to_ascii_uppercase(),
                                 Script::WholeBody => [b"whole:".as_slice(), &data].concat(),
                                 Script::HeadersOnly
                                 | Script::Configured
@@ -1598,6 +1766,14 @@ mod tests {
                                         ),
                                     },
                                 )
+                            } else if diagnostic_budget_exhausted {
+                                http_response_body_result::Action::BlockDelivery(
+                                    openshell_core::proto::HttpResponseBlockDelivery {},
+                                )
+                            } else if matches!(selected_script, Script::DiagnosticBudget) {
+                                http_response_body_result::Action::PassThrough(
+                                    HttpResponseBodyPassThrough {},
+                                )
                             } else {
                                 http_response_body_result::Action::Transform(transform)
                             };
@@ -1613,6 +1789,18 @@ mod tests {
                                             body.sequence
                                         },
                                         action: Some(action),
+                                        findings: matches!(
+                                            selected_script,
+                                            Script::DiagnosticBudget
+                                        )
+                                        .then(|| diagnostic_finding(diagnostic_sequence - 1))
+                                        .into_iter()
+                                        .collect(),
+                                        reason_code: if diagnostic_budget_exhausted {
+                                            "diagnostic_budget_block".into()
+                                        } else {
+                                            String::new()
+                                        },
                                         ..Default::default()
                                     },
                                 )),
@@ -2770,5 +2958,137 @@ mod tests {
             .expect("bounded server shutdown")
             .expect("join response middleware server")
             .expect("serve response middleware");
+    }
+
+    fn budget_finding(index: usize) -> NamespacedFinding {
+        NamespacedFinding {
+            middleware: "response-filter".into(),
+            finding: Finding {
+                r#type: format!("finding-{index}"),
+                label: "bounded finding".into(),
+                count: 1,
+                confidence: "high".into(),
+                severity: "medium".into(),
+            },
+        }
+    }
+
+    fn budget_invocation(outcome: HttpResponseInvocationOutcome) -> HttpResponseInvocation {
+        HttpResponseInvocation {
+            config_name: "response-filter".into(),
+            implementation: "test/response-filter".into(),
+            outcome,
+            sequence: Some(1),
+            input_size: 1,
+            output_size: Some(1),
+            transformed: false,
+            failed: false,
+            stage_disabled: false,
+            reason_code: None,
+            failure_category: None,
+        }
+    }
+
+    #[test]
+    fn response_diagnostic_budget_deduplicates_findings_and_signals_once() {
+        let mut budget = HttpResponseDiagnosticBudget::default();
+        let finding = budget_finding(0);
+
+        assert!(budget.retain_finding(&finding));
+        assert!(!budget.retain_finding(&finding));
+        assert!(!budget.take_truncation_signal());
+        assert!(budget.retain_finding(&budget_finding(1)));
+        assert_eq!(budget.finding_count, 2);
+    }
+
+    #[test]
+    fn response_diagnostic_budget_includes_preflight_findings() {
+        let preflight = (0..MAX_MIDDLEWARE_CHAIN_FINDINGS)
+            .map(budget_finding)
+            .collect::<Vec<_>>();
+        let mut budget = HttpResponseDiagnosticBudget::from_preflight(&preflight);
+
+        assert!(!budget.retain_finding(&preflight[0]));
+        assert!(!budget.take_truncation_signal());
+        assert!(!budget.retain_finding(&budget_finding(MAX_MIDDLEWARE_CHAIN_FINDINGS)));
+        assert!(budget.take_truncation_signal());
+        assert!(!budget.take_truncation_signal());
+    }
+
+    #[test]
+    fn response_diagnostic_budget_caps_unique_findings() {
+        let mut budget = HttpResponseDiagnosticBudget::default();
+        for index in 0..MAX_MIDDLEWARE_CHAIN_FINDINGS {
+            assert!(budget.retain_finding(&budget_finding(index)));
+        }
+
+        assert!(!budget.retain_finding(&budget_finding(MAX_MIDDLEWARE_CHAIN_FINDINGS)));
+        assert_eq!(budget.finding_count, MAX_MIDDLEWARE_CHAIN_FINDINGS);
+        assert!(budget.take_truncation_signal());
+    }
+
+    #[test]
+    fn response_diagnostic_budget_preserves_terminal_invocations() {
+        let mut budget = HttpResponseDiagnosticBudget::default();
+        let routine = budget_invocation(HttpResponseInvocationOutcome::PassThrough);
+        for _ in 0..MAX_MIDDLEWARE_CHAIN_FINDINGS {
+            assert!(budget.retain_invocation(&routine));
+        }
+        assert!(!budget.retain_invocation(&routine));
+
+        let terminal = budget_invocation(HttpResponseInvocationOutcome::BlockDelivery);
+        for _ in 0..MAX_MIDDLEWARE_CHAIN_STAGES {
+            assert!(budget.retain_invocation(&terminal));
+        }
+        assert!(!budget.retain_invocation(&terminal));
+        assert!(budget.take_truncation_signal());
+    }
+
+    #[tokio::test]
+    async fn response_session_bounds_diagnostics_and_preserves_late_block() {
+        let runner = ChainRunner::new(Arc::new(ResponseService {
+            script: Script::DiagnosticBudget,
+        }));
+        let mut preflight = runner
+            .preflight_http_response(&[entry(OnError::FailClosed)], input(200))
+            .await
+            .expect("preflight response middleware");
+        assert_eq!(preflight.findings.len(), 1);
+        let mut emitted_findings = preflight.findings.len();
+        let mut emitted_routine_invocations = 0;
+        let mut truncation_signals = 0;
+        let mut session = preflight.session.take().expect("streaming session");
+
+        for sequence in 1..=MAX_MIDDLEWARE_CHAIN_FINDINGS + 1 {
+            match session.push_body(vec![b'x']).await {
+                Ok(body) => {
+                    assert_eq!(body, vec![vec![b'x']]);
+                    let diagnostics = session.take_diagnostics();
+                    emitted_findings += diagnostics.findings.len();
+                    emitted_routine_invocations += diagnostics.invocations.len();
+                    truncation_signals += usize::from(diagnostics.diagnostics_truncated);
+                }
+                Err(failure) => {
+                    assert_eq!(sequence, MAX_MIDDLEWARE_CHAIN_FINDINGS + 1);
+                    assert!(failure.denial.is_some());
+                    let diagnostics = session.take_diagnostics();
+                    emitted_findings += diagnostics.findings.len();
+                    truncation_signals += usize::from(diagnostics.diagnostics_truncated);
+                    assert_eq!(diagnostics.invocations.len(), 1);
+                    assert_eq!(
+                        diagnostics.invocations[0].outcome,
+                        HttpResponseInvocationOutcome::BlockDelivery
+                    );
+                }
+            }
+        }
+
+        assert_eq!(emitted_findings, MAX_MIDDLEWARE_CHAIN_FINDINGS);
+        assert_eq!(emitted_routine_invocations, MAX_MIDDLEWARE_CHAIN_FINDINGS);
+        assert_eq!(truncation_signals, 1);
+        assert!(!session.take_diagnostics().diagnostics_truncated);
+        session
+            .end(MiddlewareSessionEndReason::MiddlewareDenial)
+            .await;
     }
 }

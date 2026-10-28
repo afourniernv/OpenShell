@@ -403,6 +403,7 @@ impl ChainRunner {
         let defer_output_until_finish = stages
             .iter()
             .any(|stage| stage.is_active() && stage.mode == StageMode::WholeBody);
+        let diagnostic_budget = HttpResponseDiagnosticBudget::from_preflight(&findings);
         Ok(HttpResponsePreflightOutcome {
             allowed: true,
             reason: String::new(),
@@ -414,6 +415,7 @@ impl ChainRunner {
                 findings: Vec::new(),
                 metadata: BTreeMap::new(),
                 invocations: Vec::new(),
+                diagnostic_budget,
                 session_admission: Some(session_admission),
                 body_transformed: false,
                 retained_body_bytes: 0,

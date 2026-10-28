@@ -398,6 +398,7 @@ pub struct MiddlewareObservation {
     pub fail_open: bool,
     pub fail_closed: bool,
     pub admission_exhausted: bool,
+    pub diagnostics_truncated: bool,
     pub delivery_started: bool,
     pub partial_delivery: bool,
 }
@@ -408,6 +409,7 @@ impl MiddlewareObservation {
         self.fail_open |= other.fail_open;
         self.fail_closed |= other.fail_closed;
         self.admission_exhausted |= other.admission_exhausted;
+        self.diagnostics_truncated |= other.diagnostics_truncated;
         self.delivery_started |= other.delivery_started;
         self.partial_delivery |= other.partial_delivery;
     }
@@ -498,6 +500,7 @@ impl RequestCorrelation {
             "openshell.middleware.response.fail_open" = tracing::field::Empty,
             "openshell.middleware.response.fail_closed" = tracing::field::Empty,
             "openshell.middleware.response.admission_exhausted" = tracing::field::Empty,
+            "openshell.middleware.response.diagnostics_truncated" = tracing::field::Empty,
             "openshell.middleware.response.delivery_started" = tracing::field::Empty,
             "openshell.middleware.response.partial_delivery" = tracing::field::Empty,
             "openshell.credential.outcome" = tracing::field::Empty,
@@ -1025,6 +1028,7 @@ impl RequestCorrelation {
                     "openshell.middleware.response.fail_open",
                     "openshell.middleware.response.fail_closed",
                     "openshell.middleware.response.admission_exhausted",
+                    "openshell.middleware.response.diagnostics_truncated",
                     "openshell.middleware.response.delivery_started",
                     "openshell.middleware.response.partial_delivery",
                 );
@@ -1033,8 +1037,10 @@ impl RequestCorrelation {
                 self.span.record(fields.2, observation.fail_open);
                 self.span.record(fields.3, observation.fail_closed);
                 self.span.record(fields.4, observation.admission_exhausted);
-                self.span.record(fields.5, observation.delivery_started);
-                self.span.record(fields.6, observation.partial_delivery);
+                self.span
+                    .record(fields.5, observation.diagnostics_truncated);
+                self.span.record(fields.6, observation.delivery_started);
+                self.span.record(fields.7, observation.partial_delivery);
             }
         }
     }
@@ -1315,6 +1321,7 @@ fn middleware_aggregate_event(
         .unmapped("fail_open", observation.fail_open)
         .unmapped("fail_closed", observation.fail_closed)
         .unmapped("admission_exhausted", observation.admission_exhausted)
+        .unmapped("diagnostics_truncated", observation.diagnostics_truncated)
         .unmapped("delivery_started", observation.delivery_started)
         .unmapped("partial_delivery", observation.partial_delivery)
         .message(message)
@@ -2483,6 +2490,7 @@ mod tests {
                 MiddlewarePhase::Response,
                 MiddlewareObservation {
                     admission_exhausted: true,
+                    diagnostics_truncated: true,
                     ..Default::default()
                 },
             );
@@ -2513,6 +2521,10 @@ mod tests {
             attributes["openshell.middleware.response.admission_exhausted"],
             "true"
         );
+        assert_eq!(
+            attributes["openshell.middleware.response.diagnostics_truncated"],
+            "true"
+        );
         let events = ocsf
             .json_events()
             .into_iter()
@@ -2521,6 +2533,7 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0]["unmapped"]["middleware_phase"], "response");
         assert_eq!(events[0]["unmapped"]["middleware_outcome"], "incomplete");
+        assert_eq!(events[0]["unmapped"]["diagnostics_truncated"], true);
         assert_eq!(events[0]["severity"], "Medium");
     }
 
