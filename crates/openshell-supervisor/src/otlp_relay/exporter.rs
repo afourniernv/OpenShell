@@ -21,6 +21,10 @@ use tonic::{GrpcMethod, Status};
 
 use super::EXPORT_TIMEOUT;
 
+/// Maximum collector diagnostic included in relay logs. Collector responses
+/// are external input and must not create unbounded or multi-line log fields.
+const MAX_COLLECTOR_DIAGNOSTIC_BYTES: usize = 512;
+
 /// TCP connect deadline, applied per resolved address by hyper, kept well
 /// under [`EXPORT_TIMEOUT`] so the batch that triggers a failed connect
 /// usually observes the connect error rather than a request timeout. DNS
@@ -51,6 +55,11 @@ pub enum ExportError {
     Status(Status),
     /// No answer within [`EXPORT_TIMEOUT`].
     Timeout,
+    /// The collector returned a success response that violates OTLP.
+    InvalidResponse {
+        rejected_spans: i64,
+        diagnostic: String,
+    },
 }
 
 impl std::fmt::Display for ExportError {
@@ -58,11 +67,32 @@ impl std::fmt::Display for ExportError {
         match self {
             Self::Status(status) => write!(f, "{}: {}", status.code(), status.message()),
             Self::Timeout => write!(f, "no response within {EXPORT_TIMEOUT:?}"),
+            Self::InvalidResponse {
+                rejected_spans,
+                diagnostic,
+            } => write!(
+                f,
+                "collector returned an invalid negative rejected span count ({rejected_spans}); diagnostic={diagnostic:?}"
+            ),
         }
     }
 }
 
 impl std::error::Error for ExportError {}
+
+/// Collector acknowledgement for one export batch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExportOutcome {
+    /// The collector accepted the complete batch without a diagnostic.
+    Accepted,
+    /// The collector accepted the complete batch and returned a warning.
+    Warning { diagnostic: String },
+    /// The collector accepted part of the batch and rejected some spans.
+    Partial {
+        rejected_spans: u64,
+        diagnostic: String,
+    },
+}
 
 /// Forwards encoded `ExportTraceServiceRequest` batches to one collector.
 pub struct Exporter {
@@ -117,7 +147,7 @@ impl Exporter {
     }
 
     /// Sends one encoded batch, bounded by [`EXPORT_TIMEOUT`].
-    pub async fn export(&self, batch: Bytes) -> Result<(), ExportError> {
+    pub async fn export(&self, batch: Bytes) -> Result<ExportOutcome, ExportError> {
         let mut client = self.client.clone();
         let send = async move {
             client.ready().await.map_err(|error| {
@@ -132,11 +162,75 @@ impl Exporter {
                 .await
         };
         match tokio::time::timeout(EXPORT_TIMEOUT, send).await {
-            Ok(Ok(_)) => Ok(()),
+            Ok(Ok(response)) => classify_response(response.into_inner()),
             Ok(Err(status)) => Err(ExportError::Status(status)),
             Err(_) => Err(ExportError::Timeout),
         }
     }
+}
+
+fn classify_response(response: ExportTraceServiceResponse) -> Result<ExportOutcome, ExportError> {
+    let Some(partial) = response.partial_success else {
+        return Ok(ExportOutcome::Accepted);
+    };
+    let diagnostic = sanitize_diagnostic(&partial.error_message);
+    match partial.rejected_spans {
+        value if value < 0 => Err(ExportError::InvalidResponse {
+            rejected_spans: value,
+            diagnostic,
+        }),
+        0 if partial.error_message.is_empty() => Ok(ExportOutcome::Accepted),
+        0 => Ok(ExportOutcome::Warning { diagnostic }),
+        rejected_spans => Ok(ExportOutcome::Partial {
+            rejected_spans: u64::try_from(rejected_spans)
+                .expect("positive rejected span count fits in u64"),
+            diagnostic,
+        }),
+    }
+}
+
+fn sanitize_diagnostic(message: &str) -> String {
+    let mut sanitized = String::with_capacity(message.len().min(MAX_COLLECTOR_DIAGNOSTIC_BYTES));
+    let mut previous_was_space = false;
+    for character in message.chars() {
+        if is_unicode_format_control(character) {
+            continue;
+        }
+        let character = if character.is_whitespace() || character.is_control() {
+            ' '
+        } else {
+            character
+        };
+        let is_space = character == ' ';
+        if is_space && previous_was_space {
+            continue;
+        }
+        if sanitized.len() + character.len_utf8() > MAX_COLLECTOR_DIAGNOSTIC_BYTES {
+            break;
+        }
+        sanitized.push(character);
+        previous_was_space = is_space;
+    }
+    sanitized.trim().to_string()
+}
+
+fn is_unicode_format_control(character: char) -> bool {
+    matches!(
+        character,
+        '\u{00ad}'
+            | '\u{061c}'
+            | '\u{180e}'
+            | '\u{200b}'..='\u{200f}'
+            | '\u{202a}'..='\u{202e}'
+            | '\u{2060}'..='\u{2064}'
+            | '\u{2066}'..='\u{206f}'
+            | '\u{feff}'
+            | '\u{fff9}'..='\u{fffb}'
+            | '\u{1bca0}'..='\u{1bca3}'
+            | '\u{1d173}'..='\u{1d17a}'
+            | '\u{e0001}'
+            | '\u{e0020}'..='\u{e007f}'
+    )
 }
 
 /// gRPC codec that writes a pre-encoded request body as-is and decodes the
@@ -225,14 +319,83 @@ mod tests {
     use std::time::Instant;
 
     use openshell_otel_test_support::OtlpTestServer;
+    use opentelemetry_proto::tonic::collector::trace::v1::ExportTracePartialSuccess;
 
     use super::super::enrichment::test_util::encoded_request;
     use super::test_util::SilentCollector;
     use super::*;
 
+    fn response(rejected_spans: i64, error_message: &str) -> ExportTraceServiceResponse {
+        ExportTraceServiceResponse {
+            partial_success: Some(ExportTracePartialSuccess {
+                rejected_spans,
+                error_message: error_message.to_string(),
+            }),
+        }
+    }
+
     #[test]
     fn new_rejects_an_invalid_uri() {
         assert!(Exporter::new("not a uri").is_err());
+    }
+
+    #[test]
+    fn classifies_collector_acknowledgements() {
+        assert_eq!(
+            classify_response(ExportTraceServiceResponse::default()).unwrap(),
+            ExportOutcome::Accepted
+        );
+        assert_eq!(
+            classify_response(response(0, "")).unwrap(),
+            ExportOutcome::Accepted
+        );
+        assert_eq!(
+            classify_response(response(0, "consider a smaller batch")).unwrap(),
+            ExportOutcome::Warning {
+                diagnostic: "consider a smaller batch".to_string()
+            }
+        );
+        assert_eq!(
+            classify_response(response(3, "invalid spans")).unwrap(),
+            ExportOutcome::Partial {
+                rejected_spans: 3,
+                diagnostic: "invalid spans".to_string()
+            }
+        );
+        assert_eq!(
+            classify_response(response(1, "")).unwrap(),
+            ExportOutcome::Partial {
+                rejected_spans: 1,
+                diagnostic: String::new()
+            }
+        );
+        assert!(matches!(
+            classify_response(response(-1, "broken collector")),
+            Err(ExportError::InvalidResponse {
+                rejected_spans: -1,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn collector_diagnostics_are_single_line_and_bounded() {
+        let diagnostic = format!(
+            "first\n\u{1b}[31m\u{2028}\u{2029}\u{202e}hidden{}",
+            "x".repeat(1_024)
+        );
+        let ExportOutcome::Warning { diagnostic } =
+            classify_response(response(0, &diagnostic)).unwrap()
+        else {
+            panic!("collector response should be a warning");
+        };
+        assert!(diagnostic.len() <= MAX_COLLECTOR_DIAGNOSTIC_BYTES);
+        assert!(!diagnostic.contains('\n'));
+        assert!(!diagnostic.contains('\u{1b}'));
+        assert!(!diagnostic.contains('\u{2028}'));
+        assert!(!diagnostic.contains('\u{2029}'));
+        assert!(!diagnostic.contains('\u{202e}'));
+        assert!(diagnostic.starts_with("first [31m hidden"));
     }
 
     #[tokio::test]

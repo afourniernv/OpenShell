@@ -74,7 +74,7 @@ pub mod relay {
     }
 }
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -149,6 +149,8 @@ pub async fn assert_compute_driver_tracing(
 
 #[derive(Clone, Debug, Default)]
 pub struct ReceivedTraces {
+    /// Number of trace export requests received by the collector.
+    pub trace_exports: u64,
     pub spans: Vec<Span>,
     /// String bodies of exported log records.
     pub log_bodies: Vec<String>,
@@ -206,6 +208,7 @@ impl ReceivedTraces {
 struct Collector {
     received: Arc<Mutex<ReceivedTraces>>,
     exported: Arc<tokio::sync::Notify>,
+    trace_responses: Arc<Mutex<VecDeque<ExportTraceServiceResponse>>>,
 }
 
 #[tonic::async_trait]
@@ -219,6 +222,7 @@ impl TraceService for Collector {
                 .received
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
+            received.trace_exports = received.trace_exports.saturating_add(1);
             if let Some(encoding) = request
                 .metadata()
                 .get("grpc-encoding")
@@ -238,7 +242,13 @@ impl TraceService for Collector {
             }
         }
         self.exported.notify_one();
-        Ok(tonic::Response::new(ExportTraceServiceResponse::default()))
+        let response = self
+            .trace_responses
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .pop_front()
+            .unwrap_or_default();
+        Ok(tonic::Response::new(response))
     }
 }
 
@@ -293,9 +303,19 @@ impl OtlpTestServer {
         Self::start_on(LOOPBACK_EPHEMERAL).await
     }
 
+    /// Starts a collector that returns the configured trace responses in
+    /// order, then returns full-success responses once the list is empty.
+    pub async fn start_with_trace_responses(
+        responses: impl IntoIterator<Item = ExportTraceServiceResponse>,
+    ) -> Self {
+        Self::try_start_with(LOOPBACK_EPHEMERAL, None, responses.into_iter().collect())
+            .await
+            .expect("OTLP test collector should bind a loopback listener")
+    }
+
     /// Serve over TLS at `https://localhost:<port>` using `identity`.
     pub async fn start_tls(identity: tonic::transport::Identity) -> Self {
-        Self::try_start_with(LOOPBACK_EPHEMERAL, Some(identity))
+        Self::try_start_with(LOOPBACK_EPHEMERAL, Some(identity), VecDeque::new())
             .await
             .expect("OTLP test collector should bind a loopback listener")
     }
@@ -311,12 +331,13 @@ impl OtlpTestServer {
     /// [`Self::start_on`] that reports a bind failure instead of panicking,
     /// so a test can retry with another port when a parallel test took it.
     pub async fn try_start_on(addr: SocketAddr) -> std::io::Result<Self> {
-        Self::try_start_with(addr, None).await
+        Self::try_start_with(addr, None, VecDeque::new()).await
     }
 
     async fn try_start_with(
         addr: SocketAddr,
         identity: Option<tonic::transport::Identity>,
+        trace_responses: VecDeque<ExportTraceServiceResponse>,
     ) -> std::io::Result<Self> {
         let received = Arc::new(Mutex::new(ReceivedTraces::default()));
         let exported = Arc::new(tokio::sync::Notify::new());
@@ -330,6 +351,7 @@ impl OtlpTestServer {
         let collector = Collector {
             received: Arc::clone(&received),
             exported: Arc::clone(&exported),
+            trace_responses: Arc::new(Mutex::new(trace_responses)),
         };
         let mut server = tonic::transport::Server::builder();
         if let Some(identity) = identity {
