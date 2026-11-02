@@ -13,12 +13,6 @@ use crate::l7::correlation::{
 pub const DEFAULT_HTTP_RESPONSE_WHOLE_BODY_TIMEOUT: std::time::Duration =
     std::time::Duration::from_mins(2);
 
-fn ensure_response_policy_current(guard: &PolicyGenerationGuard) -> Result<()> {
-    guard
-        .ensure_current()
-        .map_err(|error| miette::Report::new(RelayError::PolicyReloaded(error.to_string())))
-}
-
 /// Context retained from request evaluation for the matching response hook.
 pub struct HttpResponseMiddlewareRelay<'a> {
     pub(crate) chain: &'a [openshell_supervisor_middleware::ChainEntry],
@@ -142,7 +136,7 @@ where
                 informational_header_bytes += header_end;
                 let sanitized = strip_platform_request_id_from_head(&buf[..header_end]);
                 if let Some(guard) = response_generation_guard {
-                    ensure_response_policy_current(guard)?;
+                    ensure_relay_generation_current(guard)?;
                 }
                 write_correlated_interim_bytes(client, &sanitized, options.correlation).await?;
                 client.flush().await.map_err(RelayError::interim_flush)?;
@@ -161,7 +155,7 @@ where
         })
         .await?;
         if let Some(guard) = response_generation_guard {
-            ensure_response_policy_current(guard)?;
+            ensure_relay_generation_current(guard)?;
         }
         if n == 0 {
             if let Some(observer) = options.observer.as_ref() {
@@ -252,7 +246,7 @@ where
         .map_err(|error| RelayError::protocol("invalid_websocket_handshake", error.to_string()))?;
         let final_head = final_response_head(&buf[..header_end], options.correlation);
         if let Some(guard) = response_generation_guard {
-            ensure_response_policy_current(guard)?;
+            ensure_relay_generation_current(guard)?;
         }
         select_allowed_response(options.correlation, status_code);
         write_correlated_response_bytes(client, &final_head, options.correlation, false).await?;
@@ -298,7 +292,7 @@ where
     // Bodiless responses (HEAD, 1xx, 204, 304): forward headers only, skip body
     if is_bodiless_response(request_method, status_code) {
         if let Some(guard) = response_generation_guard {
-            ensure_response_policy_current(guard)?;
+            ensure_relay_generation_current(guard)?;
         }
         select_allowed_response(options.correlation, status_code);
         write_correlated_response_bytes(client, &final_head, options.correlation, false).await?;
@@ -315,7 +309,7 @@ where
             // such as SSE where the body is intentionally delimited by EOF.
             let before_end = &final_head[..final_head.len() - 2];
             if let Some(guard) = response_generation_guard {
-                ensure_response_policy_current(guard)?;
+                ensure_relay_generation_current(guard)?;
             }
             select_allowed_response(options.correlation, status_code);
             write_correlated_response_bytes(client, before_end, options.correlation, false).await?;
@@ -330,7 +324,7 @@ where
             let overflow = &buf[header_end..];
             if !overflow.is_empty() {
                 if let Some(guard) = response_generation_guard {
-                    ensure_response_policy_current(guard)?;
+                    ensure_relay_generation_current(guard)?;
                 }
                 client
                     .write_all(overflow)
@@ -345,16 +339,7 @@ where
                 match relay_until_eof(upstream, client, response_generation_guard).await? {
                     RelayUntilEofOutcome::Complete => {}
                     RelayUntilEofOutcome::IdleTimeout => {
-                        record_committed_response_error(
-                            options.correlation,
-                            "upstream_error",
-                            "upstream_response_idle_timeout",
-                        );
-                        if let Some(correlation) = options.correlation {
-                            correlation.record_pending_response_delivery(
-                                ResponseDeliveryOutcome::CancelledOrIncomplete,
-                            );
-                        }
+                        record_response_idle_timeout(options.correlation);
                     }
                 }
             }
@@ -367,7 +352,7 @@ where
         // the relay loop instead of blocking on relay_until_eof.
         debug!("BodyLength::None without Connection: close — treating body as empty");
         if let Some(guard) = response_generation_guard {
-            ensure_response_policy_current(guard)?;
+            ensure_relay_generation_current(guard)?;
         }
         select_allowed_response(options.correlation, status_code);
         write_correlated_response_bytes(client, &final_head, options.correlation, false).await?;
@@ -377,7 +362,7 @@ where
 
     // Hold buffered chunk framing until relay_chunked validates it.
     if let Some(guard) = response_generation_guard {
-        ensure_response_policy_current(guard)?;
+        ensure_relay_generation_current(guard)?;
     }
     select_allowed_response(options.correlation, status_code);
     write_correlated_response_bytes(client, &final_head, options.correlation, false).await?;
@@ -389,7 +374,7 @@ where
         BodyLength::ContentLength(len) => {
             if !overflow.is_empty() {
                 if let Some(guard) = response_generation_guard {
-                    ensure_response_policy_current(guard)?;
+                    ensure_relay_generation_current(guard)?;
                 }
                 client
                     .write_all(overflow)
@@ -602,18 +587,15 @@ fn classify_response_failure(error: &miette::Report) -> ResponseFailureClassific
     }
 }
 
-fn record_committed_response_error(
-    correlation: Option<&RequestCorrelation>,
-    outcome: &'static str,
-    stage: &'static str,
-) {
+fn record_response_idle_timeout(correlation: Option<&RequestCorrelation>) {
     if let Some(correlation) = correlation {
-        let cause = match stage {
-            "upstream_response_idle_timeout" => ResponseSelectionCause::UpstreamIdleTimeout,
-            "response_policy_reload" => ResponseSelectionCause::PolicyReloaded,
-            _ => ResponseSelectionCause::PlatformError,
-        };
-        correlation.record_response_selection(cause, outcome, Some(stage));
+        correlation.record_response_selection(
+            ResponseSelectionCause::UpstreamIdleTimeout,
+            "upstream_error",
+            Some("upstream_response_idle_timeout"),
+        );
+        correlation
+            .record_pending_response_delivery(ResponseDeliveryOutcome::CancelledOrIncomplete);
     }
 }
 
@@ -826,7 +808,7 @@ where
     C: AsyncWrite + Unpin,
 {
     if let Some(guard) = middleware.generation_guard {
-        ensure_response_policy_current(guard)?;
+        ensure_relay_generation_current(guard)?;
     }
     let header_bytes = &buffered[..header_end];
     // Ordinary responses retain the HTTP parser's byte-preserving behavior.
@@ -839,7 +821,7 @@ where
         .describe_http_response_chain(middleware.chain)
         .await;
     if let Some(guard) = middleware.generation_guard {
-        ensure_response_policy_current(guard)?;
+        ensure_relay_generation_current(guard)?;
     }
     let described = match described_result {
         Ok(described) if described.is_empty() => return Ok(None),
@@ -878,7 +860,7 @@ where
         ))
     });
     if let Some(guard) = middleware.generation_guard {
-        ensure_response_policy_current(guard)?;
+        ensure_relay_generation_current(guard)?;
     }
     let parsed = match parsed {
         Ok(parsed) => parsed,
@@ -930,7 +912,7 @@ where
             .http_response_input_unrepresentable(&described))
     };
     if let Some(guard) = middleware.generation_guard
-        && let Err(error) = ensure_response_policy_current(guard)
+        && let Err(error) = ensure_relay_generation_current(guard)
     {
         if let Ok(mut preflight) = preflight_result
             && let Some(session) = preflight.session.take()
@@ -1087,7 +1069,7 @@ where
     if bodiless {
         let finish_result = session.finish(Vec::new()).await;
         if let Some(guard) = middleware.generation_guard {
-            ensure_response_policy_current(guard)?;
+            ensure_relay_generation_current(guard)?;
         }
         let finish = match finish_result {
             Ok(finish) => finish,
@@ -1362,7 +1344,7 @@ where
     };
 
     if let Some(guard) = middleware.generation_guard
-        && let Err(error) = ensure_response_policy_current(guard)
+        && let Err(error) = ensure_relay_generation_current(guard)
     {
         if committed {
             record_response_middleware_partial_delivery(response_correlation);
@@ -1376,7 +1358,7 @@ where
     let input_trailers = trailers.clone();
     let finish_result = session.finish(trailers).await;
     if let Some(guard) = middleware.generation_guard
-        && let Err(error) = ensure_response_policy_current(guard)
+        && let Err(error) = ensure_relay_generation_current(guard)
     {
         if committed {
             record_response_middleware_partial_delivery(response_correlation);
@@ -1413,19 +1395,6 @@ where
                     true,
                     response_correlation,
                 );
-                if error.denial.is_some() {
-                    record_committed_response_error(
-                        response_correlation,
-                        "denied",
-                        "response_middleware_finish",
-                    );
-                } else {
-                    record_committed_response_error(
-                        response_correlation,
-                        "platform_error",
-                        "response_middleware_finish",
-                    );
-                }
                 return Err(ResponseMiddlewareStop::new(error).into());
             }
             debug!(error = %error, "HTTP response middleware failed before commitment");
@@ -1596,7 +1565,7 @@ where
     );
     let head = final_response_head(&head, response_correlation);
     if let Some(guard) = generation_guard {
-        ensure_response_policy_current(guard)?;
+        ensure_relay_generation_current(guard)?;
     }
     select_allowed_response(response_correlation, status_code);
     write_correlated_response_bytes(client, &head, response_correlation, true).await?;
@@ -1615,7 +1584,7 @@ where
         BodyLength::ContentLength(length) => {
             if !overflow.is_empty() {
                 if let Some(guard) = generation_guard {
-                    ensure_response_policy_current(guard)?;
+                    ensure_relay_generation_current(guard)?;
                 }
                 client
                     .write_all(overflow)
@@ -1633,7 +1602,7 @@ where
         BodyLength::None if server_wants_close || event_stream => {
             if !overflow.is_empty() {
                 if let Some(guard) = generation_guard {
-                    ensure_response_policy_current(guard)?;
+                    ensure_relay_generation_current(guard)?;
                 }
                 client
                     .write_all(overflow)
@@ -1649,23 +1618,14 @@ where
             };
             client.flush().await.map_err(RelayError::flush)?;
             if idle_timed_out {
-                record_committed_response_error(
-                    response_correlation,
-                    "upstream_error",
-                    "upstream_response_idle_timeout",
-                );
-                if let Some(correlation) = response_correlation {
-                    correlation.record_pending_response_delivery(
-                        ResponseDeliveryOutcome::CancelledOrIncomplete,
-                    );
-                }
+                record_response_idle_timeout(response_correlation);
             }
             return Ok(RelayOutcome::Consumed);
         }
         BodyLength::None => {
             if !overflow.is_empty() {
                 if let Some(guard) = generation_guard {
-                    ensure_response_policy_current(guard)?;
+                    ensure_relay_generation_current(guard)?;
                 }
                 client
                     .write_all(overflow)
@@ -2571,7 +2531,7 @@ where
                 )
                 .await?;
                 if let Some(guard) = generation_guard {
-                    ensure_response_policy_current(guard)?;
+                    ensure_relay_generation_current(guard)?;
                 }
                 let partial = unit.len() < length;
                 remaining -= unit.len() as u64;
@@ -2628,7 +2588,7 @@ where
                     )
                     .await?;
                     if let Some(guard) = generation_guard {
-                        ensure_response_policy_current(guard)?;
+                        ensure_relay_generation_current(guard)?;
                     }
                     let partial = unit.len() < length;
                     remaining -= unit.len();
@@ -2744,7 +2704,7 @@ where
                 return Ok(Vec::new());
             };
             if let Some(guard) = generation_guard {
-                ensure_response_policy_current(guard)?;
+                ensure_relay_generation_current(guard)?;
             }
             buffer_normalized_response_bytes(
                 session,
@@ -2814,7 +2774,7 @@ async fn expire_whole_body_deadline<C: AsyncWrite + Unpin>(
         );
     }
     if let Some(guard) = framing.generation_guard {
-        ensure_response_policy_current(guard)?;
+        ensure_relay_generation_current(guard)?;
     }
     emit_http_response_diagnostics(
         framing.policy_name,
@@ -2980,7 +2940,7 @@ async fn process_response_unit<C: AsyncWrite + Unpin>(
         );
     }
     if let Some(guard) = framing.generation_guard {
-        ensure_response_policy_current(guard)?;
+        ensure_relay_generation_current(guard)?;
     }
     emit_http_response_diagnostics(
         framing.policy_name,
@@ -6264,7 +6224,6 @@ mod tests {
 
     #[tokio::test]
     async fn headers_only_close_delimited_and_sse_reads_stop_on_policy_reload() {
-        use tokio::io::AsyncWriteExt as _;
         use tracing_subscriber::layer::SubscriberExt as _;
 
         let capture = openshell_ocsf::test_support::OcsfCapture::default();
@@ -6310,8 +6269,9 @@ mod tests {
             }];
             let mut middleware = test_response_middleware(&runner, &chain, request_id);
             middleware.generation_guard = Some(&generation_guard);
-            let (mut upstream, mut upstream_peer) = tokio::io::duplex(256);
-            upstream_peer.write_all(head).await.expect("seed response");
+            let pending_polled = Arc::new(AtomicBool::new(false));
+            let mut upstream =
+                SegmentsThenPendingReader::new([head.to_vec()], Arc::clone(&pending_polled));
             let mut client = Vec::new();
             let mut relay = Box::pin(relay_response(
                 "GET",
@@ -6326,7 +6286,7 @@ mod tests {
 
             tokio::select! {
                 result = &mut relay => panic!("idle response finished before reload: {result:?}"),
-                () = tokio::time::sleep(std::time::Duration::from_millis(10)) => {}
+                () = wait_for_pending_read(&pending_polled) => {}
             }
             engine
                 .reload(

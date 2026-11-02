@@ -826,25 +826,29 @@ impl RequestCorrelation {
     }
 
     pub(crate) fn record_response_delivery_started(&self) {
-        let mut response = self
-            .response
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        response.lifecycle_started = true;
-        response.delivery_started = true;
+        {
+            let mut response = self
+                .response
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            response.lifecycle_started = true;
+            response.delivery_started = true;
+        }
         self.span
             .record("openshell.response.delivery_started", true);
     }
 
     pub(crate) fn record_response_partial_delivery(&self) -> bool {
-        let mut response = self
-            .response
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if !response.delivery_started {
-            return false;
+        {
+            let mut response = self
+                .response
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if !response.delivery_started {
+                return false;
+            }
+            response.partial_delivery = true;
         }
-        response.partial_delivery = true;
         self.span
             .record("openshell.response.partial_delivery", true);
         true
