@@ -213,12 +213,13 @@ impl ChainRunner {
             let decision_metadata = decision.metadata;
             match decision.action {
                 Some(http_response_preflight_result::Action::Skip(_)) => {
-                    collect_preflight_diagnostics(
+                    collect_diagnostics(
                         &entry,
                         decision_findings,
                         decision_metadata,
                         &mut findings,
                         &mut metadata,
+                        None,
                     );
                     invocations.push(HttpResponseInvocation {
                         config_name: entry.entry.name.clone(),
@@ -299,12 +300,13 @@ impl ChainRunner {
                     if mode == StageMode::Stream {
                         strip_stale_integrity(&mut headers);
                     }
-                    collect_preflight_diagnostics(
+                    collect_diagnostics(
                         &entry,
                         decision_findings,
                         decision_metadata,
                         &mut findings,
                         &mut metadata,
+                        None,
                     );
                     invocations.push(HttpResponseInvocation {
                         config_name: entry.entry.name.clone(),
@@ -331,12 +333,13 @@ impl ChainRunner {
                     }
                 }
                 Some(http_response_preflight_result::Action::BlockDelivery(_)) => {
-                    collect_preflight_diagnostics(
+                    collect_diagnostics(
                         &entry,
                         decision_findings,
                         decision_metadata,
                         &mut findings,
                         &mut metadata,
+                        None,
                     );
                     invocations.push(HttpResponseInvocation {
                         config_name: entry.entry.name.clone(),

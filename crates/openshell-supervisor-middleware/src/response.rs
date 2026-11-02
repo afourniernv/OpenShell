@@ -758,13 +758,13 @@ impl HttpResponseSession {
             }
             self.retained_body_bytes = retained;
         }
-        collect_session_diagnostics(
-            &self.stages[index],
+        collect_diagnostics(
+            &self.stages[index].entry,
             decision.findings,
             decision.metadata,
             &mut self.findings,
             &mut self.metadata,
-            &mut self.diagnostic_budget,
+            Some(&mut self.diagnostic_budget),
         );
         let reason_code = (!decision.reason_code.is_empty()).then_some(decision.reason_code);
         match decision.action {
@@ -976,13 +976,13 @@ impl HttpResponseSession {
             trailers = decision.headers;
             let output_size = encoded_header_bytes(&trailers);
             let reason_code = (!decision.reason_code.is_empty()).then_some(decision.reason_code);
-            collect_session_diagnostics(
-                &self.stages[index],
+            collect_diagnostics(
+                &self.stages[index].entry,
                 decision.findings,
                 decision.metadata,
                 &mut self.findings,
                 &mut self.metadata,
-                &mut self.diagnostic_budget,
+                Some(&mut self.diagnostic_budget),
             );
             let invocation = HttpResponseInvocation {
                 config_name: self.stages[index].entry.entry.name.clone(),
@@ -1132,76 +1132,41 @@ fn body_invocation_with_reason(
 }
 
 fn collect_diagnostics(
-    stage: &HttpResponseStage,
+    entry: &DescribedChainEntry,
     mut findings: Vec<Finding>,
     mut metadata: std::collections::HashMap<String, String>,
     all_findings: &mut Vec<NamespacedFinding>,
     all_metadata: &mut BTreeMap<String, BTreeMap<String, String>>,
+    mut budget: Option<&mut HttpResponseDiagnosticBudget>,
 ) {
-    if stage
-        .entry
+    if entry
         .service
         .as_ref()
         .is_some_and(|service| service.diagnostic_policy == MiddlewareDiagnosticPolicy::Normalize)
     {
         metadata.clear();
         for finding in &mut findings {
-            finding.r#type = format!("{}.finding", stage.entry.entry.implementation);
+            finding.r#type = format!("{}.finding", entry.entry.implementation);
             finding.label = super::EXTERNAL_FINDING_LABEL.to_string();
             finding.confidence.clear();
             finding.severity = "medium".into();
         }
     }
-    all_findings.extend(findings.into_iter().map(|finding| NamespacedFinding {
-        middleware: stage.entry.entry.name.clone(),
-        finding,
-    }));
-    if !metadata.is_empty() {
-        all_metadata.insert(
-            stage.entry.entry.name.clone(),
-            metadata.into_iter().collect(),
-        );
+    for finding in findings {
+        let finding = NamespacedFinding {
+            middleware: entry.entry.name.clone(),
+            finding,
+        };
+        if budget
+            .as_mut()
+            .is_none_or(|budget| budget.retain_finding(&finding))
+        {
+            all_findings.push(finding);
+        }
     }
-}
-
-fn collect_session_diagnostics(
-    stage: &HttpResponseStage,
-    findings: Vec<Finding>,
-    metadata: std::collections::HashMap<String, String>,
-    all_findings: &mut Vec<NamespacedFinding>,
-    all_metadata: &mut BTreeMap<String, BTreeMap<String, String>>,
-    budget: &mut HttpResponseDiagnosticBudget,
-) {
-    let mut current_findings = Vec::new();
-    collect_diagnostics(
-        stage,
-        findings,
-        metadata,
-        &mut current_findings,
-        all_metadata,
-    );
-    all_findings.extend(
-        current_findings
-            .into_iter()
-            .filter(|finding| budget.retain_finding(finding)),
-    );
-}
-
-fn collect_preflight_diagnostics(
-    entry: &DescribedChainEntry,
-    findings: Vec<Finding>,
-    metadata: std::collections::HashMap<String, String>,
-    all_findings: &mut Vec<NamespacedFinding>,
-    all_metadata: &mut BTreeMap<String, BTreeMap<String, String>>,
-) {
-    let stage = HttpResponseStage {
-        entry: entry.clone(),
-        transport: None,
-        mode: StageMode::HeadersOnly,
-        next_sequence: 1,
-        whole_body: Vec::new(),
-    };
-    collect_diagnostics(&stage, findings, metadata, all_findings, all_metadata);
+    if !metadata.is_empty() {
+        all_metadata.insert(entry.entry.name.clone(), metadata.into_iter().collect());
+    }
 }
 
 fn collect_preflight_failure(
