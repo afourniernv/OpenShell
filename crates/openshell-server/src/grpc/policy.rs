@@ -343,18 +343,18 @@ fn emit_gateway_policy_decision_audit_log(
     sandbox_name: &str,
     state_label: &str,
     decision: GatewayPolicyDecision<'_>,
-    extra_fields: &[(&str, String)],
+    extra_fields: &[(&str, &str)],
 ) {
     let mut audit_fields = Vec::with_capacity(extra_fields.len() + 6);
     if let Some(chunk_id) = decision.chunk_id {
-        audit_fields.push(("chunk_id", chunk_id.to_string()));
+        audit_fields.push(("chunk_id", chunk_id));
     }
-    audit_fields.push(("actor", decision.actor.to_string()));
-    audit_fields.push(("actor_class", decision.actor_class.to_string()));
-    audit_fields.push(("action", decision.action.to_string()));
-    audit_fields.push(("decision_reason", decision.reason.as_str().to_string()));
-    audit_fields.push(("outcome", "success".to_string()));
-    audit_fields.extend(extra_fields.iter().cloned());
+    audit_fields.push(("actor", decision.actor));
+    audit_fields.push(("actor_class", decision.actor_class));
+    audit_fields.push(("action", decision.action));
+    audit_fields.push(("decision_reason", decision.reason.as_str()));
+    audit_fields.push(("outcome", "success"));
+    audit_fields.extend_from_slice(extra_fields);
 
     let event = build_gateway_policy_audit_event(
         sandbox_id,
@@ -434,10 +434,10 @@ fn emit_gateway_policy_auto_approve_audit_log(
     resolved_from: &str,
 ) {
     let extra = [
-        ("auto", "true".to_string()),
-        ("source", canonical_analysis_mode(source).to_string()),
-        ("prover_delta", "empty".to_string()),
-        ("resolved_from", resolved_from.to_string()),
+        ("auto", "true"),
+        ("source", canonical_analysis_mode(source)),
+        ("prover_delta", "empty"),
+        ("resolved_from", resolved_from),
     ];
     emit_gateway_policy_decision_audit_log(
         sandbox_id,
@@ -478,7 +478,11 @@ fn emit_gateway_policy_reject_audit_log(
 ) {
     let extra = [(
         "rejection_reason_present",
-        (!decision.rejection_reason.trim().is_empty()).to_string(),
+        if decision.rejection_reason.trim().is_empty() {
+            "false"
+        } else {
+            "true"
+        },
     )];
     emit_gateway_policy_decision_audit_log(
         sandbox.object_id(),
@@ -518,7 +522,7 @@ fn emit_gateway_policy_undo_audit_log(
             version,
             policy_hash,
         },
-        &[("previous_status", "approved".to_string())],
+        &[("previous_status", "approved")],
     );
 }
 
@@ -551,6 +555,7 @@ fn emit_gateway_policy_clear_audit_log(
     actor_class: &'static str,
     cleared_count: u64,
 ) {
+    let operation_count = cleared_count.to_string();
     emit_gateway_policy_decision_audit_log(
         sandbox.object_id(),
         sandbox.object_name(),
@@ -564,7 +569,7 @@ fn emit_gateway_policy_clear_audit_log(
             version: 0,
             policy_hash: "",
         },
-        &[("operation_count", cleared_count.to_string())],
+        &[("operation_count", &operation_count)],
     );
 }
 
@@ -659,7 +664,7 @@ fn build_gateway_policy_audit_event(
     detail: impl Into<String>,
     version: i64,
     policy_hash: &str,
-    extra_fields: &[(&str, String)],
+    extra_fields: &[(&str, &str)],
 ) -> OcsfEvent {
     let ctx = crate::gateway_ocsf::context(sandbox_id, sandbox_name);
     let mut builder = ConfigStateChangeBuilder::new(&ctx)
@@ -21861,9 +21866,9 @@ mod tests {
     #[test]
     fn build_gateway_policy_audit_event_carries_auto_approve_provenance() {
         let extra = [
-            ("auto", "true".to_string()),
-            ("source", "agent_authored".to_string()),
-            ("prover_delta", "empty".to_string()),
+            ("auto", "true"),
+            ("source", "agent_authored"),
+            ("prover_delta", "empty"),
         ];
         let message = build_gateway_policy_audit_event(
             "sb-123",
@@ -22052,7 +22057,7 @@ mod tests {
                 version: 0,
                 policy_hash: "",
             },
-            &[("rejection_reason_present", "true".to_string())],
+            &[("rejection_reason_present", "true")],
         );
 
         let submit_parent = tracing::info_span!("submit_policy_analysis_parent");
@@ -22070,7 +22075,7 @@ mod tests {
                     version: 8,
                     policy_hash: "sha256:auto",
                 },
-                &[("source", "mechanistic".to_string())],
+                &[("source", "mechanistic")],
             );
         });
         drop(submit_parent);

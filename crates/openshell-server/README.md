@@ -9,6 +9,13 @@ The server owns control-plane RPCs, authentication, provider credential delivery
 and sandbox lifecycle orchestration. The `openshell-gateway` crate composes the
 server with selected compute drivers.
 
+## Policy decision auditing
+
+The gateway emits decision audits after durable policy transitions. They record
+structural decision data and policy revisions, not proposal or rejection text.
+Intermediate audit fields are borrowed; the final event owns their normalized,
+bounded values before dispatch.
+
 ## Sandbox launch identity
 
 A new start, including an automatic restart, commits a fresh runtime generation
