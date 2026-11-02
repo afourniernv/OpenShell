@@ -18984,7 +18984,7 @@ mod tests {
         let mut live = ProtoSandboxPolicy::default();
         live.network_policies.insert("example".to_string(), rule);
         let policy_hash = deterministic_policy_hash(&live);
-        let (result, events) = capture_ocsf_jsonl(async {
+        let (result, events) = capture_ocsf_events(async {
             let _guard = state
                 .compute
                 .mutation_guard(MutationScope::sandbox("default", sandbox_id))
@@ -19065,7 +19065,7 @@ mod tests {
         live.network_policies.insert("race".to_string(), rule);
         let policy_hash = deterministic_policy_hash(&live);
 
-        let (results, events) = capture_ocsf_jsonl(futures::future::join_all((0..8).map(|_| {
+        let (results, events) = capture_ocsf_events(futures::future::join_all((0..8).map(|_| {
             let state = Arc::clone(&state);
             let sandbox = sandbox.clone();
             let live = live.clone();
@@ -21899,6 +21899,15 @@ mod tests {
         );
     }
 
+    /// Keep the producer on this thread: its tracing subscriber is thread-local.
+    async fn capture_ocsf_events<F: Future>(run: F) -> (F::Output, Vec<serde_json::Value>) {
+        let capture = openshell_ocsf::test_support::OcsfCapture::default();
+        let guard = capture.install();
+        let output = run.await;
+        drop(guard);
+        (output, capture.json_events())
+    }
+
     /// Run `run` with a gateway OCSF JSONL log attached and return the events
     /// it emitted. Needs the default current-thread test runtime, because the
     /// subscriber is thread-local.
@@ -22229,6 +22238,28 @@ mod tests {
         submit.accepted_chunk_ids[0].clone()
     }
 
+    async fn approve_example_chunk(state: &Arc<ServerState>, sandbox_name: &str, chunk_id: &str) {
+        let review_token = state
+            .store
+            .get_draft_chunk(chunk_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .review_token;
+        handle_approve_draft_chunk(
+            state,
+            authed_request(ApproveDraftChunkRequest {
+                request_id: String::new(),
+                sandbox: sandbox_name.to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+                chunk_id: chunk_id.to_string(),
+                review_token,
+            }),
+        )
+        .await
+        .unwrap();
+    }
+
     fn rejected_events(events: &[serde_json::Value]) -> Vec<&serde_json::Value> {
         events
             .iter()
@@ -22261,7 +22292,7 @@ mod tests {
             .unwrap()
             .review_token;
 
-        let (result, events) = capture_ocsf_jsonl(Box::pin(handle_approve_draft_chunk(
+        let (result, events) = capture_ocsf_events(Box::pin(handle_approve_draft_chunk(
             &state,
             authed_request(ApproveDraftChunkRequest {
                 request_id: String::new(),
@@ -22303,7 +22334,7 @@ mod tests {
         seed_ready_sandbox(&state, "reject-audit").await;
         let chunk_id = submit_example_chunk(&state, "reject-audit", "agent_authored").await;
 
-        let (result, events) = capture_ocsf_jsonl(Box::pin(handle_reject_draft_chunk(
+        let (result, events) = capture_ocsf_events(Box::pin(handle_reject_draft_chunk(
             &state,
             authed_request(RejectDraftChunkRequest {
                 request_id: String::new(),
@@ -22415,7 +22446,7 @@ mod tests {
         .map(Option::unwrap)
         .collect::<Vec<_>>();
 
-        let (result, events) = capture_ocsf_jsonl(Box::pin(handle_approve_all_draft_chunks(
+        let (result, events) = capture_ocsf_events(Box::pin(handle_approve_all_draft_chunks(
             &state,
             authed_request(ApproveAllDraftChunksRequest {
                 sandbox: "bulk-audit".to_string(),
@@ -22448,27 +22479,9 @@ mod tests {
         seed_ready_sandbox(&state, "reject-approved-audit").await;
         let chunk_id =
             submit_example_chunk(&state, "reject-approved-audit", "agent_authored").await;
-        let review_token = state
-            .store
-            .get_draft_chunk(&chunk_id)
-            .await
-            .unwrap()
-            .unwrap()
-            .review_token;
-        handle_approve_draft_chunk(
-            &state,
-            authed_request(ApproveDraftChunkRequest {
-                request_id: String::new(),
-                sandbox: "reject-approved-audit".to_string(),
-                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
-                chunk_id: chunk_id.clone(),
-                review_token,
-            }),
-        )
-        .await
-        .unwrap();
+        approve_example_chunk(&state, "reject-approved-audit", &chunk_id).await;
 
-        let (result, events) = capture_ocsf_jsonl(Box::pin(handle_reject_draft_chunk(
+        let (result, events) = capture_ocsf_events(Box::pin(handle_reject_draft_chunk(
             &state,
             authed_request(RejectDraftChunkRequest {
                 request_id: String::new(),
@@ -22498,27 +22511,9 @@ mod tests {
         let state = test_server_state().await;
         seed_ready_sandbox(&state, "reject-approved-race").await;
         let chunk_id = submit_example_chunk(&state, "reject-approved-race", "agent_authored").await;
-        let review_token = state
-            .store
-            .get_draft_chunk(&chunk_id)
-            .await
-            .unwrap()
-            .unwrap()
-            .review_token;
-        handle_approve_draft_chunk(
-            &state,
-            authed_request(ApproveDraftChunkRequest {
-                request_id: String::new(),
-                sandbox: "reject-approved-race".to_string(),
-                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
-                chunk_id: chunk_id.clone(),
-                review_token,
-            }),
-        )
-        .await
-        .unwrap();
+        approve_example_chunk(&state, "reject-approved-race", &chunk_id).await;
 
-        let (results, events) = capture_ocsf_jsonl(futures::future::join_all((0..8).map(|_| {
+        let (results, events) = capture_ocsf_events(futures::future::join_all((0..8).map(|_| {
             crate::persistence::lock_order::branch(handle_reject_draft_chunk(
                 &state,
                 authed_request(RejectDraftChunkRequest {
@@ -22559,27 +22554,9 @@ mod tests {
         let state = test_server_state().await;
         seed_ready_sandbox(&state, "undo-audit").await;
         let chunk_id = submit_example_chunk(&state, "undo-audit", "agent_authored").await;
-        let review_token = state
-            .store
-            .get_draft_chunk(&chunk_id)
-            .await
-            .unwrap()
-            .unwrap()
-            .review_token;
-        handle_approve_draft_chunk(
-            &state,
-            authed_request(ApproveDraftChunkRequest {
-                request_id: String::new(),
-                sandbox: "undo-audit".to_string(),
-                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
-                chunk_id: chunk_id.clone(),
-                review_token,
-            }),
-        )
-        .await
-        .unwrap();
+        approve_example_chunk(&state, "undo-audit", &chunk_id).await;
 
-        let (result, events) = capture_ocsf_jsonl(Box::pin(handle_undo_draft_chunk(
+        let (result, events) = capture_ocsf_events(Box::pin(handle_undo_draft_chunk(
             &state,
             authed_request(UndoDraftChunkRequest {
                 request_id: String::new(),
@@ -22609,7 +22586,7 @@ mod tests {
         seed_ready_sandbox(&state, "auto-approve-audit").await;
         seed_sandbox_approval_mode(&state, "auto-approve-audit", "auto").await;
 
-        let (chunk_id, events) = capture_ocsf_jsonl(submit_example_chunk(
+        let (chunk_id, events) = capture_ocsf_events(submit_example_chunk(
             &state,
             "auto-approve-audit",
             "agent_authored",
@@ -22635,7 +22612,7 @@ mod tests {
         seed_sandbox_approval_mode(&state, "auto-approve-unknown-mode", "auto").await;
         let hostile_mode = "future\nmode\rSENTINEL_ANALYSIS_MODE_SECRET";
 
-        let (chunk_id, events) = capture_ocsf_jsonl(submit_example_chunk(
+        let (chunk_id, events) = capture_ocsf_events(submit_example_chunk(
             &state,
             "auto-approve-unknown-mode",
             hostile_mode,
@@ -22657,7 +22634,7 @@ mod tests {
         seed_ready_sandbox(&state, "supersede-audit").await;
         let older = submit_example_chunk(&state, "supersede-audit", "mechanistic").await;
 
-        let (_newer, events) = capture_ocsf_jsonl(submit_example_chunk(
+        let (_newer, events) = capture_ocsf_events(submit_example_chunk(
             &state,
             "supersede-audit",
             "agent_authored",
@@ -22709,7 +22686,7 @@ mod tests {
             .await
             .unwrap();
 
-        let ((), events) = capture_ocsf_jsonl(Box::pin(async {
+        let ((), events) = capture_ocsf_events(Box::pin(async {
             tokio::join!(
                 crate::persistence::lock_order::branch(async {
                     let _guard = state
@@ -22792,7 +22769,7 @@ mod tests {
             .unwrap();
         let barrier = Arc::new(tokio::sync::Barrier::new(2));
 
-        let ((approve, reconciled), events) = capture_ocsf_jsonl(Box::pin(async {
+        let ((approve, reconciled), events) = capture_ocsf_events(Box::pin(async {
             tokio::join!(
                 crate::persistence::lock_order::branch(async {
                     barrier.wait().await;
@@ -22883,7 +22860,7 @@ mod tests {
             .unwrap();
         let barrier = Arc::new(tokio::sync::Barrier::new(2));
 
-        let ((auto_approve, reconciled), events) = capture_ocsf_jsonl(Box::pin(async {
+        let ((auto_approve, reconciled), events) = capture_ocsf_events(Box::pin(async {
             tokio::join!(
                 crate::persistence::lock_order::branch(async {
                     barrier.wait().await;
@@ -22981,7 +22958,7 @@ mod tests {
             .unwrap();
         let barrier = Arc::new(tokio::sync::Barrier::new(2));
 
-        let ((undo, reconciled), events) = capture_ocsf_jsonl(Box::pin(async {
+        let ((undo, reconciled), events) = capture_ocsf_events(Box::pin(async {
             tokio::join!(
                 crate::persistence::lock_order::branch(async {
                     barrier.wait().await;
@@ -23054,7 +23031,7 @@ mod tests {
             .unwrap();
         let barrier = Arc::new(tokio::sync::Barrier::new(2));
 
-        let ((bulk, submit), events) = capture_ocsf_jsonl(Box::pin(async {
+        let ((bulk, submit), events) = capture_ocsf_events(Box::pin(async {
             tokio::join!(
                 crate::persistence::lock_order::branch(async {
                     barrier.wait().await;
@@ -23147,7 +23124,7 @@ mod tests {
             .unwrap();
         let barrier = Arc::new(tokio::sync::Barrier::new(2));
 
-        let ((clear, approve), events) = capture_ocsf_jsonl(Box::pin(async {
+        let ((clear, approve), events) = capture_ocsf_events(Box::pin(async {
             tokio::join!(
                 crate::persistence::lock_order::branch(async {
                     barrier.wait().await;
@@ -23290,7 +23267,7 @@ mod tests {
         let mut edited_rule = decode_draft_chunk_rule(&chunk).unwrap().unwrap();
         edited_rule.endpoints[0].host = "edited-lifecycle.example.com".to_string();
 
-        let (edit_result, edit_events) = capture_ocsf_jsonl(Box::pin(handle_edit_draft_chunk(
+        let (edit_result, edit_events) = capture_ocsf_events(Box::pin(handle_edit_draft_chunk(
             &state,
             authed_request(EditDraftChunkRequest {
                 request_id: String::new(),
@@ -23311,7 +23288,7 @@ mod tests {
                 .contains("edited-lifecycle.example.com")
         );
 
-        let (clear_result, clear_events) = capture_ocsf_jsonl(handle_clear_draft_chunks(
+        let (clear_result, clear_events) = capture_ocsf_events(handle_clear_draft_chunks(
             &state,
             authed_request(ClearDraftChunksRequest {
                 request_id: String::new(),
@@ -23344,7 +23321,7 @@ mod tests {
         edited_rule.endpoints[0].host = "edited-race.example.com".to_string();
         let barrier = Arc::new(tokio::sync::Barrier::new(2));
 
-        let ((edit, approve), events) = capture_ocsf_jsonl(Box::pin(async {
+        let ((edit, approve), events) = capture_ocsf_events(Box::pin(async {
             tokio::join!(
                 crate::persistence::lock_order::branch(async {
                     barrier.wait().await;
@@ -23435,7 +23412,7 @@ mod tests {
         let _approved = submit_example_chunk(&state, "covered-audit", "agent_authored").await;
 
         let (incoming, events) =
-            capture_ocsf_jsonl(submit_example_chunk(&state, "covered-audit", "mechanistic")).await;
+            capture_ocsf_events(submit_example_chunk(&state, "covered-audit", "mechanistic")).await;
 
         let rejected = rejected_events(&events);
         assert_eq!(rejected.len(), 1, "events: {events:?}");
@@ -23462,7 +23439,7 @@ mod tests {
         chunk.host.clone_from(&hostile);
         chunk.binary.clone_from(&hostile);
 
-        let ((), events) = capture_ocsf_jsonl(async {
+        let ((), events) = capture_ocsf_events(async {
             emit_gateway_policy_reject_audit_log(
                 &sandbox,
                 &chunk,
