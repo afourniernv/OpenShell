@@ -78,3 +78,7 @@ one correlated OCSF aggregate for each completed phase. Middleware names,
 configuration, findings, failure reasons, headers, and bodies remain outside
 the correlated aggregate; existing detailed middleware events retain their
 independent security-log lifecycle.
+
+HTTP response diagnostics use a session-wide budget. Exhausting routine
+diagnostic capacity does not skip body processing or consume the separate
+terminal-invocation reserve. Routine records are constructed only when admitted.

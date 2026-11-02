@@ -224,9 +224,9 @@ impl HttpResponseDiagnosticBudget {
         true
     }
 
-    fn retain_invocation(&mut self, invocation: &HttpResponseInvocation) -> bool {
+    fn retain_invocation(&mut self, outcome: HttpResponseInvocationOutcome) -> bool {
         let routine = matches!(
-            invocation.outcome,
+            outcome,
             HttpResponseInvocationOutcome::PassThrough | HttpResponseInvocationOutcome::Transform
         );
         let (count, limit) = if routine {
@@ -363,7 +363,7 @@ impl HttpResponseSession {
     }
 
     fn record_invocation(&mut self, invocation: HttpResponseInvocation) {
-        if self.diagnostic_budget.retain_invocation(&invocation) {
+        if self.diagnostic_budget.retain_invocation(invocation.outcome) {
             self.invocations.push(invocation);
         }
     }
@@ -767,40 +767,11 @@ impl HttpResponseSession {
             Some(&mut self.diagnostic_budget),
         );
         let reason_code = (!decision.reason_code.is_empty()).then_some(decision.reason_code);
-        match decision.action {
-            BodyAction::PassThrough => {
-                let output_size = original.len();
-                let invocation = body_invocation_with_reason(
-                    &self.stages[index],
-                    HttpResponseInvocationOutcome::PassThrough,
-                    sequence,
-                    input_size,
-                    output_size,
-                    false,
-                    reason_code,
-                );
-                self.record_invocation(invocation);
-                Ok((!original.is_empty())
-                    .then_some(original)
-                    .into_iter()
-                    .collect())
-            }
+        let (output, outcome) = match decision.action {
+            BodyAction::PassThrough => (original, HttpResponseInvocationOutcome::PassThrough),
             BodyAction::Transform(replacement) => {
                 self.body_transformed = true;
-                let invocation = body_invocation_with_reason(
-                    &self.stages[index],
-                    HttpResponseInvocationOutcome::Transform,
-                    sequence,
-                    input_size,
-                    replacement.len(),
-                    true,
-                    reason_code,
-                );
-                self.record_invocation(invocation);
-                Ok((!replacement.is_empty())
-                    .then_some(replacement)
-                    .into_iter()
-                    .collect())
+                (replacement, HttpResponseInvocationOutcome::Transform)
             }
             BodyAction::SkipRemaining(action) => {
                 let transformed = matches!(&action, CurrentBodyAction::Transform(_));
@@ -828,7 +799,7 @@ impl HttpResponseSession {
                 };
                 self.record_invocation(invocation);
                 self.release_admission_if_idle();
-                Ok((!output.is_empty()).then_some(output).into_iter().collect())
+                return Ok((!output.is_empty()).then_some(output).into_iter().collect());
             }
             BodyAction::BlockDelivery => {
                 let stage = &self.stages[index];
@@ -846,7 +817,7 @@ impl HttpResponseSession {
                 self.record_invocation(invocation);
                 self.end_all(MiddlewareSessionEndReason::MiddlewareDenial)
                     .await;
-                Err(HttpResponseMiddlewareFailure {
+                return Err(HttpResponseMiddlewareFailure {
                     reason: denial_reason,
                     denial: Some(super::MiddlewareDenial {
                         config_name,
@@ -854,9 +825,21 @@ impl HttpResponseSession {
                     }),
                     kind: HttpResponseMiddlewareFailureKind::Processing,
                     diagnostics: HttpResponseDiagnostics::default(),
-                })
+                });
             }
+        };
+        if self.diagnostic_budget.retain_invocation(outcome) {
+            self.invocations.push(body_invocation_with_reason(
+                &self.stages[index],
+                outcome,
+                sequence,
+                input_size,
+                output.len(),
+                outcome == HttpResponseInvocationOutcome::Transform,
+                reason_code,
+            ));
         }
+        Ok((!output.is_empty()).then_some(output).into_iter().collect())
     }
 
     async fn handle_stage_failure(
@@ -1698,7 +1681,7 @@ mod tests {
                                 .expect("test sequence fits in usize");
                             let diagnostic_budget_exhausted =
                                 matches!(selected_script, Script::DiagnosticBudget)
-                                    && diagnostic_sequence > MAX_MIDDLEWARE_CHAIN_FINDINGS;
+                                    && diagnostic_sequence > MAX_MIDDLEWARE_CHAIN_FINDINGS + 2;
                             let replacement = match selected_script {
                                 Script::Expansion => vec![b'x'; 128 * 1024],
                                 Script::DeleteBody => Vec::new(),
@@ -1735,7 +1718,9 @@ mod tests {
                                 http_response_body_result::Action::BlockDelivery(
                                     openshell_core::proto::HttpResponseBlockDelivery {},
                                 )
-                            } else if matches!(selected_script, Script::DiagnosticBudget) {
+                            } else if matches!(selected_script, Script::DiagnosticBudget)
+                                && !diagnostic_sequence.is_multiple_of(2)
+                            {
                                 http_response_body_result::Action::PassThrough(
                                     HttpResponseBodyPassThrough {},
                                 )
@@ -2938,22 +2923,6 @@ mod tests {
         }
     }
 
-    fn budget_invocation(outcome: HttpResponseInvocationOutcome) -> HttpResponseInvocation {
-        HttpResponseInvocation {
-            config_name: "response-filter".into(),
-            implementation: "test/response-filter".into(),
-            outcome,
-            sequence: Some(1),
-            input_size: 1,
-            output_size: Some(1),
-            transformed: false,
-            failed: false,
-            stage_disabled: false,
-            reason_code: None,
-            failure_category: None,
-        }
-    }
-
     #[test]
     fn response_diagnostic_budget_deduplicates_findings_and_signals_once() {
         let mut budget = HttpResponseDiagnosticBudget::default();
@@ -2995,17 +2964,18 @@ mod tests {
     #[test]
     fn response_diagnostic_budget_preserves_terminal_invocations() {
         let mut budget = HttpResponseDiagnosticBudget::default();
-        let routine = budget_invocation(HttpResponseInvocationOutcome::PassThrough);
+        let routine = HttpResponseInvocationOutcome::PassThrough;
         for _ in 0..MAX_MIDDLEWARE_CHAIN_FINDINGS {
-            assert!(budget.retain_invocation(&routine));
+            assert!(budget.retain_invocation(routine));
         }
-        assert!(!budget.retain_invocation(&routine));
+        assert!(!budget.retain_invocation(routine));
+        assert!(!budget.retain_invocation(HttpResponseInvocationOutcome::Transform));
 
-        let terminal = budget_invocation(HttpResponseInvocationOutcome::BlockDelivery);
+        let terminal = HttpResponseInvocationOutcome::BlockDelivery;
         for _ in 0..MAX_MIDDLEWARE_CHAIN_STAGES {
-            assert!(budget.retain_invocation(&terminal));
+            assert!(budget.retain_invocation(terminal));
         }
-        assert!(!budget.retain_invocation(&terminal));
+        assert!(!budget.retain_invocation(terminal));
         assert!(budget.take_truncation_signal());
     }
 
@@ -3022,20 +2992,30 @@ mod tests {
         let mut emitted_findings = preflight.findings.len();
         let mut emitted_routine_invocations = 0;
         let mut truncation_signals = 0;
+        let mut blocked = false;
         let mut session = preflight.session.take().expect("streaming session");
 
-        for sequence in 1..=MAX_MIDDLEWARE_CHAIN_FINDINGS + 1 {
+        for sequence in 1..=MAX_MIDDLEWARE_CHAIN_FINDINGS + 3 {
             match session.push_body(vec![b'x']).await {
                 Ok(body) => {
-                    assert_eq!(body, vec![vec![b'x']]);
+                    let expected = if sequence.is_multiple_of(2) {
+                        b'X'
+                    } else {
+                        b'x'
+                    };
+                    assert_eq!(body, vec![vec![expected]]);
                     let diagnostics = session.take_diagnostics();
+                    if sequence > MAX_MIDDLEWARE_CHAIN_FINDINGS {
+                        assert!(diagnostics.invocations.is_empty());
+                    }
                     emitted_findings += diagnostics.findings.len();
                     emitted_routine_invocations += diagnostics.invocations.len();
                     truncation_signals += usize::from(diagnostics.diagnostics_truncated);
                 }
                 Err(failure) => {
-                    assert_eq!(sequence, MAX_MIDDLEWARE_CHAIN_FINDINGS + 1);
+                    assert_eq!(sequence, MAX_MIDDLEWARE_CHAIN_FINDINGS + 3);
                     assert!(failure.denial.is_some());
+                    blocked = true;
                     let diagnostics = session.take_diagnostics();
                     emitted_findings += diagnostics.findings.len();
                     truncation_signals += usize::from(diagnostics.diagnostics_truncated);
@@ -3048,6 +3028,10 @@ mod tests {
             }
         }
 
+        assert!(
+            blocked,
+            "middleware still blocks after diagnostics are exhausted"
+        );
         assert_eq!(emitted_findings, MAX_MIDDLEWARE_CHAIN_FINDINGS);
         assert_eq!(emitted_routine_invocations, MAX_MIDDLEWARE_CHAIN_FINDINGS);
         assert_eq!(truncation_signals, 1);
