@@ -65,6 +65,11 @@ platform failure. An unfinished request is reported as incomplete. The
 attributes never include credentials, query values, or request and response
 bodies.
 
+Resource identities are pinned on their first valid observation. Correlated
+OCSF events borrow that state while copying their own fields, then release the
+state lock before tracing dispatch. Revisions are exported as decimal strings
+to preserve the full `u64` range.
+
 When Supervisor Middleware is selected, the same span records separate bounded
 request- and response-phase outcomes. Each phase reports whether middleware
 allowed or denied the exchange, failed internally, mutated traffic, followed a

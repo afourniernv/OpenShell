@@ -116,21 +116,20 @@ struct ResponseDeliverySnapshot {
     error_stage: Option<&'static str>,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Debug, Default, PartialEq, Eq)]
 struct ResourceCorrelationState {
-    sandbox_id: Option<String>,
-    policy_runtime_generation: Option<String>,
+    policy_runtime_generation: Option<u64>,
     policy_endpoint: Option<PolicyEndpointResources>,
     provider_credential: Option<ProviderCredentialResources>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 struct PolicyEndpointResources {
     policy_hash: String,
     endpoint_id: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 struct ProviderCredentialResources {
     environment_revision: String,
     installation_id: String,
@@ -463,7 +462,7 @@ impl RequestCorrelation {
 
     fn build(request: &L7Request, ctx: &L7EvalContext, request_id: String) -> Self {
         let method = bounded_http_method(&request.action);
-        let sandbox_id = openshell_ocsf::ctx::ctx().sandbox_id.clone();
+        let sandbox_context = openshell_ocsf::ctx::ctx();
         let span = tracing::info_span!(
             "openshell.http.enforcement",
             "openshell.request.id" = %request_id,
@@ -523,17 +522,14 @@ impl RequestCorrelation {
         );
         let headers = trace_headers(&request.raw_header);
         let _ = openshell_otel::set_parent_from_headers(&span, &headers);
-        if !sandbox_id.is_empty() {
-            span.record("openshell.sandbox.id", sandbox_id.as_str());
+        if !sandbox_context.sandbox_id.is_empty() {
+            span.record("openshell.sandbox.id", sandbox_context.sandbox_id.as_str());
         }
         Self {
             request_id,
             span,
             completed: AtomicBool::new(false),
-            resources: Mutex::new(ResourceCorrelationState {
-                sandbox_id: (!sandbox_id.is_empty()).then_some(sandbox_id),
-                ..Default::default()
-            }),
+            resources: Mutex::new(ResourceCorrelationState::default()),
             jsonrpc: Mutex::new(JsonRpcCorrelationState::default()),
             middleware_context: MiddlewareEventContext {
                 method,
@@ -614,86 +610,69 @@ impl RequestCorrelation {
     }
 
     pub(crate) fn record_policy_runtime_generation(&self, generation: u64) {
-        let generation = generation.to_string();
-        let recorded = {
+        {
             let mut resources = self
                 .resources
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             if resources.policy_runtime_generation.is_some() {
-                false
-            } else {
-                resources.policy_runtime_generation = Some(generation.clone());
-                true
+                return;
             }
-        };
-        if recorded {
-            self.span
-                .record("openshell.policy.runtime_generation", generation.as_str());
+            resources.policy_runtime_generation = Some(generation);
         }
+        self.span.record(
+            "openshell.policy.runtime_generation",
+            tracing::field::display(generation),
+        );
     }
 
     pub(crate) fn record_selected_policy_endpoint(&self, policy_hash: &str, endpoint_id: &str) {
-        let Some(policy_endpoint) = policy_endpoint_resources(policy_hash, endpoint_id) else {
-            return;
-        };
-        let recorded = {
+        {
             let mut resources = self
                 .resources
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             if resources.policy_endpoint.is_some() {
-                false
-            } else {
-                resources.policy_endpoint = Some(policy_endpoint.clone());
-                true
+                return;
             }
-        };
-        if recorded {
-            self.span.record(
-                "openshell.policy.hash",
-                policy_endpoint.policy_hash.as_str(),
-            );
-            self.span.record(
-                "openshell.endpoint.id",
-                policy_endpoint.endpoint_id.as_str(),
-            );
+            let Some(policy_endpoint) = policy_endpoint_resources(policy_hash, endpoint_id) else {
+                return;
+            };
+            resources.policy_endpoint = Some(policy_endpoint);
         }
+        self.span.record("openshell.policy.hash", policy_hash);
+        self.span.record("openshell.endpoint.id", endpoint_id);
     }
 
     pub(crate) fn record_provider_credential_snapshot(
         &self,
         snapshot: &openshell_core::provider_credentials::ProviderCredentialSnapshot,
     ) {
-        let Ok(installation_id) = uuid::Uuid::parse_str(&snapshot.installation_id) else {
-            return;
-        };
-        let provider_credential = ProviderCredentialResources {
-            environment_revision: snapshot.revision.to_string(),
-            installation_id: installation_id.hyphenated().to_string(),
-        };
-        let recorded = {
+        let installation_id = {
             let mut resources = self
                 .resources
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             if resources.provider_credential.is_some() {
-                false
-            } else {
-                resources.provider_credential = Some(provider_credential.clone());
-                true
+                return;
             }
+            let Ok(installation_id) = uuid::Uuid::parse_str(&snapshot.installation_id) else {
+                return;
+            };
+            resources.provider_credential = Some(ProviderCredentialResources {
+                environment_revision: snapshot.revision.to_string(),
+                installation_id: installation_id.hyphenated().to_string(),
+            });
+            installation_id
         };
-        if recorded {
-            self.span.record(
-                "openshell.provider.environment.revision",
-                provider_credential.environment_revision.as_str(),
-            );
-            self.span.record(
-                "openshell.provider.credential.installation.id",
-                provider_credential.installation_id.as_str(),
-            );
-        }
+        self.span.record(
+            "openshell.provider.environment.revision",
+            tracing::field::display(snapshot.revision),
+        );
+        self.span.record(
+            "openshell.provider.credential.installation.id",
+            tracing::field::display(installation_id.hyphenated()),
+        );
     }
 
     pub(crate) fn record_effective_jsonrpc_summary(
@@ -1127,12 +1106,13 @@ impl RequestCorrelation {
 
     pub(crate) fn emit(&self, mut event: OcsfEvent) {
         event.set_correlation_uid(self.request_id.clone());
-        let resources = self
-            .resources
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone();
-        add_resource_fields(&mut event, &resources);
+        {
+            let resources = self
+                .resources
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            add_resource_fields(&mut event, &resources);
+        }
         openshell_otel::with_span_context(&self.span, || {
             self.span.in_scope(|| ocsf_emit!(event));
         });
@@ -1173,8 +1153,8 @@ fn is_lower_hex_digest(value: &str) -> bool {
 }
 
 fn add_resource_fields(event: &mut OcsfEvent, resources: &ResourceCorrelationState) {
-    if let Some(generation) = resources.policy_runtime_generation.as_deref() {
-        event.add_unmapped("policy_runtime_generation", generation);
+    if let Some(generation) = resources.policy_runtime_generation {
+        event.add_unmapped("policy_runtime_generation", generation.to_string());
     }
     if let Some(policy_endpoint) = &resources.policy_endpoint {
         event.add_unmapped("policy_hash", policy_endpoint.policy_hash.clone());
@@ -1881,6 +1861,17 @@ mod tests {
             .find(|span| span.name == "openshell.http.enforcement")
             .expect("HTTP enforcement span");
         assert_eq!(span.dropped_attributes_count, 0);
+        for key in [
+            "openshell.policy.runtime_generation",
+            "openshell.provider.environment.revision",
+        ] {
+            let attribute = span
+                .attributes
+                .iter()
+                .find(|attribute| attribute.key.as_str() == key)
+                .expect("revision attribute");
+            assert_eq!(attribute.value, u64::MAX.to_string().into());
+        }
         let raw_keys = span
             .attributes
             .iter()
