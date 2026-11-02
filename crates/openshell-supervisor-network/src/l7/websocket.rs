@@ -830,7 +830,7 @@ where
                             unreachable!("validated binary continuation state")
                         };
                         if let Some(ctx) = options.middleware_context {
-                            crate::l7::middleware::emit_websocket_coverage(ctx, &coverage);
+                            crate::l7::middleware::emit_websocket_coverage(ctx, &coverage, None);
                         }
                     }
                 } else {
@@ -871,7 +871,7 @@ where
                 if frame.fin
                     && let Some(ctx) = options.middleware_context
                 {
-                    crate::l7::middleware::emit_websocket_coverage(ctx, &coverage);
+                    crate::l7::middleware::emit_websocket_coverage(ctx, &coverage, None);
                 } else if !frame.fin {
                     fragments = FragmentState::Binary {
                         fragment_count: 1,

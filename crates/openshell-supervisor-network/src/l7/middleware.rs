@@ -200,7 +200,7 @@ pub fn emit_websocket_preflight_events(
     correlation: Option<&RequestCorrelation>,
 ) {
     emit_websocket_invocations(ctx, &outcome.invocations, correlation);
-    emit_websocket_coverage_correlated(ctx, &outcome.coverage, correlation);
+    emit_websocket_coverage(ctx, &outcome.coverage, correlation);
     for event in websocket_preflight_finding_events(outcome) {
         emit_ocsf(correlation, event);
     }
@@ -213,13 +213,6 @@ pub fn emit_websocket_preflight_events(
 }
 
 pub(super) fn emit_websocket_coverage(
-    ctx: &L7EvalContext,
-    coverage: &[openshell_supervisor_middleware::WebSocketCoverage],
-) {
-    emit_websocket_coverage_correlated(ctx, coverage, None);
-}
-
-fn emit_websocket_coverage_correlated(
     ctx: &L7EvalContext,
     coverage: &[openshell_supervisor_middleware::WebSocketCoverage],
     correlation: Option<&RequestCorrelation>,
@@ -645,11 +638,7 @@ pub async fn apply_middleware_chain_for_scheme_with_request_id<
             openshell_supervisor_middleware::TransformedBodyPolicy::NotPolicyRelevant,
             admission,
         );
-        let outcome = if let Some(correlation) = correlation {
-            correlation.within_span(evaluation).await?
-        } else {
-            evaluation.await?
-        };
+        let outcome = RequestCorrelation::within_span(correlation, evaluation).await?;
         observe_request_chain_outcome(correlation, &outcome);
         emit_middleware_events(ctx, &req, &outcome, correlation);
         return Ok(if outcome.allowed {
@@ -675,8 +664,7 @@ pub async fn apply_middleware_chain_for_scheme_with_request_id<
     {
         crate::l7::rest::BufferResult::Buffered(buffered) => buffered,
         crate::l7::rest::BufferResult::OverCapacity { recoverable } => {
-            let result =
-                resolve_unbuffered_body_correlated(ctx, req, &chain, recoverable, correlation);
+            let result = resolve_unbuffered_body(ctx, req, &chain, recoverable, correlation);
             observe_unbuffered_request_outcome(correlation, &chain, &result);
             return Ok(result);
         }
@@ -703,11 +691,7 @@ pub async fn apply_middleware_chain_for_scheme_with_request_id<
         transformed_body_policy,
         Some(admission),
     );
-    let outcome = if let Some(correlation) = correlation {
-        correlation.within_span(evaluation).await?
-    } else {
-        evaluation.await?
-    };
+    let outcome = RequestCorrelation::within_span(correlation, evaluation).await?;
     observe_request_chain_outcome(correlation, &outcome);
     emit_middleware_events(ctx, &req, &outcome, correlation);
     if !outcome.allowed {
@@ -930,17 +914,7 @@ pub(super) fn raw_query_from_request_headers(headers: &[u8]) -> Result<String> {
 /// would individually fail with `request_body_over_capacity`; the aggregate is
 /// a deny unless every attached middleware is `fail_open`, and passing the
 /// body through is only safe when no bytes were consumed.
-#[cfg(test)]
 pub(super) fn resolve_unbuffered_body(
-    ctx: &L7EvalContext,
-    req: crate::l7::provider::L7Request,
-    chain: &[openshell_supervisor_middleware::DescribedChainEntry],
-    recoverable: bool,
-) -> MiddlewareApplyResult {
-    resolve_unbuffered_body_correlated(ctx, req, chain, recoverable, None)
-}
-
-fn resolve_unbuffered_body_correlated(
     ctx: &L7EvalContext,
     req: crate::l7::provider::L7Request,
     chain: &[openshell_supervisor_middleware::DescribedChainEntry],

@@ -548,11 +548,14 @@ impl RequestCorrelation {
         &self.request_id
     }
 
-    pub(crate) async fn within_span<F>(&self, future: F) -> F::Output
+    pub(crate) async fn within_span<F>(correlation: Option<&Self>, future: F) -> F::Output
     where
         F: Future,
     {
-        future.instrument(self.span.clone()).await
+        match correlation {
+            Some(correlation) => future.instrument(correlation.span.clone()).await,
+            None => future.await,
+        }
     }
 
     pub(crate) fn record_policy_decision(&self, decision: &str) {
@@ -1578,21 +1581,35 @@ mod tests {
                     ..Default::default()
                 },
             );
-            let expected = correlation.span.id().expect("request span has an id");
-            let mut yielded = false;
-            let current = futures::executor::block_on(correlation.within_span(
-                futures::future::poll_fn(|cx| {
-                    if yielded {
-                        std::task::Poll::Ready(tracing::Span::current().id())
+            let request_span_id = correlation.span.id().expect("request span has an id");
+            let ambient = tracing::info_span!("ambient");
+            let ambient_span_id = ambient.id().expect("ambient span has an id");
+            ambient.in_scope(|| {
+                for selected in [Some(&correlation), None] {
+                    let expected = Some(if selected.is_some() {
+                        request_span_id.clone()
                     } else {
-                        yielded = true;
-                        cx.waker().wake_by_ref();
-                        std::task::Poll::Pending
-                    }
-                }),
-            ));
+                        ambient_span_id.clone()
+                    });
+                    let mut yielded = false;
+                    let current = futures::executor::block_on(RequestCorrelation::within_span(
+                        selected,
+                        futures::future::poll_fn(|cx| {
+                            assert_eq!(tracing::Span::current().id(), expected);
+                            if yielded {
+                                std::task::Poll::Ready(tracing::Span::current().id())
+                            } else {
+                                yielded = true;
+                                cx.waker().wake_by_ref();
+                                std::task::Poll::Pending
+                            }
+                        }),
+                    ));
 
-            assert_eq!(current, Some(expected));
+                    assert_eq!(current, expected);
+                    assert_eq!(tracing::Span::current().id(), ambient.id());
+                }
+            });
         });
     }
 

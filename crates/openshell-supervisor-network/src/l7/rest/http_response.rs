@@ -923,11 +923,7 @@ where
         let preflight = middleware
             .runner
             .preflight_described_http_response(described, input);
-        if let Some(correlation) = response_correlation {
-            correlation.within_span(preflight).await
-        } else {
-            preflight.await
-        }
+        RequestCorrelation::within_span(response_correlation, preflight).await
     } else {
         Ok(middleware
             .runner

@@ -2209,11 +2209,7 @@ pub(crate) async fn websocket_middleware_preflight(
         correlation.map(RequestCorrelation::request_id),
     );
     let preflight = runner.preflight_websocket(chain, input);
-    if let Some(correlation) = correlation {
-        correlation.within_span(preflight).await
-    } else {
-        preflight.await
-    }
+    RequestCorrelation::within_span(correlation, preflight).await
 }
 
 /// Build the WebSocket preflight input from the sandbox and evaluation
@@ -7754,18 +7750,18 @@ network_policies:
         // Recoverable (Content-Length over cap, nothing consumed) + all fail-open
         // -> stream through unprocessed.
         assert!(matches!(
-            resolve_unbuffered_body(&ctx, req(), &open_chain, true),
+            resolve_unbuffered_body(&ctx, req(), &open_chain, true, None),
             MiddlewareApplyResult::Allowed(_)
         ));
         // Any fail-closed entry -> deny.
         assert!(matches!(
-            resolve_unbuffered_body(&ctx, req(), &mixed_chain, true),
+            resolve_unbuffered_body(&ctx, req(), &mixed_chain, true, None),
             MiddlewareApplyResult::Denied { .. }
         ));
         // Not recoverable (chunked overflow already consumed bytes) -> deny even
         // when every entry is fail-open.
         assert!(matches!(
-            resolve_unbuffered_body(&ctx, req(), &open_chain, false),
+            resolve_unbuffered_body(&ctx, req(), &open_chain, false, None),
             MiddlewareApplyResult::Denied { .. }
         ));
     }

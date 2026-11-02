@@ -27,7 +27,6 @@ tracing = { workspace = true }
 [dev-dependencies]
 openshell-supervisor-middleware-builtins = { path = "../openshell-supervisor-middleware-builtins" }
 tokio-stream = { workspace = true, features = ["net"] }
-tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 
 [lints]
