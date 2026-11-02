@@ -1549,6 +1549,20 @@ fn trim_optional_whitespace(mut value: &[u8]) -> &[u8] {
 mod tests {
     use super::*;
 
+    fn span_attributes(
+        span: opentelemetry_sdk::trace::SpanData,
+    ) -> std::collections::BTreeMap<String, String> {
+        span.attributes
+            .into_iter()
+            .map(|attribute| {
+                (
+                    attribute.key.as_str().to_string(),
+                    attribute.value.to_string(),
+                )
+            })
+            .collect()
+    }
+
     fn request() -> L7Request {
         L7Request {
             action: "GET".into(),
@@ -1903,16 +1917,7 @@ mod tests {
             raw_keys.iter().copied().collect::<BTreeSet<_>>().len(),
             "OTLP span must contain each attribute key exactly once"
         );
-        let attributes = span
-            .attributes
-            .into_iter()
-            .map(|attribute| {
-                (
-                    attribute.key.as_str().to_string(),
-                    attribute.value.to_string(),
-                )
-            })
-            .collect::<std::collections::BTreeMap<_, _>>();
+        let attributes = span_attributes(span);
         assert_eq!(attributes["openshell.sandbox.id"], "sandbox-resource-test");
         assert_eq!(
             attributes["openshell.policy.runtime_generation"],
@@ -2013,16 +2018,7 @@ mod tests {
             .into_iter()
             .find(|span| span.name == "openshell.http.enforcement")
             .expect("HTTP enforcement span");
-        let attributes = span
-            .attributes
-            .into_iter()
-            .map(|attribute| {
-                (
-                    attribute.key.as_str().to_string(),
-                    attribute.value.to_string(),
-                )
-            })
-            .collect::<std::collections::BTreeMap<_, _>>();
+        let attributes = span_attributes(span);
         assert_eq!(attributes["openshell.policy.hash"], valid_policy_hash);
         assert_eq!(attributes["openshell.endpoint.id"], valid_endpoint_id);
         assert_eq!(attributes["openshell.provider.environment.revision"], "42");
@@ -2155,7 +2151,7 @@ mod tests {
             .iter()
             .find(|attribute| attribute.key.as_str() == "openshell.jsonrpc.effective.call_count")
             .expect("call count attribute");
-        assert_eq!(format!("{:?}", call_count.value), "I64(64)");
+        assert_eq!(call_count.value, 64_i64.into());
         let notification_count = span
             .attributes
             .iter()
@@ -2163,17 +2159,8 @@ mod tests {
                 attribute.key.as_str() == "openshell.jsonrpc.effective.notification_count"
             })
             .expect("notification count attribute");
-        assert_eq!(format!("{:?}", notification_count.value), "I64(64)");
-        let attributes = span
-            .attributes
-            .into_iter()
-            .map(|attribute| {
-                (
-                    attribute.key.as_str().to_string(),
-                    attribute.value.to_string(),
-                )
-            })
-            .collect::<std::collections::BTreeMap<_, _>>();
+        assert_eq!(notification_count.value, 64_i64.into());
+        let attributes = span_attributes(span);
 
         assert_eq!(attributes["openshell.l7.protocol"], "mcp");
         assert_eq!(
@@ -2291,17 +2278,8 @@ mod tests {
             .iter()
             .find(|attribute| attribute.key.as_str() == "openshell.jsonrpc.effective.call_count")
             .expect("call count attribute");
-        assert_eq!(format!("{:?}", call_count.value), "I64(0)");
-        let attributes = span
-            .attributes
-            .into_iter()
-            .map(|attribute| {
-                (
-                    attribute.key.as_str().to_string(),
-                    attribute.value.to_string(),
-                )
-            })
-            .collect::<std::collections::BTreeMap<_, _>>();
+        assert_eq!(call_count.value, 0_i64.into());
+        let attributes = span_attributes(span);
 
         assert_eq!(
             attributes["openshell.jsonrpc.effective.inspection_outcome"],
@@ -2434,16 +2412,7 @@ mod tests {
             .into_iter()
             .find(|span| span.name == "openshell.http.enforcement")
             .expect("HTTP enforcement span");
-        let attributes = span
-            .attributes
-            .into_iter()
-            .map(|attribute| {
-                (
-                    attribute.key.as_str().to_string(),
-                    attribute.value.to_string(),
-                )
-            })
-            .collect::<std::collections::BTreeMap<_, _>>();
+        let attributes = span_attributes(span);
         assert_eq!(attributes["openshell.middleware.request.outcome"], "denied");
         assert_eq!(attributes["openshell.middleware.request.mutated"], "true");
         assert_eq!(attributes["openshell.middleware.request.fail_open"], "true");
@@ -2515,16 +2484,7 @@ mod tests {
             .into_iter()
             .find(|span| span.name == "openshell.http.enforcement")
             .expect("HTTP enforcement span");
-        let attributes = span
-            .attributes
-            .into_iter()
-            .map(|attribute| {
-                (
-                    attribute.key.as_str().to_string(),
-                    attribute.value.to_string(),
-                )
-            })
-            .collect::<std::collections::BTreeMap<_, _>>();
+        let attributes = span_attributes(span);
         assert_eq!(
             attributes["openshell.middleware.response.outcome"],
             "incomplete"
@@ -2593,16 +2553,7 @@ mod tests {
             .into_iter()
             .find(|span| span.name == "openshell.http.enforcement")
             .expect("HTTP enforcement span");
-        let attributes = span
-            .attributes
-            .into_iter()
-            .map(|attribute| {
-                (
-                    attribute.key.as_str().to_string(),
-                    attribute.value.to_string(),
-                )
-            })
-            .collect::<std::collections::BTreeMap<_, _>>();
+        let attributes = span_attributes(span);
         assert_eq!(
             attributes["openshell.middleware.response.delivery_started"],
             "true"
@@ -2857,16 +2808,7 @@ mod tests {
             .into_iter()
             .find(|span| span.name == "openshell.http.enforcement")
             .expect("HTTP enforcement span");
-        let attributes = span
-            .attributes
-            .into_iter()
-            .map(|attribute| {
-                (
-                    attribute.key.as_str().to_string(),
-                    attribute.value.to_string(),
-                )
-            })
-            .collect::<std::collections::BTreeMap<_, _>>();
+        let attributes = span_attributes(span);
         assert_eq!(attributes["openshell.credential.outcome"], "incomplete");
         assert_eq!(
             attributes["openshell.credential.mechanisms"],
@@ -2959,16 +2901,7 @@ mod tests {
             .into_iter()
             .find(|span| span.name == "openshell.http.enforcement")
             .expect("HTTP enforcement span");
-        let attributes = span
-            .attributes
-            .into_iter()
-            .map(|attribute| {
-                (
-                    attribute.key.as_str().to_string(),
-                    attribute.value.to_string(),
-                )
-            })
-            .collect::<std::collections::BTreeMap<_, _>>();
+        let attributes = span_attributes(span);
         assert_eq!(attributes["openshell.credential.outcome"], "stale");
         assert!(!attributes.contains_key("openshell.credential.mechanisms"));
         assert!(!attributes.contains_key("openshell.credential.surfaces"));
