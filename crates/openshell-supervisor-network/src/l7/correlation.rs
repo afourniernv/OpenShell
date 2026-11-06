@@ -20,6 +20,8 @@ use tracing::Instrument as _;
 
 use crate::l7::provider::L7Request;
 use crate::l7::relay::L7EvalContext;
+use crate::l7::{L7Protocol, jsonrpc};
+const JSONRPC_CORRELATED_COUNT_LIMIT: usize = 64;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 #[derive(Debug)]
@@ -38,9 +40,31 @@ struct RequestState {
     outcome: Option<&'static str>,
     policy_span: Option<tracing::Span>,
     middleware: [Option<MiddlewareState>; 2],
+    jsonrpc: JsonRpcCorrelationState,
+    mcp_span: Option<tracing::Span>,
     resources: ResourceCorrelationState,
     credential: CredentialState,
     credential_span: Option<tracing::Span>,
+}
+
+#[derive(Debug, Default)]
+struct JsonRpcCorrelationState {
+    effective: Option<JsonRpcEffectiveSummary>,
+    selected_mcp_revision: Option<openshell_core::mcp::McpProtocolVersion>,
+    mcp_tools_call_observed: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct JsonRpcEffectiveSummary {
+    protocol: &'static str,
+    message_kind: &'static str,
+    inspection_outcome: &'static str,
+    call_count: i64,
+    notification_count: i64,
+    counts_truncated: bool,
+    has_response: bool,
+    mcp_revision: Option<openshell_core::mcp::McpProtocolVersion>,
+    mcp_method_classification: Option<&'static str>,
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -385,6 +409,8 @@ impl RequestCorrelation {
                 outcome: None,
                 policy_span: None,
                 middleware: [None, None],
+                jsonrpc: JsonRpcCorrelationState::default(),
+                mcp_span: None,
                 resources: ResourceCorrelationState::default(),
                 credential: CredentialState::default(),
                 credential_span: None,
@@ -541,6 +567,187 @@ impl RequestCorrelation {
             "openshell.provider.credential.installation.id",
             tracing::field::display(installation_id.hyphenated()),
         );
+    }
+
+    pub(crate) fn record_effective_jsonrpc_summary(
+        &self,
+        protocol: L7Protocol,
+        info: &jsonrpc::JsonRpcRequestInfo,
+    ) {
+        let protocol_name = match protocol {
+            L7Protocol::JsonRpc => "jsonrpc",
+            L7Protocol::Mcp => "mcp",
+            _ => return,
+        };
+        let call_count = info
+            .calls
+            .iter()
+            .filter(|call| !call.is_notification)
+            .count();
+        let notification_count = info
+            .calls
+            .iter()
+            .filter(|call| call.is_notification)
+            .count();
+        let counts_truncated = call_count > JSONRPC_CORRELATED_COUNT_LIMIT
+            || notification_count > JSONRPC_CORRELATED_COUNT_LIMIT;
+
+        {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let state = &mut state.jsonrpc;
+            if protocol == L7Protocol::Mcp {
+                if let Some(revision) = info.mcp_revision {
+                    state.selected_mcp_revision = Some(revision);
+                }
+                state.mcp_tools_call_observed |=
+                    info.calls.iter().any(|call| call.method == "tools/call");
+            }
+            state.effective = Some(JsonRpcEffectiveSummary {
+                protocol: protocol_name,
+                message_kind: jsonrpc_message_kind(info, call_count, notification_count),
+                inspection_outcome: jsonrpc_inspection_outcome(info),
+                call_count: i64::try_from(call_count.min(JSONRPC_CORRELATED_COUNT_LIMIT))
+                    .expect("bounded JSON-RPC call count fits i64"),
+                notification_count: i64::try_from(
+                    notification_count.min(JSONRPC_CORRELATED_COUNT_LIMIT),
+                )
+                .expect("bounded JSON-RPC notification count fits i64"),
+                counts_truncated,
+                has_response: info.has_response,
+                mcp_revision: if protocol == L7Protocol::Mcp {
+                    info.mcp_revision
+                } else {
+                    None
+                },
+                mcp_method_classification: (protocol == L7Protocol::Mcp)
+                    .then(|| mcp_method_classification(info)),
+            });
+        }
+        self.record_jsonrpc_attributes();
+    }
+
+    fn record_jsonrpc_attributes(&self) {
+        let span = self.take_mcp_span();
+        let (summary, selected_revision, tools_call_observed) = {
+            let state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let state = &state.jsonrpc;
+            let Some(summary) = state.effective else {
+                return;
+            };
+            (
+                summary,
+                state.selected_mcp_revision,
+                state.mcp_tools_call_observed,
+            )
+        };
+
+        span.record("openshell.l7.protocol", summary.protocol);
+        span.record(
+            "openshell.jsonrpc.effective.message_kind",
+            summary.message_kind,
+        );
+        span.record(
+            "openshell.jsonrpc.effective.inspection_outcome",
+            summary.inspection_outcome,
+        );
+        span.record("openshell.jsonrpc.effective.call_count", summary.call_count);
+        span.record(
+            "openshell.jsonrpc.effective.notification_count",
+            summary.notification_count,
+        );
+        span.record(
+            "openshell.jsonrpc.effective.counts_truncated",
+            summary.counts_truncated,
+        );
+        span.record(
+            "openshell.jsonrpc.effective.has_response",
+            summary.has_response,
+        );
+
+        if summary.protocol == "mcp" {
+            if let Some(revision) = selected_revision {
+                span.record(
+                    "openshell.mcp.selected_protocol_revision",
+                    revision.as_str(),
+                );
+            }
+            if let Some(revision) = summary.mcp_revision {
+                span.record(
+                    "openshell.mcp.effective.protocol_revision",
+                    revision.as_str(),
+                );
+            }
+            if let Some(classification) = summary.mcp_method_classification {
+                span.record(
+                    "openshell.mcp.effective.method_classification",
+                    classification,
+                );
+            }
+            span.record("openshell.mcp.tools_call_observed", tools_call_observed);
+        }
+    }
+
+    fn new_mcp_span(&self) -> tracing::Span {
+        self.span
+            .with_subscriber(|(_, dispatch)| {
+                tracing::dispatcher::with_default(dispatch, || {
+                    tracing::info_span!(parent: &self.span, "openshell.mcp.inspect",
+                        otel.status_code = tracing::field::Empty,
+                    "openshell.l7.protocol" = tracing::field::Empty,
+                    "openshell.jsonrpc.effective.message_kind" = tracing::field::Empty,
+                    "openshell.jsonrpc.effective.inspection_outcome" = tracing::field::Empty,
+                    "openshell.jsonrpc.effective.call_count" = tracing::field::Empty,
+                    "openshell.jsonrpc.effective.notification_count" = tracing::field::Empty,
+                    "openshell.jsonrpc.effective.counts_truncated" = tracing::field::Empty,
+                    "openshell.jsonrpc.effective.has_response" = tracing::field::Empty,
+                    "openshell.mcp.selected_protocol_revision" = tracing::field::Empty,
+                    "openshell.mcp.effective.protocol_revision" = tracing::field::Empty,
+                    "openshell.mcp.effective.method_classification" = tracing::field::Empty,
+                    "openshell.mcp.tools_call_observed" = tracing::field::Empty,
+                    )
+                })
+            })
+            .unwrap_or_else(tracing::Span::none)
+    }
+
+    fn take_mcp_span(&self) -> tracing::Span {
+        let span = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .mcp_span
+            .take();
+        span.unwrap_or_else(|| self.new_mcp_span())
+    }
+
+    pub(crate) fn within_mcp<F, T>(&self, future: F) -> impl Future<Output = miette::Result<T>>
+    where
+        F: Future<Output = miette::Result<T>>,
+    {
+        let future = Box::pin(future);
+        async move {
+            let span = self.new_mcp_span();
+            self.state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .mcp_span = Some(span.clone());
+            let result = future.instrument(span.clone()).await;
+            if result.is_err() {
+                openshell_otel::mark_error(&span);
+                self.state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .mcp_span
+                    .take();
+            }
+            result
+        }
     }
 
     pub(crate) fn record_target_reached(&self) {
@@ -966,8 +1173,10 @@ pub fn test_request_attributes(
         .map(|attribute| (attribute.key.to_string(), attribute.value.to_string()))
         .collect::<BTreeMap<_, _>>();
     for child in spans.iter().filter(|span| {
-        span.name == "openshell.credential.prepare"
-            && span.parent_span_id == root.span_context.span_id()
+        matches!(
+            span.name.as_ref(),
+            "openshell.credential.prepare" | "openshell.mcp.inspect"
+        ) && span.parent_span_id == root.span_context.span_id()
     }) {
         assert_eq!(child.span_context.trace_id(), root.span_context.trace_id());
         attributes.extend(
@@ -1128,6 +1337,71 @@ fn add_resource_fields(event: &mut OcsfEvent, resources: &ResourceCorrelationSta
             "provider_credential_installation_id",
             provider_credential.installation_id.clone(),
         );
+    }
+}
+
+fn jsonrpc_message_kind(
+    info: &jsonrpc::JsonRpcRequestInfo,
+    call_count: usize,
+    notification_count: usize,
+) -> &'static str {
+    if info.error.is_some() {
+        return "invalid";
+    }
+    if info.receive_stream {
+        return "receive_stream";
+    }
+    if info.is_batch {
+        return match (call_count > 0, notification_count > 0, info.has_response) {
+            (true, false, false) => "batch_calls",
+            (false, true, false) => "batch_notifications",
+            (false, false, true) => "batch_responses",
+            _ => "batch_mixed",
+        };
+    }
+    match (call_count > 0, notification_count > 0, info.has_response) {
+        (true, false, false) => "call",
+        (false, true, false) => "notification",
+        (false, false, true) => "response",
+        (false, false, false) => "empty",
+        _ => "mixed",
+    }
+}
+
+fn jsonrpc_inspection_outcome(info: &jsonrpc::JsonRpcRequestInfo) -> &'static str {
+    match info
+        .error
+        .as_ref()
+        .map(jsonrpc::JsonRpcInspectionError::kind)
+    {
+        None => "accepted",
+        Some(jsonrpc::JsonRpcInspectionErrorKind::InvalidJson) => "invalid_json",
+        Some(jsonrpc::JsonRpcInspectionErrorKind::InvalidMessage) => "invalid_message",
+        Some(jsonrpc::JsonRpcInspectionErrorKind::RevisionNotSelected) => "revision_not_selected",
+        Some(jsonrpc::JsonRpcInspectionErrorKind::McpProfileViolation) => "mcp_profile_violation",
+        Some(jsonrpc::JsonRpcInspectionErrorKind::McpLifecycleViolation) => {
+            "mcp_lifecycle_violation"
+        }
+    }
+}
+
+fn mcp_method_classification(info: &jsonrpc::JsonRpcRequestInfo) -> &'static str {
+    let mut core = false;
+    let mut extension = false;
+    let mut unclassified = false;
+    for call in &info.calls {
+        match call.mcp_classification {
+            Some(jsonrpc::McpMethodClassification::Available) => core = true,
+            Some(jsonrpc::McpMethodClassification::Extension) => extension = true,
+            None => unclassified = true,
+        }
+    }
+    match (core, extension, unclassified) {
+        (false, false, false) => "none",
+        (true, false, false) => "core",
+        (false, true, false) => "extension",
+        (true, true, false) => "mixed",
+        _ => "unclassified",
     }
 }
 

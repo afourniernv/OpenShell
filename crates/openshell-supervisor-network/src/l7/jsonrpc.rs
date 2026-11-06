@@ -18,7 +18,7 @@ use tower_mcp_types::{
     protocol::{InitializeParams, JSONRPC_VERSION, McpRequest, RequestMeta, validate_meta_object},
 };
 
-use crate::l7::provider::{L7Provider, L7Request};
+use crate::l7::provider::L7Request;
 
 pub const DEFAULT_MAX_BODY_BYTES: usize = 64 * 1024;
 
@@ -114,26 +114,18 @@ pub struct JsonRpcHttpRequest {
     pub info: JsonRpcRequestInfo,
 }
 
-pub(crate) async fn parse_jsonrpc_http_request<C: AsyncRead + AsyncWrite + Unpin + Send>(
+pub(crate) async fn inspect_jsonrpc_http_request<C: AsyncRead + AsyncWrite + Unpin + Send>(
     client: &mut C,
+    request: &mut L7Request,
     max_body_bytes: usize,
-    canonicalize_options: crate::l7::path::CanonicalizeOptions,
     inspection_options: JsonRpcInspectionOptions,
-) -> Result<Option<JsonRpcHttpRequest>> {
-    let provider = crate::l7::rest::RestProvider::with_options(canonicalize_options);
-    let Some(mut request) = provider.parse_request(client).await? else {
-        return Ok(None);
-    };
-    if jsonrpc_receive_stream_request(&request) {
-        return Ok(Some(JsonRpcHttpRequest {
-            request,
-            info: JsonRpcRequestInfo::receive_stream(),
-        }));
+) -> Result<JsonRpcRequestInfo> {
+    if jsonrpc_receive_stream_request(request) {
+        return Ok(JsonRpcRequestInfo::receive_stream());
     }
-    let body =
-        crate::l7::http::read_body_for_inspection(client, &mut request, max_body_bytes).await?;
+    let body = crate::l7::http::read_body_for_inspection(client, request, max_body_bytes).await?;
     let info = parse_jsonrpc_body_with_options(&body, inspection_options);
-    Ok(Some(JsonRpcHttpRequest { request, info }))
+    Ok(info)
 }
 
 /// Reinspect a fully buffered JSON-RPC-family HTTP request after middleware.

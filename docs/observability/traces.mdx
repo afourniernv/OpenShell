@@ -76,7 +76,9 @@ The gateway also passes its trace context to compute drivers, so driver spans ap
 ### HTTP Enforcement Correlation
 
 Inspected HTTP requests create an `openshell.http.request` span. Policy evaluation
-and selected request and response middleware phases appear as children. A valid,
+and selected request and response middleware phases appear as children.
+MCP and JSON-RPC inspection adds an `openshell.mcp.inspect` child with bounded
+counts and outcomes, not arguments or payloads. A valid,
 sampled W3C `traceparent` links the request to the caller's trace. Malformed or
 duplicate headers are ignored; an unsampled context becomes a link rather than
 disabling local enforcement telemetry. OpenShell does not adopt `tracestate`.
@@ -93,8 +95,7 @@ OCSF record includes notable withholding, denial, unavailability or stale state.
 
 The primary HTTP Activity record describes the final response headers accepted
 by the client connection. Response-body completion is recorded separately in the
-trace. A
-successful header write does not establish that the caller received a complete
+trace. A successful header write does not establish that the caller received a complete
 body or that the external service committed an operation. Correlation attributes
 exclude credentials, query values, bodies and MCP arguments.
 

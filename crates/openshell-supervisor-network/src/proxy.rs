@@ -1943,6 +1943,7 @@ impl ForwardMiddlewarePipeline<'_> {
                     l7.engine,
                     self.ctx,
                     l7.request_info,
+                    self.correlation,
                 );
                 openshell_supervisor_middleware::TransformedBodyPolicy::Reevaluate(&validate)
             }
@@ -11631,7 +11632,11 @@ network_policies:
 
     #[tokio::test]
     async fn forward_middleware_pipeline_denies_policy_invalid_transformation() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
         const TEST_POLICY: &str = include_str!("../data/sandbox-policy.rego");
+        const REQUEST_ID: &str = "00000000-0000-4000-8000-000000000031";
+        const SENSITIVE_METHOD: &str = "sk-ABCDEFGHIJKLMNOP";
         let data = r#"
 network_policies:
   jsonrpc_api:
@@ -11712,6 +11717,24 @@ network_policies:
             runner,
             tunnel_engine.generation_guard().clone(),
         );
+        let exporter = opentelemetry_sdk::trace::InMemorySpanExporterBuilder::new().build();
+        let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+            .with_simple_exporter(exporter.clone())
+            .build();
+        let ocsf = openshell_ocsf::test_support::OcsfCapture::default();
+        let subscriber = tracing_subscriber::registry()
+            .with(openshell_otel::layer(
+                &provider,
+                "forward-pipeline-correlation-test",
+            ))
+            .with(ocsf.clone());
+        let _subscriber = tracing::subscriber::set_default(subscriber);
+        tracing::callsite::rebuild_interest_cache();
+        let correlation = crate::l7::correlation::RequestCorrelation::with_request_id(
+            &request,
+            &ctx,
+            REQUEST_ID.into(),
+        );
         let pipeline = ForwardMiddlewarePipeline {
             ctx: &ctx,
             scheme: "http",
@@ -11721,7 +11744,7 @@ network_policies:
                 engine: &tunnel_engine,
                 request_info: &request_info,
             }),
-            correlation: None,
+            correlation: Some(&correlation),
         };
         let (_app, mut client) = tokio::io::duplex(8192);
 
@@ -11752,6 +11775,46 @@ network_policies:
                 panic!("test middleware work admission must be available")
             }
         }
+
+        correlation.record_final_http_outcome("denied");
+        drop(correlation);
+        provider.force_flush().expect("flush spans");
+
+        let attributes = crate::l7::correlation::test_request_attributes(
+            &exporter.get_finished_spans().expect("finished spans"),
+            Some(REQUEST_ID),
+        );
+        assert_eq!(attributes["openshell.l7.protocol"], "jsonrpc");
+        assert_eq!(
+            attributes["openshell.jsonrpc.effective.inspection_outcome"],
+            "accepted"
+        );
+        assert_eq!(
+            attributes["openshell.jsonrpc.effective.message_kind"],
+            "call"
+        );
+        assert_eq!(attributes["openshell.jsonrpc.effective.call_count"], "1");
+        assert!(!format!("{attributes:?}").contains(SENSITIVE_METHOD));
+
+        let transformed_events = ocsf
+            .json_events()
+            .into_iter()
+            .filter(|event| {
+                event["message"]
+                    .as_str()
+                    .is_some_and(|message| message.starts_with("L7_REQUEST_TRANSFORMED"))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(transformed_events.len(), 1);
+        assert_eq!(
+            transformed_events[0]["metadata"]["correlation_uid"],
+            REQUEST_ID
+        );
+        assert!(
+            !serde_json::to_string(&transformed_events)
+                .unwrap()
+                .contains(SENSITIVE_METHOD)
+        );
     }
 
     #[tokio::test]

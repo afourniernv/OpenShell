@@ -113,3 +113,8 @@ not whichever revision is current when an operator later reads its records.
 Revision values remain decimal strings so full-width values survive export.
 OCSF stores these request configuration identities in `unmapped`; they are not
 firewall-rule versions or claims about the currently active configuration.
+
+JSON-RPC and MCP inspection use child spans for bounded message classification,
+counts, protocol revision and inspection result. Reinspection after middleware
+records the effective view without exposing arguments, tool names or raw errors.
+The HTTP request owns the correlation ID before dedicated MCP body inspection.
