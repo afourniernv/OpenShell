@@ -22,12 +22,21 @@ use openshell_e2e::harness::sandbox::SandboxGuard;
 use openshell_otel_test_support::OtlpTestServer;
 use openshell_otel_test_support::relay::{
     SANDBOX_ID_KEY, SOURCE_KEY, SOURCE_VALUE, encoded_trace_request,
+    encoded_trace_request_with_span_attributes,
 };
+use opentelemetry_proto::tonic::common::v1::any_value::Value;
+use opentelemetry_proto::tonic::trace::v1::Span;
 use serial_test::serial;
 
 const ENV_ENDPOINT: &str = "OTEL_EXPORTER_OTLP_ENDPOINT";
 const ENV_PROTOCOL: &str = "OTEL_EXPORTER_OTLP_PROTOCOL";
+const ENV_TRACES_ENDPOINT: &str = "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT";
+const ENV_TRACES_PROTOCOL: &str = "OTEL_EXPORTER_OTLP_TRACES_PROTOCOL";
 const ENV_COLLECTOR: &str = "OPENSHELL_OTLP_ENDPOINT";
+const REPORTED_DECISION_ID_KEY: &str = "relay.guard.report.id";
+const REPORTED_DECISION_KEY: &str = "relay.guard.decision";
+const REPORTED_DENIAL_ID: &str = "guardrails-pre-egress-e2e-7f3e5d96";
+const REPORTED_DENIAL_SPAN: &str = "relay.guardrails.request.denied";
 
 /// Posts the base64 body from `OTLP_BODY_B64` to the relay and prints the
 /// status plus the complete environment, one `ENV key=value` line each, so
@@ -35,7 +44,7 @@ const ENV_COLLECTOR: &str = "OPENSHELL_OTLP_ENDPOINT";
 const EXPORT_SCRIPT: &str = r#"
 import base64, os, requests
 body = base64.b64decode(os.environ["OTLP_BODY_B64"])
-url = os.environ["OTEL_EXPORTER_OTLP_ENDPOINT"] + "/v1/traces"
+url = os.environ["OTEL_EXPORTER_OTLP_TRACES_ENDPOINT"]
 response = requests.post(url, data=body, headers={"Content-Type": "application/x-protobuf"}, timeout=10)
 print("STATUS", response.status_code)
 for key, value in sorted(os.environ.items()):
@@ -50,7 +59,7 @@ fn exit_script(body_b64: &str) -> String {
         r#"
 import base64, os, requests
 body = base64.b64decode("{body_b64}")
-url = os.environ["OTEL_EXPORTER_OTLP_ENDPOINT"] + "/v1/traces"
+url = os.environ["OTEL_EXPORTER_OTLP_TRACES_ENDPOINT"]
 response = requests.post(url, data=body, headers={{"Content-Type": "application/x-protobuf"}}, timeout=10)
 raise SystemExit(0 if response.status_code == 200 else 1)
 "#
@@ -62,7 +71,7 @@ raise SystemExit(0 if response.status_code == 200 else 1)
 /// raising.
 const INERT_SCRIPT: &str = r#"
 import os, requests
-print("ENDPOINT", os.environ.get("OTEL_EXPORTER_OTLP_ENDPOINT", "unset"))
+print("TRACES_ENDPOINT", os.environ.get("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", "unset"))
 url = "http://192.0.0.8:4318/v1/traces"
 try:
     response = requests.post(url, data=b"", headers={"Content-Type": "application/x-protobuf"}, timeout=3)
@@ -112,6 +121,36 @@ fn encoded_request(span_name: &str) -> String {
         ],
     );
     base64::engine::general_purpose::STANDARD.encode(request)
+}
+
+fn encoded_reported_denial() -> String {
+    let request = encoded_trace_request_with_span_attributes(
+        REPORTED_DENIAL_SPAN,
+        &[
+            ("service.name", "e2e-agent"),
+            (SANDBOX_ID_KEY, "resource-spoofed-sandbox"),
+            (SOURCE_KEY, "resource-spoofed-source"),
+        ],
+        &[
+            (SANDBOX_ID_KEY, "workload-claimed-sandbox"),
+            (SOURCE_KEY, "relay"),
+            (REPORTED_DECISION_ID_KEY, REPORTED_DENIAL_ID),
+            (REPORTED_DECISION_KEY, "deny"),
+        ],
+    );
+    base64::engine::general_purpose::STANDARD.encode(request)
+}
+
+fn string_span_attributes(span: &Span) -> HashMap<String, String> {
+    span.attributes
+        .iter()
+        .filter_map(|attribute| {
+            let Value::StringValue(value) = attribute.value.as_ref()?.value.as_ref()? else {
+                return None;
+            };
+            Some((attribute.key.clone(), value.clone()))
+        })
+        .collect()
 }
 
 /// The harness CLI runner with a `Result` for the failure path.
@@ -280,14 +319,24 @@ async fn agent_span_reaches_collector_with_attribution() {
         output.contains("STATUS 200"),
         "relay must accept the export:\n{output}"
     );
-    // US1-S3: the exact values a standard SDK needs.
+    // US1-S3: the exact trace-specific values a standard SDK needs.
     assert!(
-        output.contains(&format!("ENV {ENV_ENDPOINT}=http://192.0.0.8:4318")),
-        "the relay endpoint is set for the workload:\n{output}"
+        output.contains(&format!(
+            "ENV {ENV_TRACES_ENDPOINT}=http://192.0.0.8:4318/v1/traces"
+        )),
+        "the trace relay endpoint is set for the workload:\n{output}"
     );
     assert!(
-        output.contains(&format!("ENV {ENV_PROTOCOL}=http/protobuf")),
-        "the exporter protocol is set for the workload:\n{output}"
+        output.contains(&format!("ENV {ENV_TRACES_PROTOCOL}=http/protobuf")),
+        "the trace exporter protocol is set for the workload:\n{output}"
+    );
+    assert!(
+        !output.contains(&format!("ENV {ENV_ENDPOINT}=")),
+        "the trace-only relay must not set the generic endpoint:\n{output}"
+    );
+    assert!(
+        !output.contains(&format!("ENV {ENV_PROTOCOL}=")),
+        "the trace-only relay must not set the generic protocol:\n{output}"
     );
     // US1-S4: neither the variable nor the address itself is present anywhere.
     assert!(
@@ -314,6 +363,78 @@ async fn agent_span_reaches_collector_with_attribution() {
 
 #[tokio::test]
 #[serial]
+async fn pre_egress_denial_span_remains_workload_reported() {
+    let Some(endpoint) = collector_endpoint() else {
+        eprintln!("OPENSHELL_E2E_OTLP_ENDPOINT is unset; skipping the collector case");
+        return;
+    };
+    let collector = OtlpTestServer::start_on(collector_bind_addr(&endpoint)).await;
+
+    let body = format!("OTLP_BODY_B64={}", encoded_reported_denial());
+    let mut sandbox = SandboxGuard::create(&[
+        "--env",
+        &body,
+        "--no-auto-providers",
+        "--",
+        "python3",
+        "-c",
+        EXPORT_SCRIPT,
+    ])
+    .await
+    .expect("sandbox exports a workload-reported pre-egress denial");
+    assert!(
+        sandbox.create_output.contains("STATUS 200"),
+        "relay must accept the export:\n{}",
+        sandbox.create_output
+    );
+
+    let id = sandbox_id(&sandbox.name).await.expect("sandbox id");
+    let spans = wait_for_spans(&collector, &[REPORTED_DENIAL_SPAN], Duration::from_secs(5))
+        .await
+        .expect("workload-reported denial reaches the collector");
+    assert_no_duplicate_resource_keys(&collector);
+    assert_attribution(&spans[REPORTED_DENIAL_SPAN], &id);
+
+    let received = collector.received();
+    let span = received
+        .spans
+        .iter()
+        .find(|span| span.name == REPORTED_DENIAL_SPAN)
+        .expect("reported denial span");
+    let attributes = string_span_attributes(span);
+    assert_eq!(
+        attributes.get(SANDBOX_ID_KEY).map(String::as_str),
+        Some("workload-claimed-sandbox")
+    );
+    assert_eq!(
+        attributes.get(SOURCE_KEY).map(String::as_str),
+        Some("relay")
+    );
+    assert_eq!(
+        attributes.get(REPORTED_DECISION_ID_KEY).map(String::as_str),
+        Some(REPORTED_DENIAL_ID)
+    );
+    assert_eq!(
+        attributes.get(REPORTED_DECISION_KEY).map(String::as_str),
+        Some("deny")
+    );
+
+    let logs = wait_for_sandbox_logs(&sandbox.name, |logs| {
+        logs.contains("OTLP agent trace relay enabled")
+    })
+    .await
+    .expect("native supervisor logs are available after the reported denial");
+    assert!(
+        !logs.contains(REPORTED_DENIAL_ID),
+        "a workload-reported denial must not be synthesized into authoritative OpenShell OCSF:\n{logs}"
+    );
+
+    sandbox.cleanup().await;
+    drop(collector.shutdown().await);
+}
+
+#[tokio::test]
+#[serial]
 async fn relay_is_inert_without_collector() {
     if collector_endpoint().is_some() {
         eprintln!("the agent trace relay is enabled; skipping the inert case");
@@ -326,8 +447,8 @@ async fn relay_is_inert_without_collector() {
             .expect("sandbox attempts an export without a collector");
     let output = sandbox.create_output.clone();
     assert!(
-        output.contains("ENDPOINT unset"),
-        "no relay endpoint is injected while the relay is inactive:\n{output}"
+        output.contains("TRACES_ENDPOINT unset"),
+        "no trace relay endpoint is injected while the relay is inactive:\n{output}"
     );
     assert!(
         output.contains("ERROR ConnectionError"),

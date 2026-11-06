@@ -26,6 +26,8 @@ use tonic::{GrpcMethod, Status};
 
 use super::EXPORT_TIMEOUT;
 
+const MAX_COLLECTOR_DIAGNOSTIC_BYTES: usize = 512;
+
 /// HTTP/2 PING cadence while an export is in flight. Pings are never sent on
 /// an idle connection: stock collectors (grpc-go) close connections that
 /// ping without an open stream.
@@ -53,6 +55,8 @@ pub enum ExportError {
     Http(String),
     /// No answer within [`EXPORT_TIMEOUT`].
     Timeout,
+    /// A collector acknowledgement could not be decoded or violates OTLP.
+    InvalidResponse(String),
 }
 
 impl std::fmt::Display for ExportError {
@@ -62,11 +66,24 @@ impl std::fmt::Display for ExportError {
             Self::HttpStatus(status) => write!(f, "collector answered HTTP {status}"),
             Self::Http(error) => f.write_str(error),
             Self::Timeout => write!(f, "no response within {EXPORT_TIMEOUT:?}"),
+            Self::InvalidResponse(detail) => write!(f, "invalid collector response: {detail}"),
         }
     }
 }
 
 impl std::error::Error for ExportError {}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum ExportOutcome {
+    Accepted,
+    Warning {
+        diagnostic: String,
+    },
+    Partial {
+        rejected_spans: u64,
+        diagnostic: String,
+    },
+}
 
 /// The collector transport could not be set up.
 #[derive(Debug)]
@@ -142,7 +159,7 @@ impl Exporter {
     }
 
     /// Sends one encoded batch, bounded by [`EXPORT_TIMEOUT`].
-    pub async fn export(&self, batch: Bytes) -> Result<(), ExportError> {
+    pub async fn export(&self, batch: Bytes) -> Result<ExportOutcome, ExportError> {
         let send = async {
             match &self.transport {
                 Transport::Grpc(client) => export_grpc(client.clone(), &self.headers, batch).await,
@@ -151,9 +168,10 @@ impl Exporter {
                 }
             }
         };
-        tokio::time::timeout(EXPORT_TIMEOUT, send)
+        let response = tokio::time::timeout(EXPORT_TIMEOUT, send)
             .await
-            .unwrap_or(Err(ExportError::Timeout))
+            .unwrap_or(Err(ExportError::Timeout))?;
+        classify_response(response)
     }
 }
 
@@ -192,7 +210,7 @@ async fn export_grpc(
     mut client: Grpc<Channel>,
     headers: &http::HeaderMap,
     batch: Bytes,
-) -> Result<(), ExportError> {
+) -> Result<ExportTraceServiceResponse, ExportError> {
     client.ready().await.map_err(|error| {
         ExportError::Status(Status::unavailable(format!(
             "collector channel not ready: {error}"
@@ -203,11 +221,11 @@ async fn export_grpc(
     request
         .extensions_mut()
         .insert(GrpcMethod::new(SERVICE, METHOD));
-    client
+    let response = client
         .unary(request, PathAndQuery::from_static(PATH), PassthroughCodec)
         .await
-        .map(|_| ())
-        .map_err(ExportError::Status)
+        .map_err(ExportError::Status)?;
+    response.into_inner().map_err(invalid_response)
 }
 
 async fn export_http(
@@ -215,7 +233,7 @@ async fn export_http(
     uri: &http::Uri,
     headers: &http::HeaderMap,
     batch: Bytes,
-) -> Result<(), ExportError> {
+) -> Result<ExportTraceServiceResponse, ExportError> {
     let mut request = http::Request::post(uri.clone())
         .body(batch)
         .map_err(|error| ExportError::Http(error.to_string()))?;
@@ -229,10 +247,49 @@ async fn export_http(
         .await
         .map_err(|error| ExportError::Http(error_chain(error.as_ref())))?;
     if response.status().is_success() {
-        Ok(())
+        ExportTraceServiceResponse::decode(response.body().as_ref()).map_err(invalid_response)
     } else {
         Err(ExportError::HttpStatus(response.status()))
     }
+}
+
+fn invalid_response(error: prost::DecodeError) -> ExportError {
+    ExportError::InvalidResponse(collector_diagnostic(&error.to_string()))
+}
+
+fn classify_response(response: ExportTraceServiceResponse) -> Result<ExportOutcome, ExportError> {
+    let Some(partial) = response.partial_success else {
+        return Ok(ExportOutcome::Accepted);
+    };
+    let rejected_spans = u64::try_from(partial.rejected_spans).map_err(|_| {
+        ExportError::InvalidResponse(format!(
+            "negative rejected span count: {}",
+            partial.rejected_spans
+        ))
+    })?;
+    if rejected_spans > 0 {
+        Ok(ExportOutcome::Partial {
+            rejected_spans,
+            diagnostic: collector_diagnostic(&partial.error_message),
+        })
+    } else if partial.error_message.is_empty() {
+        Ok(ExportOutcome::Accepted)
+    } else {
+        Ok(ExportOutcome::Warning {
+            diagnostic: collector_diagnostic(&partial.error_message),
+        })
+    }
+}
+
+fn collector_diagnostic(message: &str) -> String {
+    let mut diagnostic = String::with_capacity(message.len().min(MAX_COLLECTOR_DIAGNOSTIC_BYTES));
+    for character in message.chars().flat_map(char::escape_debug) {
+        if diagnostic.len() + character.len_utf8() > MAX_COLLECTOR_DIAGNOSTIC_BYTES {
+            break;
+        }
+        diagnostic.push(character);
+    }
+    diagnostic
 }
 
 fn error_chain(error: &dyn std::error::Error) -> String {
@@ -252,7 +309,7 @@ struct PassthroughCodec;
 
 impl Codec for PassthroughCodec {
     type Encode = Bytes;
-    type Decode = ExportTraceServiceResponse;
+    type Decode = Result<ExportTraceServiceResponse, prost::DecodeError>;
     type Encoder = PassthroughEncoder;
     type Decoder = ResponseDecoder;
 
@@ -280,19 +337,90 @@ impl Encoder for PassthroughEncoder {
 struct ResponseDecoder;
 
 impl Decoder for ResponseDecoder {
-    type Item = ExportTraceServiceResponse;
+    type Item = Result<ExportTraceServiceResponse, prost::DecodeError>;
     type Error = Status;
 
     fn decode(&mut self, src: &mut DecodeBuf<'_>) -> Result<Option<Self::Item>, Status> {
-        ExportTraceServiceResponse::decode(src)
-            .map(Some)
-            .map_err(|error| Status::internal(format!("malformed export response: {error}")))
+        // A malformed acknowledgement is not a failed collector connection.
+        Ok(Some(ExportTraceServiceResponse::decode(src)))
     }
 }
 
 /// Collector doubles shared with the lifecycle tests in the parent module.
 #[cfg(test)]
 pub mod test_util {
+    use bytes::Bytes;
+    use openshell_core::sandbox_env::OtlpProtocol;
+    use openshell_otel_test_support::{OtlpHttpTestServer, OtlpTestServer};
+    use opentelemetry_proto::tonic::collector::trace::v1::{
+        ExportTracePartialSuccess, ExportTraceServiceResponse,
+    };
+    use prost::Message as _;
+
+    pub fn response(rejected_spans: i64, message: &str) -> ExportTraceServiceResponse {
+        ExportTraceServiceResponse {
+            partial_success: Some(ExportTracePartialSuccess {
+                rejected_spans,
+                error_message: message.to_string(),
+            }),
+        }
+    }
+
+    pub enum AckCollector {
+        Grpc(OtlpTestServer),
+        Http(OtlpHttpTestServer),
+    }
+
+    impl AckCollector {
+        pub async fn start(
+            protocol: OtlpProtocol,
+            responses: impl IntoIterator<Item = ExportTraceServiceResponse>,
+        ) -> Self {
+            match protocol {
+                OtlpProtocol::Grpc => {
+                    Self::Grpc(OtlpTestServer::start_with_trace_responses(responses).await)
+                }
+                OtlpProtocol::HttpProtobuf => Self::Http(
+                    OtlpHttpTestServer::start_with_trace_responses(
+                        responses
+                            .into_iter()
+                            .map(|response| Bytes::from(response.encode_to_vec())),
+                    )
+                    .await,
+                ),
+            }
+        }
+
+        pub fn endpoint(&self) -> &str {
+            match self {
+                Self::Grpc(collector) => collector.endpoint(),
+                Self::Http(collector) => collector.endpoint(),
+            }
+        }
+
+        /// Call after relay shutdown so no export remains in flight.
+        pub async fn assert_requests(self, expected: u64) {
+            match self {
+                Self::Grpc(collector) => {
+                    assert_eq!(collector.shutdown().await.trace_exports, expected);
+                }
+                Self::Http(mut collector) => {
+                    for _ in 0..expected {
+                        collector.next_export().await;
+                    }
+                    assert!(
+                        tokio::time::timeout(
+                            std::time::Duration::from_millis(20),
+                            collector.next_export()
+                        )
+                        .await
+                        .is_err()
+                    );
+                }
+            }
+        }
+    }
+
     /// A loopback listener that accepts TCP connections and never answers,
     /// so an export's HTTP/2 PING goes unanswered. Deterministic on every
     /// platform, unlike an unroutable address.
@@ -338,8 +466,82 @@ mod tests {
 
     use openshell_otel_test_support::OtlpHttpTestServer;
 
-    use super::test_util::SilentCollector;
+    use super::test_util::{AckCollector, SilentCollector, response};
     use super::*;
+
+    #[tokio::test]
+    async fn collector_acknowledgements_are_classified_over_both_protocols() {
+        for protocol in [OtlpProtocol::Grpc, OtlpProtocol::HttpProtobuf] {
+            let responses = [
+                ExportTraceServiceResponse::default(),
+                response(0, ""),
+                response(0, "smaller batches"),
+                response(1, "invalid span"),
+                response(1, ""),
+                response(-1, "invalid count"),
+            ];
+            let collector = AckCollector::start(protocol, responses).await;
+            let exporter =
+                Exporter::new(collector.endpoint(), protocol, http::HeaderMap::new(), None)
+                    .unwrap();
+            let batch = Bytes::from(encoded_request("ack", &[]));
+            for expected in [
+                ExportOutcome::Accepted,
+                ExportOutcome::Accepted,
+                ExportOutcome::Warning {
+                    diagnostic: "smaller batches".into(),
+                },
+                ExportOutcome::Partial {
+                    rejected_spans: 1,
+                    diagnostic: "invalid span".into(),
+                },
+                ExportOutcome::Partial {
+                    rejected_spans: 1,
+                    diagnostic: String::new(),
+                },
+            ] {
+                assert_eq!(
+                    exporter.export(batch.clone()).await.unwrap(),
+                    expected,
+                    "{protocol}"
+                );
+            }
+            assert!(matches!(
+                exporter.export(batch).await,
+                Err(ExportError::InvalidResponse(_))
+            ));
+            collector.assert_requests(6).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn malformed_http_acknowledgement_is_not_success() {
+        let collector =
+            OtlpHttpTestServer::start_with_trace_responses([Bytes::from_static(b"\xff")]).await;
+        let exporter = Exporter::new(
+            collector.endpoint(),
+            OtlpProtocol::HttpProtobuf,
+            http::HeaderMap::new(),
+            None,
+        )
+        .unwrap();
+        assert!(matches!(
+            exporter.export(Bytes::new()).await,
+            Err(ExportError::InvalidResponse(_))
+        ));
+    }
+
+    #[test]
+    fn collector_diagnostics_are_escaped_and_bounded_without_splitting_unicode() {
+        let raw = format!("line\n\r\t\u{1b}\u{2028}\u{202e}{}", "☃".repeat(512));
+        let diagnostic = collector_diagnostic(&raw);
+        assert!(diagnostic.len() <= MAX_COLLECTOR_DIAGNOSTIC_BYTES);
+        for character in ['\n', '\r', '\t', '\u{1b}', '\u{2028}', '\u{202e}'] {
+            assert!(!diagnostic.contains(character));
+        }
+        assert!(diagnostic.starts_with("line\\n\\r\\t"));
+        assert!(diagnostic.ends_with('☃'));
+    }
 
     #[test]
     fn new_rejects_an_invalid_uri() {

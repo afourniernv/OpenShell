@@ -3,6 +3,8 @@
 
 //! Loopback OTLP/HTTP collector that records every request.
 
+use std::collections::VecDeque;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -33,15 +35,24 @@ impl OtlpHttpTestServer {
 
     /// Starts the collector, answering every request with `status`.
     pub async fn start_with_status(status: http::StatusCode) -> Self {
-        Self::start_with(status, None).await
+        Self::start_with(status, None, VecDeque::new()).await
+    }
+
+    /// Returns the configured protobuf bodies in order, then empty success.
+    pub async fn start_with_trace_responses(responses: impl IntoIterator<Item = Bytes>) -> Self {
+        Self::start_with(http::StatusCode::OK, None, responses.into_iter().collect()).await
     }
 
     /// Serve over TLS at `https://localhost:<port>` with `tls`, answering 200.
     pub async fn start_with_tls(tls: &crate::ServerTls) -> Self {
-        Self::start_with(http::StatusCode::OK, Some(tls)).await
+        Self::start_with(http::StatusCode::OK, Some(tls), VecDeque::new()).await
     }
 
-    async fn start_with(status: http::StatusCode, tls: Option<&crate::ServerTls>) -> Self {
+    async fn start_with(
+        status: http::StatusCode,
+        tls: Option<&crate::ServerTls>,
+        responses: VecDeque<Bytes>,
+    ) -> Self {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("OTLP/HTTP test collector should bind a loopback listener");
@@ -53,6 +64,7 @@ impl OtlpHttpTestServer {
         };
         let acceptor = tls.map(|tls| tokio_rustls::TlsAcceptor::from(tls.rustls_config()));
         let (tx, exports) = tokio::sync::mpsc::unbounded_channel();
+        let responses = Arc::new(Mutex::new(responses));
         let task = tokio::spawn(async move {
             loop {
                 let Ok((stream, _)) = listener.accept().await else {
@@ -60,10 +72,12 @@ impl OtlpHttpTestServer {
                 };
                 let tx = tx.clone();
                 let acceptor = acceptor.clone();
+                let responses = Arc::clone(&responses);
                 tokio::spawn(async move {
                     let service = hyper::service::service_fn(
                         move |request: http::Request<hyper::body::Incoming>| {
                             let tx = tx.clone();
+                            let responses = Arc::clone(&responses);
                             async move {
                                 let (parts, body) = request.into_parts();
                                 let body = body.collect().await?.to_bytes();
@@ -73,9 +87,15 @@ impl OtlpHttpTestServer {
                                     headers: parts.headers,
                                     body,
                                 });
+                                let body =
+                                    responses.lock().unwrap().pop_front().unwrap_or_default();
                                 let mut response =
-                                    http::Response::new(http_body_util::Full::new(Bytes::new()));
+                                    http::Response::new(http_body_util::Full::new(body));
                                 *response.status_mut() = status;
+                                response.headers_mut().insert(
+                                    http::header::CONTENT_TYPE,
+                                    http::HeaderValue::from_static("application/x-protobuf"),
+                                );
                                 Ok::<_, hyper::Error>(response)
                             }
                         },

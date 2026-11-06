@@ -602,6 +602,46 @@ mod tests {
     }
 
     #[test]
+    fn preserves_reserved_keys_on_span_attributes_as_workload_reported_data() {
+        let span = Span {
+            name: "reported-denial".into(),
+            attributes: vec![
+                string_attribute(SANDBOX_ID_KEY, "span-supplied-sandbox"),
+                string_attribute(SOURCE_KEY, "span-supplied-source"),
+            ],
+            ..Default::default()
+        };
+        let raw = ExportTraceServiceRequest {
+            resource_spans: vec![ResourceSpans {
+                resource: Some(Resource {
+                    attributes: vec![
+                        string_attribute(SANDBOX_ID_KEY, "resource-spoofed-sandbox"),
+                        string_attribute(SOURCE_KEY, "resource-spoofed-source"),
+                    ],
+                    ..Default::default()
+                }),
+                scope_spans: vec![ScopeSpans {
+                    spans: vec![span.clone()],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+        };
+
+        let enriched = enrich(&raw.encode_to_vec(), "sb-real").unwrap();
+        let decoded = ExportTraceServiceRequest::decode(enriched.as_ref()).unwrap();
+        let resource = decoded.resource_spans[0].resource.as_ref().unwrap();
+        assert_eq!(
+            resource.attributes,
+            vec![
+                string_attribute(SANDBOX_ID_KEY, "sb-real"),
+                string_attribute(SOURCE_KEY, SOURCE_VALUE),
+            ]
+        );
+        assert_eq!(decoded.resource_spans[0].scope_spans[0].spans, [span]);
+    }
+
+    #[test]
     fn preserves_other_attributes_and_all_spans() {
         let raw = encoded_request("keep-me", &[("service.name", "unit-agent")]);
         let enriched = enrich(&raw, "sb-1").unwrap();

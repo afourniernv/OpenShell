@@ -6,8 +6,9 @@ use std::hash::BuildHasher;
 use std::path::Path;
 
 use openshell_core::sandbox_env::{
-    OTEL_EXPORTER_OTLP_COMPRESSION, OTEL_EXPORTER_OTLP_ENDPOINT, OTEL_EXPORTER_OTLP_PROTOCOL,
-    OTEL_EXPORTER_OTLP_TRACES_COMPRESSION, OTEL_EXPORTER_OTLP_TRACES_ENDPOINT, OTLP_RELAY_ENDPOINT,
+    OTEL_EXPORTER_OTLP_ENDPOINT, OTEL_EXPORTER_OTLP_TRACES_COMPRESSION,
+    OTEL_EXPORTER_OTLP_TRACES_ENDPOINT, OTEL_EXPORTER_OTLP_TRACES_PROTOCOL,
+    OTLP_RELAY_TRACES_ENDPOINT,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -56,18 +57,17 @@ const OTLP_ENDPOINT_VARS: [&str; 2] = [
 /// OpenTelemetry exporter variables that point agent SDKs at the
 /// supervisor's OTLP relay.
 ///
-/// Only the generic endpoint and protocol are set. Signal-specific variables
-/// take precedence over them in every SDK, so an endpoint the workload sets
-/// later at any layer, generic or traces-specific, wins over this default.
-/// Compression is disabled for both the generic and the traces-specific
-/// variable because the relay refuses compressed bodies, and a `gzip` value
-/// from the image or the creation request would otherwise make every export
-/// fail.
-pub fn otlp_relay_env_vars() -> [(&'static str, &'static str); 4] {
+/// Only trace-specific variables are set, so the trace-only relay does not
+/// redirect logs or metrics. An endpoint the workload sets at any caller-owned
+/// layer, generic or traces-specific, suppresses this default. Trace
+/// compression is disabled because the relay refuses compressed bodies.
+pub fn otlp_relay_env_vars() -> [(&'static str, &'static str); 3] {
     [
-        (OTEL_EXPORTER_OTLP_ENDPOINT, OTLP_RELAY_ENDPOINT),
-        (OTEL_EXPORTER_OTLP_PROTOCOL, "http/protobuf"),
-        (OTEL_EXPORTER_OTLP_COMPRESSION, "none"),
+        (
+            OTEL_EXPORTER_OTLP_TRACES_ENDPOINT,
+            OTLP_RELAY_TRACES_ENDPOINT,
+        ),
+        (OTEL_EXPORTER_OTLP_TRACES_PROTOCOL, "http/protobuf"),
         (OTEL_EXPORTER_OTLP_TRACES_COMPRESSION, "none"),
     ]
 }
@@ -117,9 +117,9 @@ fn relay_default_applies<S: BuildHasher>(
 /// sandbox's network policy and outside relay attribution. The image only
 /// counts for a child that inherits the sandbox environment; a child started
 /// from a cleared environment never sees the image's endpoint, so the relay
-/// default still applies to it. When the default is injected, a
-/// traces-specific endpoint can only have come from a provider, and is
-/// removed so a provider cannot redirect traces.
+/// default still applies to it. When the default is injected, a generic
+/// endpoint can only have come from a provider, and is removed before the
+/// trace-specific defaults are set so it cannot redirect other signals.
 pub fn apply_otlp_relay_env<S: BuildHasher>(
     cmd: &mut impl EnvTarget,
     relay_active: bool,
@@ -132,7 +132,7 @@ pub fn apply_otlp_relay_env<S: BuildHasher>(
     }) {
         return;
     }
-    cmd.remove_var(OTEL_EXPORTER_OTLP_TRACES_ENDPOINT);
+    cmd.remove_var(OTEL_EXPORTER_OTLP_ENDPOINT);
     for (key, value) in otlp_relay_env_vars() {
         cmd.set_var(key, value);
     }
@@ -227,9 +227,11 @@ mod tests {
         assert_eq!(
             otlp_relay_env_vars(),
             [
-                ("OTEL_EXPORTER_OTLP_ENDPOINT", "http://192.0.0.8:4318"),
-                ("OTEL_EXPORTER_OTLP_PROTOCOL", "http/protobuf"),
-                ("OTEL_EXPORTER_OTLP_COMPRESSION", "none"),
+                (
+                    "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
+                    "http://192.0.0.8:4318/v1/traces"
+                ),
+                ("OTEL_EXPORTER_OTLP_TRACES_PROTOCOL", "http/protobuf"),
                 ("OTEL_EXPORTER_OTLP_TRACES_COMPRESSION", "none"),
             ]
         );
@@ -261,11 +263,11 @@ mod tests {
         apply_otlp_relay_env(&mut env, true, ChildEnvironment::Cleared, &none, &[]);
         assert_eq!(
             env.set
-                .get("OTEL_EXPORTER_OTLP_ENDPOINT")
+                .get("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT")
                 .map(String::as_str),
-            Some("http://192.0.0.8:4318")
+            Some("http://192.0.0.8:4318/v1/traces")
         );
-        assert_eq!(env.removed, ["OTEL_EXPORTER_OTLP_TRACES_ENDPOINT"]);
+        assert_eq!(env.removed, ["OTEL_EXPORTER_OTLP_ENDPOINT"]);
 
         let mut env = RecordedEnv::default();
         apply_otlp_relay_env(
@@ -295,34 +297,42 @@ mod tests {
         );
 
         // Protocol or compression alone do not name a destination.
-        let protocol_only = HashMap::from([(
-            "OTEL_EXPORTER_OTLP_PROTOCOL".to_string(),
-            "grpc".to_string(),
-        )]);
-        assert!(relay_default_applies(
-            true,
-            &protocol_only,
-            &[],
-            nothing_inherited
-        ));
+        for key in [
+            "OTEL_EXPORTER_OTLP_PROTOCOL",
+            "OTEL_EXPORTER_OTLP_TRACES_PROTOCOL",
+        ] {
+            let protocol_only = HashMap::from([(key.to_string(), "grpc".to_string())]);
+            assert!(relay_default_applies(
+                true,
+                &protocol_only,
+                &[],
+                nothing_inherited
+            ));
+        }
 
         for key in [
             "OTEL_EXPORTER_OTLP_ENDPOINT",
             "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
         ] {
-            let value = "http://collector.example:4318".to_string();
-            let declared = HashMap::from([(key.to_string(), value.clone())]);
-            assert!(
-                !relay_default_applies(true, &declared, &[], nothing_inherited),
-                "{key} in the creation request names a destination"
-            );
-            assert!(
-                !relay_default_applies(true, &none, &[(key.to_string(), value)], nothing_inherited),
-                "{key} in the exec environment names a destination"
-            );
+            for value in ["http://collector.example:4318", ""] {
+                let declared = HashMap::from([(key.to_string(), value.to_string())]);
+                assert!(
+                    !relay_default_applies(true, &declared, &[], nothing_inherited),
+                    "{key} in the creation request opts out, even when empty"
+                );
+                assert!(
+                    !relay_default_applies(
+                        true,
+                        &none,
+                        &[(key.to_string(), value.to_string())],
+                        nothing_inherited
+                    ),
+                    "{key} in the exec environment opts out, even when empty"
+                );
+            }
             assert!(
                 !relay_default_applies(true, &none, &[], |inherited| inherited == key),
-                "{key} in the image environment names a destination"
+                "{key} in the image environment opts out"
             );
         }
     }

@@ -511,37 +511,40 @@ pub const DEFAULT_SANDBOX_GID: u32 = 1000;
 /// OCI only for the former contract.
 pub const OCI_IMAGE_USER: &str = "OPENSHELL_OCI_IMAGE_USER";
 
-/// Standard OpenTelemetry environment variable for the OTLP exporter endpoint.
+/// Generic OpenTelemetry OTLP exporter endpoint.
 ///
-/// While the supervisor serves the OTLP relay, the sandbox runtime sets it in
-/// workload processes to [`OTLP_RELAY_ENDPOINT`] as a lowest-precedence
-/// default, so agent SDKs export to the relay without configuration. It is
-/// not set when the creation request, the image, or a per-exec environment
-/// names an endpoint, generic or traces-specific, and any signal-specific
-/// endpoint the workload sets later takes precedence over it in the SDK.
+/// A caller-declared value applies to traces when
+/// [`OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`] is absent, so it suppresses the
+/// trace-specific relay default.
 pub const OTEL_EXPORTER_OTLP_ENDPOINT: &str = "OTEL_EXPORTER_OTLP_ENDPOINT";
 
-/// Standard OpenTelemetry environment variable for the OTLP exporter protocol.
-///
-/// Set to `http/protobuf` alongside [`OTEL_EXPORTER_OTLP_ENDPOINT`].
+/// Standard OpenTelemetry environment variable for the generic OTLP exporter
+/// protocol.
 pub const OTEL_EXPORTER_OTLP_PROTOCOL: &str = "OTEL_EXPORTER_OTLP_PROTOCOL";
 
-/// Signal-specific endpoint variable. Never injected; a layer that sets it
-/// has chosen where traces go, so the relay default is left out.
+/// Standard OpenTelemetry environment variable for the traces OTLP endpoint.
+///
+/// While the supervisor serves the OTLP relay, the sandbox runtime sets it in
+/// workload processes to [`OTLP_RELAY_TRACES_ENDPOINT`] as a lowest-precedence
+/// default. It is not set when the creation request, the image, or a per-exec
+/// environment names an endpoint, generic or traces-specific.
 pub const OTEL_EXPORTER_OTLP_TRACES_ENDPOINT: &str = "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT";
+
+/// Standard OpenTelemetry environment variable for the traces OTLP protocol.
+///
+/// Set to `http/protobuf` alongside [`OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`].
+pub const OTEL_EXPORTER_OTLP_TRACES_PROTOCOL: &str = "OTEL_EXPORTER_OTLP_TRACES_PROTOCOL";
 
 /// Standard OpenTelemetry environment variable for OTLP exporter compression.
 ///
-/// Set to `none` alongside [`OTEL_EXPORTER_OTLP_ENDPOINT`], because the
-/// relay refuses compressed bodies.
+/// A generic caller value may apply to traces, but the relay default overrides
+/// it with [`OTEL_EXPORTER_OTLP_TRACES_COMPRESSION`].
 pub const OTEL_EXPORTER_OTLP_COMPRESSION: &str = "OTEL_EXPORTER_OTLP_COMPRESSION";
 
-/// Signal-specific compression variable, also set to `none` with the relay
-/// default.
+/// Signal-specific compression variable, set to `none` with the relay default.
 ///
-/// SDKs prefer it over [`OTEL_EXPORTER_OTLP_COMPRESSION`], so a `gzip` value
-/// from the image or the creation request would otherwise still compress
-/// every trace export.
+/// SDKs prefer it over [`OTEL_EXPORTER_OTLP_COMPRESSION`], so a generic `gzip`
+/// value would otherwise still compress trace exports that the relay refuses.
 pub const OTEL_EXPORTER_OTLP_TRACES_COMPRESSION: &str = "OTEL_EXPORTER_OTLP_TRACES_COMPRESSION";
 
 /// Reserved destination agent processes export OTLP to.
@@ -557,9 +560,15 @@ pub const OTEL_EXPORTER_OTLP_TRACES_COMPRESSION: &str = "OTEL_EXPORTER_OTLP_TRAC
 /// unroutable, and never assigned to a real service.
 pub const OTLP_RELAY_ADDR: &str = "192.0.0.8:4318";
 
-/// [`OTLP_RELAY_ADDR`] as the URL injected through
-/// [`OTEL_EXPORTER_OTLP_ENDPOINT`].
+/// [`OTLP_RELAY_ADDR`] as an OTLP HTTP base URL.
 pub const OTLP_RELAY_ENDPOINT: &str = "http://192.0.0.8:4318";
+
+/// Trace ingestion URL injected through
+/// [`OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`].
+///
+/// Signal-specific HTTP endpoints are used verbatim by OpenTelemetry SDKs and
+/// therefore include `/v1/traces`.
+pub const OTLP_RELAY_TRACES_ENDPOINT: &str = "http://192.0.0.8:4318/v1/traces";
 
 // The corporate upstream-proxy configuration deliberately has no reserved
 // environment variables: it travels on the supervisor's argv
@@ -570,7 +579,7 @@ pub const OTLP_RELAY_ENDPOINT: &str = "http://192.0.0.8:4318";
 mod otlp_relay_address_tests {
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
-    use super::{OTLP_RELAY_ADDR, OTLP_RELAY_ENDPOINT};
+    use super::{OTLP_RELAY_ADDR, OTLP_RELAY_ENDPOINT, OTLP_RELAY_TRACES_ENDPOINT};
 
     #[test]
     fn relay_address_is_an_unroutable_non_loopback_label() {
@@ -590,6 +599,10 @@ mod otlp_relay_address_tests {
             "198.18.0.0/15 is the policy DNS synthetic answer pool"
         );
         assert_eq!(OTLP_RELAY_ENDPOINT, format!("http://{OTLP_RELAY_ADDR}"));
+        assert_eq!(
+            OTLP_RELAY_TRACES_ENDPOINT,
+            format!("{OTLP_RELAY_ENDPOINT}/v1/traces")
+        );
     }
 }
 

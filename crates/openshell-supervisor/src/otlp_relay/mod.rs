@@ -34,7 +34,7 @@ use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
 use self::buffer::new_buffer;
-use self::exporter::Exporter;
+use self::exporter::{ExportError, ExportOutcome, Exporter};
 use self::receiver::{OtlpConnectionServer, ReceiverHandle};
 
 /// Maximum accepted request body, in wire bytes.
@@ -82,12 +82,18 @@ pub const RETRY_AFTER_SECS: u64 = 1;
 /// Point-in-time copy of the relay counters.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CounterSnapshot {
-    /// Batches delivered to the collector.
+    /// Batches acknowledged by the collector, including partial acceptance.
     pub exported: u64,
     /// Export requests refused with 503 because the buffer was full.
     pub rejected: u64,
     /// Export attempts that failed, timed out, or were discarded at exit.
     pub export_failures: u64,
+    /// Export batches the collector accepted only in part.
+    pub partial_successes: u64,
+    /// Spans the collector reported rejecting from partial exports.
+    pub rejected_spans: u64,
+    /// Fully accepted batches that carried a collector warning.
+    pub collector_warnings: u64,
 }
 
 /// Cumulative relay counters shared by the receiver, exporter, and summary
@@ -98,6 +104,9 @@ pub struct RelayCounters {
     exported: AtomicU64,
     rejected: AtomicU64,
     export_failures: AtomicU64,
+    partial_successes: AtomicU64,
+    rejected_spans: AtomicU64,
+    collector_warnings: AtomicU64,
     /// Metrics and logs exports acknowledged and dropped, since the relay
     /// forwards traces only.
     discarded_signals: AtomicU64,
@@ -107,6 +116,8 @@ pub struct RelayCounters {
     first_rejection_logged: AtomicBool,
     first_discard_logged: AtomicBool,
     first_failure_logged: AtomicBool,
+    first_partial_success_logged: AtomicBool,
+    first_collector_warning_logged: AtomicBool,
     final_summary_logged: AtomicBool,
 }
 
@@ -156,10 +167,62 @@ impl RelayCounters {
         }
     }
 
-    /// Records one batch delivered to the collector.
+    /// Fails this batch without making a later flush discard unrelated batches.
+    pub fn record_export_protocol_failure(&self, endpoint: &str, error: &dyn std::fmt::Display) {
+        self.export_failures.fetch_add(1, Ordering::Relaxed);
+        self.last_export_failed.store(false, Ordering::Relaxed);
+        if !self.first_failure_logged.swap(true, Ordering::Relaxed) {
+            warn!(endpoint, %error, "OTLP collector returned an invalid response");
+        }
+    }
+
+    /// Records one batch acknowledged by the collector.
     pub fn record_export_success(&self) {
         self.exported.fetch_add(1, Ordering::Relaxed);
         self.last_export_failed.store(false, Ordering::Relaxed);
+    }
+
+    /// Records a collector acknowledgement. Partial acceptance and warnings
+    /// settle the batch once: OTLP requires clients not to retry either one.
+    pub fn record_export_outcome(&self, endpoint: &str, outcome: &ExportOutcome) {
+        self.record_export_success();
+        match outcome {
+            ExportOutcome::Accepted => {}
+            ExportOutcome::Warning { diagnostic } => {
+                self.collector_warnings.fetch_add(1, Ordering::Relaxed);
+                if !self
+                    .first_collector_warning_logged
+                    .swap(true, Ordering::Relaxed)
+                {
+                    warn!(
+                        endpoint,
+                        diagnostic, "OTLP collector accepted an agent trace batch with a warning"
+                    );
+                }
+            }
+            ExportOutcome::Partial {
+                rejected_spans,
+                diagnostic,
+            } => {
+                self.partial_successes.fetch_add(1, Ordering::Relaxed);
+                let _ = self.rejected_spans.fetch_update(
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                    |current| Some(current.saturating_add(*rejected_spans)),
+                );
+                if !self
+                    .first_partial_success_logged
+                    .swap(true, Ordering::Relaxed)
+                {
+                    warn!(
+                        endpoint,
+                        rejected_spans,
+                        diagnostic,
+                        "OTLP collector accepted only part of an agent trace batch"
+                    );
+                }
+            }
+        }
     }
 
     /// Whether the most recent export attempt failed.
@@ -173,6 +236,9 @@ impl RelayCounters {
             exported: self.exported.load(Ordering::Relaxed),
             rejected: self.rejected.load(Ordering::Relaxed),
             export_failures: self.export_failures.load(Ordering::Relaxed),
+            partial_successes: self.partial_successes.load(Ordering::Relaxed),
+            rejected_spans: self.rejected_spans.load(Ordering::Relaxed),
+            collector_warnings: self.collector_warnings.load(Ordering::Relaxed),
         }
     }
 
@@ -194,26 +260,35 @@ impl RelayCounters {
             exported,
             rejected,
             export_failures,
+            partial_successes,
+            rejected_spans,
+            collector_warnings,
         } = self.snapshot();
         info!(
             exported,
             rejected,
             export_failures,
+            partial_successes,
+            rejected_spans,
+            collector_warnings,
             discarded_signals = self.discarded_signals(),
             "OTLP relay summary"
         );
     }
 
-    /// Logs the final summary once, and only when something was rejected or
-    /// failed (FR-009). Called from `shutdown` and, for lifecycle paths that
-    /// drop the relay without shutting it down, from `Drop`.
+    /// Logs the final summary once when delivery was degraded or the
+    /// collector returned a warning. Called from `shutdown` and, for
+    /// lifecycle paths that drop the relay without shutting it down, from
+    /// `Drop`.
     fn log_final_summary(&self) {
         let CounterSnapshot {
             rejected,
             export_failures,
+            partial_successes,
+            collector_warnings,
             ..
         } = self.snapshot();
-        if (rejected > 0 || export_failures > 0)
+        if (rejected > 0 || export_failures > 0 || partial_successes > 0 || collector_warnings > 0)
             && !self.final_summary_logged.swap(true, Ordering::Relaxed)
         {
             self.log_summary();
@@ -467,7 +542,10 @@ fn assemble(
             }
             while let Some(batch) = buffer_rx.recv().await {
                 match exporter.export(batch).await {
-                    Ok(()) => counters.record_export_success(),
+                    Ok(outcome) => counters.record_export_outcome(exporter.endpoint(), &outcome),
+                    Err(error @ ExportError::InvalidResponse(_)) => {
+                        counters.record_export_protocol_failure(exporter.endpoint(), &error);
+                    }
                     Err(error) => counters.record_export_failure(exporter.endpoint(), &error),
                 }
             }
@@ -489,24 +567,32 @@ fn assemble(
     (relay, reserved)
 }
 
-/// Logs the cumulative counts every [`SUMMARY_INTERVAL`], but only while the
-/// rejected or failed counts keep changing.
+/// Logs the cumulative counts every [`SUMMARY_INTERVAL`], but only while a
+/// rejection, failure, partial acceptance, or warning count keeps changing.
 async fn summary_loop(counters: Arc<RelayCounters>) {
     let mut interval = tokio::time::interval_at(
         tokio::time::Instant::now() + SUMMARY_INTERVAL,
         SUMMARY_INTERVAL,
     );
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let mut last_reported = (0, 0);
+    let mut last_reported = (0, 0, 0, 0);
     loop {
         interval.tick().await;
         let CounterSnapshot {
             rejected,
             export_failures,
+            partial_successes,
+            collector_warnings,
             ..
         } = counters.snapshot();
-        if (rejected, export_failures) != last_reported {
-            last_reported = (rejected, export_failures);
+        let degraded = (
+            rejected,
+            export_failures,
+            partial_successes,
+            collector_warnings,
+        );
+        if degraded != last_reported {
+            last_reported = degraded;
             counters.log_summary();
         }
     }
@@ -643,10 +729,137 @@ mod tests {
     use super::enrichment::test_util::{encoded_request, encoded_request_with_large_span};
     use super::enrichment::{SANDBOX_ID_KEY, SOURCE_KEY, SOURCE_VALUE};
     use super::exporter::test_util::SilentCollector;
+    use super::exporter::test_util::{AckCollector, response};
     use super::receiver::test_util::{connect, read_head, request, send};
     use super::*;
 
     const PROTOBUF: &str = "application/x-protobuf";
+
+    #[tokio::test]
+    async fn warnings_and_partial_success_settle_once_over_both_protocols() {
+        for protocol in [OtlpProtocol::Grpc, OtlpProtocol::HttpProtobuf] {
+            let collector = AckCollector::start(
+                protocol,
+                [response(0, "warning"), response(1, "rejected span")],
+            )
+            .await;
+            let (relay, _reserved) = start(OtlpRelayConfig {
+                endpoint: collector.endpoint().to_string(),
+                protocol,
+                headers: None,
+                tls: None,
+                sandbox_id: "sb-ack".into(),
+            })
+            .unwrap();
+            assert_eq!(post(&relay, "warning").await, 200);
+            assert_eq!(post(&relay, "partial").await, 200);
+            relay.flush(FLUSH_TIMEOUT).await;
+            let snapshot = relay.counters.snapshot();
+            assert_eq!(snapshot.exported, 2);
+            assert_eq!(snapshot.partial_successes, 1);
+            assert_eq!(snapshot.rejected_spans, 1);
+            assert_eq!(snapshot.collector_warnings, 1);
+            assert_eq!(snapshot.export_failures, 0);
+            assert_eq!(relay.counters.pending(), 0);
+            assert!(!relay.counters.last_export_failed());
+            relay.shutdown(FLUSH_TIMEOUT).await;
+            collector.assert_requests(2).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_acknowledgement_does_not_discard_later_batches() {
+        for protocol in [OtlpProtocol::Grpc, OtlpProtocol::HttpProtobuf] {
+            let collector = AckCollector::start(protocol, [response(-1, "invalid count")]).await;
+            let (relay, _reserved) = start(OtlpRelayConfig {
+                endpoint: collector.endpoint().to_string(),
+                protocol,
+                headers: None,
+                tls: None,
+                sandbox_id: "sb-invalid-ack".into(),
+            })
+            .unwrap();
+            assert_eq!(post(&relay, "invalid-response").await, 200);
+            wait_until(Duration::from_secs(5), || {
+                relay.counters.snapshot().export_failures == 1
+            })
+            .await;
+            assert!(!relay.counters.last_export_failed());
+            for name in ["following-one", "following-two"] {
+                assert_eq!(post(&relay, name).await, 200);
+            }
+            relay.flush(FLUSH_TIMEOUT).await;
+            assert_eq!(relay.counters.pending(), 0);
+            let snapshot = relay.counters.snapshot();
+            assert_eq!(snapshot.exported, 2);
+            assert_eq!(snapshot.export_failures, 1);
+            assert_eq!(snapshot.partial_successes, 0);
+            assert_eq!(snapshot.collector_warnings, 0);
+            assert_eq!(snapshot.rejected_spans, 0);
+            relay.shutdown(FLUSH_TIMEOUT).await;
+            collector.assert_requests(3).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn collector_diagnostics_are_logged_once_and_summarized() {
+        let logs = LogCapture::default();
+        let _guard = logs.install();
+        let counters = RelayCounters::default();
+        for _ in 0..2 {
+            counters.record_export_outcome(
+                "collector",
+                &ExportOutcome::Warning {
+                    diagnostic: "warning".into(),
+                },
+            );
+            counters.record_export_outcome(
+                "collector",
+                &ExportOutcome::Partial {
+                    rejected_spans: 1,
+                    diagnostic: "partial".into(),
+                },
+            );
+        }
+        counters.log_final_summary();
+        counters.log_final_summary();
+        assert_eq!(
+            logs.count(
+                tracing::Level::WARN,
+                "OTLP collector accepted an agent trace batch with a warning"
+            ),
+            1
+        );
+        assert_eq!(
+            logs.count(
+                tracing::Level::WARN,
+                "OTLP collector accepted only part of an agent trace batch"
+            ),
+            1
+        );
+        let summaries = logs.events(tracing::Level::INFO, "OTLP relay summary");
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].field("exported"), Some(4));
+        assert_eq!(summaries[0].field("partial_successes"), Some(2));
+        assert_eq!(summaries[0].field("rejected_spans"), Some(2));
+        assert_eq!(summaries[0].field("collector_warnings"), Some(2));
+    }
+
+    #[test]
+    fn collector_reported_span_count_saturates() {
+        let counters = RelayCounters::default();
+        counters
+            .rejected_spans
+            .store(u64::MAX - 1, Ordering::Relaxed);
+        counters.record_export_outcome(
+            "collector",
+            &ExportOutcome::Partial {
+                rejected_spans: 10,
+                diagnostic: String::new(),
+            },
+        );
+        assert_eq!(counters.snapshot().rejected_spans, u64::MAX);
+    }
 
     /// Serialises the tests that install a log capture, so concurrent
     /// dispatcher registration on other test threads cannot race the
@@ -1304,6 +1517,37 @@ mod tests {
         let second = &logs.events(tracing::Level::INFO, "OTLP relay summary")[1];
         assert_eq!(second.field("rejected"), Some(1));
         assert_eq!(second.field("export_failures"), Some(1));
+
+        counters.record_export_outcome(
+            "collector",
+            &ExportOutcome::Warning {
+                diagnostic: "warning".into(),
+            },
+        );
+        tokio::time::advance(SUMMARY_INTERVAL).await;
+        tokio::task::yield_now().await;
+        assert_eq!(summaries(), 3);
+        counters.record_export_outcome(
+            "collector",
+            &ExportOutcome::Partial {
+                rejected_spans: 2,
+                diagnostic: "partial".into(),
+            },
+        );
+        tokio::time::advance(SUMMARY_INTERVAL).await;
+        tokio::task::yield_now().await;
+        assert_eq!(summaries(), 4);
+        let fourth = &logs.events(tracing::Level::INFO, "OTLP relay summary")[3];
+        assert_eq!(fourth.field("collector_warnings"), Some(1));
+        assert_eq!(fourth.field("partial_successes"), Some(1));
+        assert_eq!(fourth.field("rejected_spans"), Some(2));
+        tokio::time::advance(SUMMARY_INTERVAL).await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            summaries(),
+            4,
+            "unchanged degradation does not repeat the summary"
+        );
         summary.abort();
     }
 

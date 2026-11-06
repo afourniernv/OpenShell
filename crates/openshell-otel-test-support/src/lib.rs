@@ -42,10 +42,21 @@ pub mod relay {
     /// `span_name` and the given string resource attributes.
     #[must_use]
     pub fn encoded_trace_request(span_name: &str, attributes: &[(&str, &str)]) -> Vec<u8> {
+        encoded_trace_request_with_span_attributes(span_name, attributes, &[])
+    }
+
+    /// Protobuf-encoded `ExportTraceServiceRequest` with one span named
+    /// `span_name` and the given string resource and span attributes.
+    #[must_use]
+    pub fn encoded_trace_request_with_span_attributes(
+        span_name: &str,
+        resource_attributes: &[(&str, &str)],
+        span_attributes: &[(&str, &str)],
+    ) -> Vec<u8> {
         ExportTraceServiceRequest {
             resource_spans: vec![ResourceSpans {
                 resource: Some(Resource {
-                    attributes: attributes
+                    attributes: resource_attributes
                         .iter()
                         .map(|(key, value)| string_attribute(key, value))
                         .collect(),
@@ -54,6 +65,10 @@ pub mod relay {
                 scope_spans: vec![ScopeSpans {
                     spans: vec![Span {
                         name: span_name.to_string(),
+                        attributes: span_attributes
+                            .iter()
+                            .map(|(key, value)| string_attribute(key, value))
+                            .collect(),
                         ..Default::default()
                     }],
                     ..Default::default()
@@ -65,7 +80,7 @@ pub mod relay {
     }
 }
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -141,6 +156,8 @@ pub async fn assert_compute_driver_tracing(
 
 #[derive(Clone, Debug, Default)]
 pub struct ReceivedTraces {
+    /// Number of trace export requests received by the collector.
+    pub trace_exports: u64,
     pub spans: Vec<Span>,
     /// String bodies of exported log records.
     pub log_bodies: Vec<String>,
@@ -200,6 +217,7 @@ impl ReceivedTraces {
 struct Collector {
     received: Arc<Mutex<ReceivedTraces>>,
     exported: Arc<tokio::sync::Notify>,
+    trace_responses: Arc<Mutex<VecDeque<ExportTraceServiceResponse>>>,
 }
 
 #[tonic::async_trait]
@@ -213,6 +231,7 @@ impl TraceService for Collector {
                 .received
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
+            received.trace_exports = received.trace_exports.saturating_add(1);
             if let Some(encoding) = request
                 .metadata()
                 .get("grpc-encoding")
@@ -241,7 +260,13 @@ impl TraceService for Collector {
             }
         }
         self.exported.notify_one();
-        Ok(tonic::Response::new(ExportTraceServiceResponse::default()))
+        let response = self
+            .trace_responses
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .pop_front()
+            .unwrap_or_default();
+        Ok(tonic::Response::new(response))
     }
 }
 
@@ -296,11 +321,21 @@ impl OtlpTestServer {
         Self::start_on(LOOPBACK_EPHEMERAL).await
     }
 
+    /// Returns the configured trace responses in order, then full success.
+    pub async fn start_with_trace_responses(
+        responses: impl IntoIterator<Item = ExportTraceServiceResponse>,
+    ) -> Self {
+        Self::try_start_with(LOOPBACK_EPHEMERAL, None, responses.into_iter().collect())
+            .await
+            .expect("OTLP test collector should bind a loopback listener")
+    }
+
     /// Serve over TLS at `https://localhost:<port>` using `identity`.
     pub async fn start_tls(identity: tonic::transport::Identity) -> Self {
         Self::try_start_with(
             LOOPBACK_EPHEMERAL,
             Some(tonic::transport::ServerTlsConfig::new().identity(identity)),
+            VecDeque::new(),
         )
         .await
         .expect("OTLP test collector should bind a loopback listener")
@@ -309,9 +344,13 @@ impl OtlpTestServer {
     /// Serve over TLS at `https://localhost:<port>` with `tls`, which can
     /// require client certificates.
     pub async fn start_with_tls(tls: &ServerTls) -> Self {
-        Self::try_start_with(LOOPBACK_EPHEMERAL, Some(tls.tonic_config()))
-            .await
-            .expect("OTLP test collector should bind a loopback listener")
+        Self::try_start_with(
+            LOOPBACK_EPHEMERAL,
+            Some(tls.tonic_config()),
+            VecDeque::new(),
+        )
+        .await
+        .expect("OTLP test collector should bind a loopback listener")
     }
 
     /// Starts the collector on a fixed address, for tests whose peer learned
@@ -325,12 +364,13 @@ impl OtlpTestServer {
     /// [`Self::start_on`] that reports a bind failure instead of panicking,
     /// so a test can retry with another port when a parallel test took it.
     pub async fn try_start_on(addr: SocketAddr) -> std::io::Result<Self> {
-        Self::try_start_with(addr, None).await
+        Self::try_start_with(addr, None, VecDeque::new()).await
     }
 
     async fn try_start_with(
         addr: SocketAddr,
         tls: Option<tonic::transport::ServerTlsConfig>,
+        trace_responses: VecDeque<ExportTraceServiceResponse>,
     ) -> std::io::Result<Self> {
         let received = Arc::new(Mutex::new(ReceivedTraces::default()));
         let exported = Arc::new(tokio::sync::Notify::new());
@@ -344,6 +384,7 @@ impl OtlpTestServer {
         let collector = Collector {
             received: Arc::clone(&received),
             exported: Arc::clone(&exported),
+            trace_responses: Arc::new(Mutex::new(trace_responses)),
         };
         let mut server = tonic::transport::Server::builder();
         if let Some(tls) = tls {
