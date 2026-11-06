@@ -7,7 +7,9 @@
 //! Parses each request within the tunnel, evaluates it against OPA policy,
 //! and either forwards or denies the request.
 
-use crate::l7::correlation::RequestCorrelation;
+use crate::l7::correlation::{
+    CredentialMechanism, CredentialOutcome, CredentialSurface, RequestCorrelation,
+};
 use crate::l7::middleware::{
     MiddlewareApplyResult, UninspectableTrafficGate, apply_middleware_chain_with_request_id,
     emit_middleware_uninspectable, middleware_network_input, uninspectable_traffic_gate,
@@ -30,8 +32,6 @@ use openshell_ocsf::{
     ActionId, ActivityId, DetectionFindingBuilder, DispositionId, Endpoint, FindingInfo,
     HttpActivityBuilder, HttpRequest, NetworkActivityBuilder, SeverityId, StatusId, Url as OcsfUrl,
 };
-#[cfg(test)]
-use std::collections::BTreeMap;
 use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
@@ -165,6 +165,7 @@ fn credential_generation_guard(
 ///
 /// A refused grant returns a [`TokenGrantInjectionError`](crate::l7::token_grant_injection::TokenGrantInjectionError)
 /// inside the report, so callers can tell it apart from other failures.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn prepare_inspected_request(
     req: crate::l7::provider::L7Request,
     ctx: &L7EvalContext,
@@ -173,6 +174,7 @@ pub(crate) async fn prepare_inspected_request(
     request_info: &L7RequestInfo,
     request_id: &str,
     observation_context: Option<&openshell_core::endpoint_status::EndpointObservationContext>,
+    correlation: Option<&RequestCorrelation>,
 ) -> Result<(crate::l7::provider::L7Request, L7EvalContext)> {
     let mut scoped = ctx.clone();
     let snapshot = crate::l7::token_grant_injection::pin_live_credentials(&mut scoped);
@@ -224,6 +226,7 @@ pub(crate) async fn prepare_inspected_request(
             observation_context.filter(|context| {
                 context.matches_config(&config.policy_hash, Some(snapshot.revision))
             }),
+            correlation,
         )
         .await?
     } else {
@@ -232,8 +235,13 @@ pub(crate) async fn prepare_inspected_request(
     if engine.is_stale() {
         return Err(miette!("policy changed during token grant resolution"));
     }
-    if let Some(guard) = credential_generation_guard(&scoped) {
-        guard.ensure_current()?;
+    if let Some(guard) = credential_generation_guard(&scoped)
+        && let Err(error) = guard.ensure_current()
+    {
+        if let Some(correlation) = correlation {
+            correlation.complete_credential(CredentialOutcome::Stale);
+        }
+        return Err(error);
     }
     let scoped = scoped_context_for_request(&scoped, &req).unwrap_or(scoped);
     Ok((req, scoped))
@@ -752,6 +760,31 @@ where
         events.push(build_credential_endpoint_mismatch_finding(ctx));
     }
     if let Some(correlation) = correlation {
+        let mechanism = if correlation.has_credential_mechanism(CredentialMechanism::SigV4) {
+            CredentialMechanism::SigV4
+        } else {
+            CredentialMechanism::StaticPlaceholder
+        };
+        let static_surface = match error.location {
+            "path" => Some(CredentialSurface::Path),
+            "query_param" => Some(CredentialSurface::Query),
+            "header" => Some(CredentialSurface::Header),
+            _ => None,
+        };
+        if mechanism == CredentialMechanism::StaticPlaceholder
+            && !correlation.has_credential_mechanism(CredentialMechanism::StaticPlaceholder)
+            && let Some(surface) = static_surface
+        {
+            correlation.observe_credential(CredentialMechanism::StaticPlaceholder, surface);
+        }
+        correlation.complete_credential_mechanism(
+            mechanism,
+            if endpoint_mismatch || placement_mismatch {
+                CredentialOutcome::Denied
+            } else {
+                CredentialOutcome::Unavailable
+            },
+        );
         correlation.record_enforcement_action("block");
         correlation.record_response_status(if endpoint_mismatch || placement_mismatch {
             403
@@ -794,6 +827,14 @@ pub(crate) async fn reject_body_credential<C: AsyncWrite + Unpin>(
         "message": "A credential placeholder in the request body cannot be forwarded. Remove the reference from conversation history or restore provider access; body credential rewriting is disabled."
     }});
     if let Some(correlation) = correlation {
+        correlation.observe_credential(
+            CredentialMechanism::StaticPlaceholder,
+            CredentialSurface::Body,
+        );
+        correlation.complete_credential_mechanism(
+            CredentialMechanism::StaticPlaceholder,
+            CredentialOutcome::Denied,
+        );
         correlation.record_policy_decision("deny");
         correlation.record_enforcement_action("block");
         correlation.record_response_status(403);
@@ -824,6 +865,10 @@ async fn reject_credential_unavailable<C: AsyncWrite + Unpin>(
         "message": "Credential material is unavailable for this request",
     });
     if let Some(correlation) = correlation {
+        correlation.complete_credential_mechanism(
+            CredentialMechanism::SigV4,
+            CredentialOutcome::Unavailable,
+        );
         correlation.record_enforcement_action("block");
         correlation.record_response_status(500);
         correlation.record_final_http_outcome("platform_error");
@@ -892,6 +937,7 @@ where
         request_info,
         request_id,
         observation_context,
+        correlation,
     )
     .await
     {
@@ -1044,6 +1090,7 @@ where
                 }
                 if error.generation_is_stale() {
                     if let Some(correlation) = correlation {
+                        correlation.complete_credential(CredentialOutcome::Stale);
                         correlation.record_enforcement_action("block");
                         correlation.record_final_http_outcome("platform_error");
                         correlation.record_error_stage("credential_generation");
@@ -4130,8 +4177,15 @@ where
                 return Ok(());
             }
         };
+        let mut correlation = (ctx.provider_credentials.is_some() || ctx.secret_resolver.is_some())
+            .then(|| RequestCorrelation::new(&req, ctx));
+        let fallback_request_id = uuid::Uuid::new_v4().to_string();
+        if let Some(correlation) = correlation.as_ref() {
+            correlation.record_policy_decision("not_applicable");
+        }
         if !request_authority_matches_endpoint(&req, ctx) {
-            reject_request_authority_mismatch(client, ctx, &req.action, None).await?;
+            reject_request_authority_mismatch(client, ctx, &req.action, correlation.as_ref())
+                .await?;
             return Ok(());
         }
         if close_if_stale(generation_guard, ctx) {
@@ -4144,7 +4198,14 @@ where
         let redacted_target = match secrets::redact_target_for_policy(&req.target) {
             Ok(target) => target,
             Err(error) => {
-                reject_credential_resolution(client, ctx, &req.action, &error, None).await?;
+                reject_credential_resolution(
+                    client,
+                    ctx,
+                    &req.action,
+                    &error,
+                    correlation.as_ref(),
+                )
+                .await?;
                 return Ok(());
             }
         };
@@ -4171,8 +4232,6 @@ where
             egress_emit!(event);
         }
 
-        let fallback_request_id = uuid::Uuid::new_v4().to_string();
-        let mut correlation = None;
         let mut response_selection = None;
         let req = if let Some(engine) = middleware_engine {
             let input = middleware_network_input(ctx);
@@ -4180,10 +4239,10 @@ where
             if generation != generation_guard.captured_generation() {
                 return Ok(());
             }
-            if !chain.is_empty() {
-                let selected = RequestCorrelation::new(&req, ctx);
-                selected.record_policy_decision("not_applicable");
-                correlation = Some(selected);
+            if !chain.is_empty() && correlation.is_none() {
+                let request = RequestCorrelation::new(&req, ctx);
+                request.record_policy_decision("not_applicable");
+                correlation = Some(request);
             }
             let request_id = correlation
                 .as_ref()
@@ -4282,6 +4341,7 @@ where
                     &snapshot,
                     request_id,
                     observation_context.as_ref(),
+                    correlation.as_ref(),
                 )
                 .await
             }
@@ -4452,16 +4512,231 @@ mod tests {
     use openshell_core::token_grant_failure::{
         TokenGrantFailure, TokenGrantFailureKind, TokenGrantStage,
     };
-    use std::collections::HashMap as TestHashMap;
+    use std::collections::{BTreeMap, HashMap as TestHashMap};
     use std::fmt::Write as _;
     use std::path::PathBuf;
     use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
+    use tracing::instrument::WithSubscriber as _;
+    use tracing_subscriber::layer::SubscriberExt as _;
 
     fn relay_grant_failure() -> TokenGrantFailure {
         TokenGrantFailure::new(
             TokenGrantFailureKind::ProviderAuthorizationRequired,
             TokenGrantStage::GatewayRpc,
         )
+    }
+
+    async fn capture_correlated_credential_rejection(
+        mechanism: CredentialMechanism,
+        surface: CredentialSurface,
+        error_location: &'static str,
+    ) -> BTreeMap<String, String> {
+        let exporter = opentelemetry_sdk::trace::InMemorySpanExporterBuilder::new().build();
+        let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+            .with_simple_exporter(exporter.clone())
+            .build();
+        let subscriber = tracing_subscriber::registry().with(openshell_otel::layer(
+            &provider,
+            "credential-rejection-correlation-test",
+        ));
+        let request = crate::l7::provider::L7Request {
+            action: "GET".into(),
+            target: "/credential".into(),
+            query_params: TestHashMap::new(),
+            raw_header: b"GET /credential HTTP/1.1\r\nHost: api.example.test\r\n\r\n".to_vec(),
+            body_length: crate::l7::provider::BodyLength::None,
+        };
+        let context = L7EvalContext {
+            host: "api.example.test".into(),
+            port: 443,
+            policy_name: "credential-test".into(),
+            ..Default::default()
+        };
+
+        async {
+            tracing::callsite::rebuild_interest_cache();
+            let correlation = RequestCorrelation::with_request_id(
+                &request,
+                &context,
+                "00000000-0000-4000-8000-000000000031".into(),
+            );
+            correlation.observe_credential(mechanism, surface);
+            let mut client = tokio::io::sink();
+            reject_credential_resolution(
+                &mut client,
+                &context,
+                &request.action,
+                &secrets::UnresolvedPlaceholderError::unavailable(error_location),
+                Some(&correlation),
+            )
+            .await
+            .expect("write local credential rejection");
+        }
+        .with_subscriber(subscriber)
+        .await;
+        provider.force_flush().expect("flush spans");
+
+        crate::l7::correlation::test_request_attributes(
+            &exporter.get_finished_spans().expect("finished spans"),
+            None,
+        )
+    }
+
+    #[tokio::test]
+    async fn credential_rejection_preserves_authoritative_prescanned_surface() {
+        let attributes = capture_correlated_credential_rejection(
+            CredentialMechanism::StaticPlaceholder,
+            CredentialSurface::Path,
+            "header",
+        )
+        .await;
+
+        assert_eq!(attributes["openshell.credential.outcome"], "unavailable");
+        assert_eq!(
+            attributes["openshell.credential.mechanisms"],
+            "static_placeholder"
+        );
+        assert_eq!(attributes["openshell.credential.surfaces"], "path");
+        assert_eq!(
+            attributes["openshell.credential.static_placeholder.outcome"],
+            "unavailable"
+        );
+    }
+
+    #[tokio::test]
+    async fn sigv4_resolution_rejection_is_not_attributed_to_static_placeholders() {
+        let attributes = capture_correlated_credential_rejection(
+            CredentialMechanism::SigV4,
+            CredentialSurface::Signature,
+            "sigv4",
+        )
+        .await;
+
+        assert_eq!(attributes["openshell.credential.outcome"], "unavailable");
+        assert_eq!(attributes["openshell.credential.mechanisms"], "sigv4");
+        assert_eq!(attributes["openshell.credential.surfaces"], "signature");
+        assert_eq!(
+            attributes["openshell.credential.sigv4.outcome"],
+            "unavailable"
+        );
+        assert!(!attributes.contains_key("openshell.credential.static_placeholder.outcome"));
+    }
+
+    #[tokio::test]
+    async fn policy_only_staleness_does_not_emit_credential_state() {
+        const DATA: &str = r#"
+network_policies:
+  rest_api:
+    name: rest_api
+    endpoints:
+      - host: api.example.test
+        port: 8080
+        protocol: rest
+        enforcement: enforce
+        rules:
+          - allow:
+              method: GET
+              path: "/v1/**"
+    binaries:
+      - { path: /usr/bin/curl }
+"#;
+        const REQUEST_ID: &str = "00000000-0000-4000-8000-000000000032";
+
+        let engine = OpaEngine::from_strings(TEST_POLICY, DATA).unwrap();
+        let input = NetworkInput {
+            host: "api.example.test".into(),
+            port: 8080,
+            binary_path: PathBuf::from("/usr/bin/curl"),
+            binary_sha256: "unused".into(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+        };
+        let (endpoint_config, generation) = engine
+            .query_endpoint_config_with_generation(&input)
+            .unwrap();
+        let config = crate::l7::parse_l7_config(&endpoint_config.unwrap()).unwrap();
+        let tunnel_engine = engine.clone_engine_for_tunnel(generation).unwrap();
+        engine.reload(TEST_POLICY, DATA).unwrap();
+
+        let request = crate::l7::provider::L7Request {
+            action: "GET".into(),
+            target: "/v1/data".into(),
+            query_params: TestHashMap::new(),
+            raw_header: b"GET /v1/data HTTP/1.1\r\nHost: api.example.test:8080\r\n\r\n".to_vec(),
+            body_length: crate::l7::provider::BodyLength::None,
+        };
+        let request_info = L7RequestInfo {
+            action: request.action.clone(),
+            target: request.target.clone(),
+            query_params: TestHashMap::new(),
+            graphql: None,
+            jsonrpc: None,
+        };
+        let context = L7EvalContext {
+            host: "api.example.test".into(),
+            port: 8080,
+            request_default_port: Some(8080),
+            policy_name: "rest_api".into(),
+            binary_path: "/usr/bin/curl".into(),
+            ..Default::default()
+        };
+        let exporter = opentelemetry_sdk::trace::InMemorySpanExporterBuilder::new().build();
+        let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+            .with_simple_exporter(exporter.clone())
+            .build();
+        let ocsf = openshell_ocsf::test_support::OcsfCapture::default();
+        let subscriber = tracing_subscriber::registry()
+            .with(openshell_otel::layer(
+                &provider,
+                "policy-staleness-correlation-test",
+            ))
+            .with(ocsf.clone());
+
+        async {
+            tracing::callsite::rebuild_interest_cache();
+            let correlation =
+                RequestCorrelation::with_request_id(&request, &context, REQUEST_ID.into());
+            let Err(error) = prepare_inspected_request(
+                request,
+                &context,
+                &tunnel_engine,
+                &config,
+                &request_info,
+                REQUEST_ID,
+                None,
+                Some(&correlation),
+            )
+            .await
+            else {
+                panic!("stale policy generation must reject the request");
+            };
+            assert!(
+                error
+                    .to_string()
+                    .contains("policy changed during token grant resolution")
+            );
+            correlation.record_final_http_outcome("platform_error");
+        }
+        .with_subscriber(subscriber)
+        .await;
+        provider.force_flush().expect("flush spans");
+
+        let span = exporter
+            .get_finished_spans()
+            .expect("finished spans")
+            .into_iter()
+            .find(|span| span.name == "openshell.http.request")
+            .expect("HTTP enforcement span");
+        assert!(
+            span.attributes
+                .iter()
+                .all(|attribute| !attribute.key.as_str().starts_with("openshell.credential."))
+        );
+        assert!(
+            ocsf.json_events()
+                .iter()
+                .all(|event| { event["firewall_rule"]["type"] != "credential-correlation" })
+        );
     }
 
     /// Assert the generic refusal and return its request ID header value.
@@ -5623,10 +5898,15 @@ mod tests {
 
     #[tokio::test]
     async fn implicit_sigv4_endpoint_mismatch_returns_typed_403() {
+        const ACCESS_KEY: &str = "AKIA_MISMATCH_SENTINEL";
+        const SECRET_KEY: &str = "sigv4-mismatch-secret-sentinel";
+        const SESSION_TOKEN: &str = "sigv4-mismatch-session-sentinel";
+        const REGION: &str = "us-mismatch-1";
+        const SERVICE: &str = "mismatch-service";
         let (_state, resolver) = endpoint_mismatch_resolver(TestHashMap::from([
-            ("AWS_ACCESS_KEY_ID".to_string(), "access".to_string()),
-            ("AWS_SECRET_ACCESS_KEY".to_string(), "secret".to_string()),
-            ("AWS_SESSION_TOKEN".to_string(), "session".to_string()),
+            ("AWS_ACCESS_KEY_ID".to_string(), ACCESS_KEY.to_string()),
+            ("AWS_SECRET_ACCESS_KEY".to_string(), SECRET_KEY.to_string()),
+            ("AWS_SESSION_TOKEN".to_string(), SESSION_TOKEN.to_string()),
         ]));
         let request = crate::l7::provider::L7Request {
             action: "GET".to_string(),
@@ -5638,19 +5918,52 @@ mod tests {
             body_length: crate::l7::provider::BodyLength::ContentLength(0),
         };
 
-        assert_credential_relay_rejected(
-            request,
-            resolver.as_ref(),
-            crate::l7::rest::RelayRequestOptions {
-                credential_signing: crate::l7::CredentialSigning::SigV4NoBody,
-                signing_service: "execute-api",
-                signing_region: "us-west-2",
-                host: "denied.example.test",
-                port: 443,
-                ..Default::default()
-            },
-        )
+        let exporter = opentelemetry_sdk::trace::InMemorySpanExporterBuilder::new().build();
+        let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+            .with_simple_exporter(exporter.clone())
+            .build();
+        let subscriber = tracing_subscriber::registry().with(openshell_otel::layer(
+            &provider,
+            "sigv4-endpoint-mismatch-correlation-test",
+        ));
+
+        async {
+            tracing::callsite::rebuild_interest_cache();
+            assert_credential_relay_rejected(
+                request,
+                resolver.as_ref(),
+                crate::l7::rest::RelayRequestOptions {
+                    credential_signing: crate::l7::CredentialSigning::SigV4NoBody,
+                    signing_service: SERVICE,
+                    signing_region: REGION,
+                    host: "denied.example.test",
+                    port: 443,
+                    ..Default::default()
+                },
+            )
+            .await;
+        }
+        .with_subscriber(subscriber)
         .await;
+        provider.force_flush().expect("flush spans");
+
+        let attributes = crate::l7::correlation::test_request_attributes(
+            &exporter.get_finished_spans().expect("finished spans"),
+            None,
+        );
+        assert_eq!(attributes["openshell.credential.outcome"], "denied");
+        assert_eq!(attributes["openshell.credential.mechanisms"], "sigv4");
+        assert_eq!(attributes["openshell.credential.surfaces"], "signature");
+        assert_eq!(attributes["openshell.credential.sigv4.outcome"], "denied");
+        assert_eq!(attributes["openshell.request.delivery_started"], "false");
+        assert!(!attributes.contains_key("openshell.credential.static_placeholder.outcome"));
+        let serialized = format!("{attributes:?}");
+        for private_value in [ACCESS_KEY, SECRET_KEY, SESSION_TOKEN, REGION, SERVICE] {
+            assert!(
+                !serialized.contains(private_value),
+                "leaked {private_value}"
+            );
+        }
     }
 
     #[tokio::test]

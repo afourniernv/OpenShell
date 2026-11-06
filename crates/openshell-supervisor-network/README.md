@@ -100,3 +100,9 @@ emits a bounded truncation finding.
 The middleware crate's Rust `ChainOutcome` now includes a typed termination
 reason. Rust consumers constructing that result must supply the new field;
 middleware protobuf messages and RPC signatures are unchanged.
+
+Credential preparation has its own child spans. They describe the mechanism,
+placement and bounded result, never token material. The primary audit record
+includes notable credential outcomes such as withholding or unavailable material;
+successful preparation does not create another routine HTTP record. A completed
+preparation span does not establish that the target received the request.
