@@ -83,3 +83,20 @@ the final head, a guard emits it with the available outcome instead. The byte
 observer does not buffer headers or alter transport behavior. A receipt confirms
 only observation of a response head, not completion of its body. Process crashes
 and requests that remain hung cannot be finalized by the guard.
+
+When selected, request and response middleware have separate child spans. Routine
+invocations stay in sampled traces; security findings and notable failures remain
+in OCSF output, linked by the same request ID. Each phase closes when its work
+ends rather than waiting for the entire request. Cancelling an unfinished phase
+marks its span as incomplete without inventing a middleware verdict.
+Streaming observations record flag transitions, not one attribute update per
+body unit, so long responses retain room for their final verdict.
+
+Middleware RPCs propagate the supervisor's current trace context, replacing
+caller-supplied trace metadata without changing bearer authentication. Response
+diagnostics have a session-wide budget; exceeding it preserves enforcement and
+emits a bounded truncation finding.
+
+The middleware crate's Rust `ChainOutcome` now includes a typed termination
+reason. Rust consumers constructing that result must supply the new field;
+middleware protobuf messages and RPC signatures are unchanged.

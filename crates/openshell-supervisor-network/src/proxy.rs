@@ -1919,6 +1919,7 @@ struct ForwardMiddlewarePipeline<'a> {
     scheme: &'a str,
     exchange: &'a crate::l7::middleware::HttpMiddlewareExchange,
     l7_reevaluation: Option<ForwardL7Reevaluation<'a>>,
+    correlation: Option<&'a crate::l7::correlation::RequestCorrelation>,
 }
 
 impl ForwardMiddlewarePipeline<'_> {
@@ -1955,6 +1956,7 @@ impl ForwardMiddlewarePipeline<'_> {
                 self.ctx,
                 self.scheme,
                 transformed_body_policy,
+                self.correlation,
             )
             .await
     }
@@ -6646,6 +6648,7 @@ async fn handle_forward_proxy(
             scheme: &scheme,
             exchange: &middleware_exchange,
             l7_reevaluation,
+            correlation: Some(&correlation),
         };
         // Middleware denials join the connect trace, like other FORWARD denials.
         forward_request_bytes = match pipeline
@@ -6654,16 +6657,17 @@ async fn handle_forward_proxy(
             .await?
         {
             crate::l7::middleware::MiddlewareApplyResult::Allowed(request) => request.raw_header,
-            crate::l7::middleware::MiddlewareApplyResult::Denied { denial, .. } => {
+            crate::l7::middleware::MiddlewareApplyResult::Denied {
+                denial,
+                termination,
+            } => {
                 emit_activity_simple(activity_tx, true, "middleware");
                 correlation.record_enforcement_action("block");
                 correlation.record_response_status(403);
-                correlation.record_final_http_outcome(if denial.is_some() {
-                    "denied"
-                } else {
-                    "platform_error"
-                });
-                correlation.record_error_stage("request_middleware");
+                let (outcome, stage) =
+                    crate::l7::middleware::request_rejection_correlation(termination);
+                correlation.record_final_http_outcome(outcome);
+                correlation.record_error_stage(stage);
                 let response = denial.as_ref().map_or_else(
                     || {
                         build_middleware_failure_response(
@@ -6712,6 +6716,7 @@ async fn handle_forward_proxy(
             &middleware_runner,
             &l7_ctx,
             "ws",
+            Some(&correlation),
         )
         .await;
         let preflight = match preflight {
@@ -6736,7 +6741,11 @@ async fn handle_forward_proxy(
                 return Ok(());
             }
         };
-        crate::l7::middleware::emit_websocket_preflight_events(&l7_ctx, &preflight);
+        crate::l7::middleware::emit_websocket_preflight_events(
+            &l7_ctx,
+            &preflight,
+            Some(&correlation),
+        );
         if preflight.terminal_reason.is_some() {
             correlation.record_enforcement_action("block");
             correlation.record_response_status(403);
@@ -11624,6 +11633,7 @@ network_policies:
                 engine: &tunnel_engine,
                 request_info: &request_info,
             }),
+            correlation: None,
         };
         let (_app, mut client) = tokio::io::duplex(8192);
 
@@ -11633,8 +11643,19 @@ network_policies:
             .expect("forward middleware pipeline");
 
         match outcome {
-            crate::l7::middleware::MiddlewareApplyResult::Denied { denial } => {
+            crate::l7::middleware::MiddlewareApplyResult::Denied {
+                denial,
+                termination,
+            } => {
                 assert!(denial.is_none());
+                assert_eq!(
+                    termination,
+                    openshell_supervisor_middleware::ChainTermination::TransformedBodyPolicyDenied
+                );
+                assert_eq!(
+                    crate::l7::middleware::request_rejection_correlation(termination),
+                    ("denied", "post_middleware_policy")
+                );
             }
             crate::l7::middleware::MiddlewareApplyResult::Allowed(_) => {
                 panic!("policy-invalid transformed request must be denied")
@@ -11723,6 +11744,7 @@ network_policies:
             scheme: "http",
             exchange: &exchange,
             l7_reevaluation: None,
+            correlation: None,
         };
         let (_app, mut client) = tokio::io::duplex(8192);
         let revoke = async {
@@ -14628,6 +14650,7 @@ network_policies:
             scheme: "http",
             exchange: &exchange,
             l7_reevaluation: None,
+            correlation: None,
         };
         let (_app, mut client) = tokio::io::duplex(8192);
 

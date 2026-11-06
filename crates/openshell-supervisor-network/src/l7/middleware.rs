@@ -3,6 +3,10 @@
 
 //! Supervisor middleware application for L7 requests.
 
+use crate::l7::correlation::{
+    MiddlewareObservation, MiddlewareOutcome, MiddlewarePhase, RequestCorrelation,
+    emit_phase_events,
+};
 use crate::l7::relay::L7EvalContext;
 use crate::opa::PolicyGenerationGuard;
 use crate::telemetry::egress_emit;
@@ -18,12 +22,30 @@ pub enum MiddlewareApplyResult {
     Allowed(crate::l7::provider::L7Request),
     Denied {
         denial: Option<openshell_supervisor_middleware::MiddlewareDenial>,
+        termination: openshell_supervisor_middleware::ChainTermination,
     },
     /// The platform's shared active-work and waiter capacities were both full.
     ///
     /// This is platform load shedding, not a selected middleware-stage failure,
     /// so callers must not apply a stage's `on_error` policy.
     AdmissionExhausted,
+}
+
+pub fn request_rejection_correlation(
+    termination: openshell_supervisor_middleware::ChainTermination,
+) -> (&'static str, &'static str) {
+    use openshell_supervisor_middleware::ChainTermination;
+
+    match termination {
+        ChainTermination::MiddlewareDenied => ("denied", "request_middleware"),
+        ChainTermination::TransformedBodyPolicyDenied => ("denied", "post_middleware_policy"),
+        ChainTermination::TransformedBodyPolicyEvaluationFailed => {
+            ("platform_error", "post_middleware_policy")
+        }
+        ChainTermination::Completed | ChainTermination::MiddlewareFailure => {
+            ("platform_error", "request_middleware")
+        }
+    }
 }
 
 /// One destination-selected middleware chain shared by an HTTP request and
@@ -59,6 +81,7 @@ impl HttpMiddlewareExchange {
         ctx: &L7EvalContext,
         scheme: &str,
         transformed_body_policy: openshell_supervisor_middleware::TransformedBodyPolicy<'_>,
+        correlation: Option<&RequestCorrelation>,
     ) -> Result<MiddlewareApplyResult>
     where
         C: AsyncRead + AsyncWrite + Unpin + Send,
@@ -73,6 +96,7 @@ impl HttpMiddlewareExchange {
             &self.generation_guard,
             transformed_body_policy,
             &self.request_id,
+            correlation,
         )
         .await
     }
@@ -177,17 +201,20 @@ pub fn emit_middleware_uninspectable(ctx: &L7EvalContext, detail: &str, denied: 
 pub fn emit_websocket_preflight_events(
     ctx: &L7EvalContext,
     outcome: &openshell_supervisor_middleware::WebSocketPreflightResult,
+    correlation: Option<&RequestCorrelation>,
 ) {
-    emit_websocket_invocations(ctx, &outcome.invocations);
-    emit_websocket_coverage(ctx, &outcome.coverage);
-    for event in websocket_preflight_finding_events(outcome) {
-        egress_emit!(event);
-    }
-    if outcome.saturated {
-        emit_websocket_saturation(ctx);
-    }
+    let mut events = websocket_invocation_events(ctx, &outcome.invocations);
+    events.extend(websocket_coverage_events(ctx, &outcome.coverage));
+    events.extend(websocket_preflight_finding_events(outcome));
     if outcome.session_capacity_exhausted {
-        emit_middleware_session_capacity_exhausted(ctx, !outcome.allowed);
+        events.push(middleware_session_capacity_exhausted_event(
+            ctx,
+            !outcome.allowed,
+        ));
+    }
+    emit_phase_events(correlation, MiddlewarePhase::Request, events);
+    if outcome.saturated {
+        emit_websocket_saturation(ctx, correlation);
     }
 }
 
@@ -195,8 +222,16 @@ pub(super) fn emit_websocket_coverage(
     ctx: &L7EvalContext,
     coverage: &[openshell_supervisor_middleware::WebSocketCoverage],
 ) {
+    emit_websocket_coverage_correlated(ctx, coverage, None);
+}
+
+fn emit_websocket_coverage_correlated(
+    ctx: &L7EvalContext,
+    coverage: &[openshell_supervisor_middleware::WebSocketCoverage],
+    correlation: Option<&RequestCorrelation>,
+) {
     for event in websocket_coverage_events(ctx, coverage) {
-        egress_emit!(event);
+        emit_phase_events(correlation, MiddlewarePhase::Request, [event]);
     }
 }
 
@@ -254,19 +289,18 @@ pub(super) fn emit_websocket_session_start_events(
     ctx: &L7EvalContext,
     outcome: &openshell_supervisor_middleware::WebSocketSessionStartOutcome,
 ) {
-    emit_websocket_invocations(ctx, &outcome.invocations);
+    crate::telemetry::emit_decision(websocket_invocation_events(ctx, &outcome.invocations), None);
 }
 
 pub(super) fn emit_websocket_message_events(
     ctx: &L7EvalContext,
     outcome: &openshell_supervisor_middleware::WebSocketMessageOutcome,
 ) {
-    emit_websocket_invocations(ctx, &outcome.invocations);
+    let mut events = websocket_invocation_events(ctx, &outcome.invocations);
+    events.extend(websocket_message_finding_events(outcome));
+    crate::telemetry::emit_decision(events, None);
     if outcome.saturated {
-        emit_websocket_saturation(ctx);
-    }
-    for event in websocket_message_finding_events(outcome) {
-        egress_emit!(event);
+        emit_websocket_saturation(ctx, None);
     }
 }
 
@@ -314,10 +348,11 @@ pub(super) fn middleware_finding_events(
         .collect()
 }
 
-fn emit_websocket_invocations(
+fn websocket_invocation_events(
     ctx: &L7EvalContext,
     invocations: &[openshell_supervisor_middleware::WebSocketInvocation],
-) {
+) -> Vec<openshell_ocsf::OcsfEvent> {
+    let mut events = Vec::new();
     for invocation in invocations {
         use openshell_supervisor_middleware::WebSocketInvocationOutcome as Outcome;
         let (action, disposition, severity, status, outcome_name) = match invocation.outcome {
@@ -388,7 +423,7 @@ fn emit_websocket_invocations(
                 invocation.transformed,
             ))
             .build();
-        egress_emit!(event);
+        events.push(event);
         if invocation.failed {
             let fail_closed = invocation.outcome == Outcome::FailClosed;
             let mut finding = DetectionFindingBuilder::new(openshell_ocsf::ctx::ctx());
@@ -414,7 +449,7 @@ fn emit_websocket_invocations(
                 ])
                 .message("WebSocket middleware stage failed")
                 .build();
-            egress_emit!(event);
+            events.push(event);
         }
         if invocation.stage_disabled {
             let event = DetectionFindingBuilder::new(openshell_ocsf::ctx::ctx())
@@ -434,12 +469,13 @@ fn emit_websocket_invocations(
                     "WebSocket middleware stage stream became unusable and was disabled for this session",
                 )
                 .build();
-            egress_emit!(event);
+            events.push(event);
         }
     }
+    events
 }
 
-fn emit_websocket_saturation(ctx: &L7EvalContext) {
+fn emit_websocket_saturation(ctx: &L7EvalContext, correlation: Option<&RequestCorrelation>) {
     let event = DetectionFindingBuilder::new(openshell_ocsf::ctx::ctx())
         .severity(SeverityId::Medium)
         .finding_info(FindingInfo::new(
@@ -453,10 +489,13 @@ fn emit_websocket_saturation(ctx: &L7EvalContext) {
         ])
         .message("WebSocket middleware work waited for admission capacity")
         .build();
-    egress_emit!(event);
+    emit_phase_events(correlation, MiddlewarePhase::Request, [event]);
 }
 
-fn emit_middleware_session_capacity_exhausted(ctx: &L7EvalContext, denied: bool) {
+fn middleware_session_capacity_exhausted_event(
+    ctx: &L7EvalContext,
+    denied: bool,
+) -> openshell_ocsf::OcsfEvent {
     let mut event = DetectionFindingBuilder::new(openshell_ocsf::ctx::ctx())
         .severity(SeverityId::Medium)
         .finding_info(FindingInfo::new(
@@ -472,7 +511,7 @@ fn emit_middleware_session_capacity_exhausted(ctx: &L7EvalContext, denied: bool)
     if denied {
         event = event.action(ActionId::Denied);
     }
-    egress_emit!(event.build());
+    event.build()
 }
 
 fn middleware_admission_exhausted_event(ctx: &L7EvalContext) -> openshell_ocsf::OcsfEvent {
@@ -493,8 +532,15 @@ fn middleware_admission_exhausted_event(ctx: &L7EvalContext) -> openshell_ocsf::
         .build()
 }
 
-fn emit_middleware_admission_exhausted(ctx: &L7EvalContext) {
-    egress_emit!(middleware_admission_exhausted_event(ctx));
+fn emit_middleware_admission_exhausted(
+    ctx: &L7EvalContext,
+    correlation: Option<&RequestCorrelation>,
+) {
+    emit_phase_events(
+        correlation,
+        MiddlewarePhase::Request,
+        [middleware_admission_exhausted_event(ctx)],
+    );
 }
 
 /// Largest body-buffering limit across the entries that actually resolved to a
@@ -526,6 +572,7 @@ pub async fn apply_middleware_chain_with_request_id<C: AsyncRead + AsyncWrite + 
     generation_guard: &PolicyGenerationGuard,
     transformed_body_policy: openshell_supervisor_middleware::TransformedBodyPolicy<'_>,
     request_id: &str,
+    correlation: Option<&RequestCorrelation>,
 ) -> Result<MiddlewareApplyResult> {
     apply_middleware_chain_for_scheme_with_request_id(
         req,
@@ -537,6 +584,7 @@ pub async fn apply_middleware_chain_with_request_id<C: AsyncRead + AsyncWrite + 
         generation_guard,
         transformed_body_policy,
         request_id,
+        correlation,
     )
     .await
 }
@@ -554,11 +602,20 @@ pub async fn apply_middleware_chain_for_scheme_with_request_id<
     generation_guard: &PolicyGenerationGuard,
     transformed_body_policy: openshell_supervisor_middleware::TransformedBodyPolicy<'_>,
     request_id: &str,
+    correlation: Option<&RequestCorrelation>,
 ) -> Result<MiddlewareApplyResult> {
     if chain.is_empty() {
         return Ok(MiddlewareApplyResult::Allowed(req));
     }
     let chain = runner.describe_chain(&chain).await?;
+    if chain.is_empty() {
+        return Ok(MiddlewareApplyResult::Allowed(req));
+    }
+    let _phase =
+        correlation.map(|correlation| correlation.begin_middleware(MiddlewarePhase::Request));
+    if let Some(correlation) = correlation {
+        correlation.observe_middleware(MiddlewarePhase::Request, MiddlewareObservation::default());
+    }
     let admission = if chain.is_empty() {
         None
     } else {
@@ -568,7 +625,20 @@ pub async fn apply_middleware_chain_for_scheme_with_request_id<
                 admission,
             ) => Some(admission),
             openshell_supervisor_middleware::MiddlewareWorkAdmissionOutcome::QueueExhausted => {
-                emit_middleware_admission_exhausted(ctx);
+                emit_middleware_admission_exhausted(ctx, correlation);
+                if let Some(correlation) = correlation {
+                    correlation.observe_middleware(
+                        MiddlewarePhase::Request,
+                        MiddlewareObservation {
+                            admission_exhausted: true,
+                            ..Default::default()
+                        },
+                    );
+                    correlation.complete_middleware(
+                        MiddlewarePhase::Request,
+                        MiddlewareOutcome::PlatformError,
+                    );
+                }
                 return Ok(MiddlewareApplyResult::AdmissionExhausted);
             }
         }
@@ -589,20 +659,27 @@ pub async fn apply_middleware_chain_for_scheme_with_request_id<
             Vec::new(),
             request_id,
         );
-        let outcome = runner
-            .evaluate_described_with_policy_admitted(
-                &chain,
-                input,
-                openshell_supervisor_middleware::TransformedBodyPolicy::NotPolicyRelevant,
-                admission,
-            )
-            .await?;
-        emit_middleware_events(ctx, &req, &outcome);
+        let evaluation = runner.evaluate_described_with_policy_admitted(
+            &chain,
+            input,
+            openshell_supervisor_middleware::TransformedBodyPolicy::NotPolicyRelevant,
+            admission,
+        );
+        let outcome = if let Some(correlation) = correlation {
+            correlation
+                .within_middleware(MiddlewarePhase::Request, evaluation)
+                .await?
+        } else {
+            evaluation.await?
+        };
+        observe_request_chain_outcome(correlation, &outcome);
+        emit_middleware_events(ctx, &req, &outcome, correlation);
         return Ok(if outcome.allowed {
             MiddlewareApplyResult::Allowed(req)
         } else {
             MiddlewareApplyResult::Denied {
                 denial: outcome.denial,
+                termination: outcome.termination,
             }
         });
     };
@@ -620,7 +697,10 @@ pub async fn apply_middleware_chain_for_scheme_with_request_id<
     {
         crate::l7::rest::BufferResult::Buffered(buffered) => buffered,
         crate::l7::rest::BufferResult::OverCapacity { recoverable } => {
-            return Ok(resolve_unbuffered_body(ctx, req, &chain, recoverable));
+            let result =
+                resolve_unbuffered_body_correlated(ctx, req, &chain, recoverable, correlation);
+            observe_unbuffered_request_outcome(correlation, &chain, &result);
+            return Ok(result);
         }
     };
     let headers = safe_middleware_headers(&buffered.headers)?;
@@ -639,18 +719,25 @@ pub async fn apply_middleware_chain_for_scheme_with_request_id<
     // The explicitly selected transformation policy either re-checks every
     // replacement or documents that this protocol's policy is body-independent.
     // An ALLOW outcome therefore means the final body is policy-compliant.
-    let outcome = runner
-        .evaluate_described_with_policy_admitted(
-            &chain,
-            input,
-            transformed_body_policy,
-            Some(admission),
-        )
-        .await?;
-    emit_middleware_events(ctx, &req, &outcome);
+    let evaluation = runner.evaluate_described_with_policy_admitted(
+        &chain,
+        input,
+        transformed_body_policy,
+        Some(admission),
+    );
+    let outcome = if let Some(correlation) = correlation {
+        correlation
+            .within_middleware(MiddlewarePhase::Request, evaluation)
+            .await?
+    } else {
+        evaluation.await?
+    };
+    observe_request_chain_outcome(correlation, &outcome);
+    emit_middleware_events(ctx, &req, &outcome, correlation);
     if !outcome.allowed {
         return Ok(MiddlewareApplyResult::Denied {
             denial: outcome.denial,
+            termination: outcome.termination,
         });
     }
     let rebuilt = crate::l7::rest::rebuild_request_with_buffered_body(
@@ -660,6 +747,84 @@ pub async fn apply_middleware_chain_for_scheme_with_request_id<
         &outcome.header_mutations,
     )?;
     Ok(MiddlewareApplyResult::Allowed(rebuilt))
+}
+
+fn observe_request_chain_outcome(
+    correlation: Option<&RequestCorrelation>,
+    outcome: &openshell_supervisor_middleware::ChainOutcome,
+) {
+    let Some(correlation) = correlation else {
+        return;
+    };
+    let (observation, middleware_outcome) = request_chain_observation(outcome);
+    correlation.observe_middleware(MiddlewarePhase::Request, observation);
+    correlation.complete_middleware(MiddlewarePhase::Request, middleware_outcome);
+}
+
+fn request_chain_observation(
+    outcome: &openshell_supervisor_middleware::ChainOutcome,
+) -> (MiddlewareObservation, MiddlewareOutcome) {
+    let observation = MiddlewareObservation {
+        mutated: outcome
+            .applied
+            .iter()
+            .any(|invocation| invocation.transformed),
+        fail_open: outcome.applied.iter().any(|invocation| {
+            invocation.failed && invocation.decision == openshell_core::proto::Decision::Allow
+        }),
+        fail_closed: outcome.applied.iter().any(|invocation| {
+            invocation.failed && invocation.decision == openshell_core::proto::Decision::Deny
+        }),
+        admission_exhausted: false,
+        ..Default::default()
+    };
+    let middleware_outcome = match outcome.termination {
+        openshell_supervisor_middleware::ChainTermination::Completed
+        | openshell_supervisor_middleware::ChainTermination::TransformedBodyPolicyDenied
+        | openshell_supervisor_middleware::ChainTermination::TransformedBodyPolicyEvaluationFailed => {
+            MiddlewareOutcome::Allowed
+        }
+        openshell_supervisor_middleware::ChainTermination::MiddlewareDenied => {
+            MiddlewareOutcome::Denied
+        }
+        openshell_supervisor_middleware::ChainTermination::MiddlewareFailure => {
+            MiddlewareOutcome::PlatformError
+        }
+    };
+    (observation, middleware_outcome)
+}
+
+fn observe_unbuffered_request_outcome(
+    correlation: Option<&RequestCorrelation>,
+    chain: &[openshell_supervisor_middleware::DescribedChainEntry],
+    result: &MiddlewareApplyResult,
+) {
+    let Some(correlation) = correlation else {
+        return;
+    };
+    let fail_open = chain
+        .iter()
+        .any(|entry| entry.on_error() == openshell_supervisor_middleware::OnError::FailOpen);
+    let fail_closed = chain
+        .iter()
+        .any(|entry| entry.on_error() == openshell_supervisor_middleware::OnError::FailClosed);
+    correlation.observe_middleware(
+        MiddlewarePhase::Request,
+        MiddlewareObservation {
+            fail_open,
+            fail_closed,
+            ..Default::default()
+        },
+    );
+    let outcome = match result {
+        MiddlewareApplyResult::Allowed(_) => MiddlewareOutcome::Allowed,
+        MiddlewareApplyResult::Denied {
+            denial: Some(_), ..
+        } => MiddlewareOutcome::Denied,
+        MiddlewareApplyResult::Denied { denial: None, .. }
+        | MiddlewareApplyResult::AdmissionExhausted => MiddlewareOutcome::PlatformError,
+    };
+    correlation.complete_middleware(MiddlewarePhase::Request, outcome);
 }
 
 pub async fn send_middleware_rejection_response<C: AsyncRead + AsyncWrite + Unpin + Send>(
@@ -789,24 +954,42 @@ pub(super) fn raw_query_from_request_headers(headers: &[u8]) -> Result<String> {
 /// would individually fail with `request_body_over_capacity`; the aggregate is
 /// a deny unless every attached middleware is `fail_open`, and passing the
 /// body through is only safe when no bytes were consumed.
+#[cfg(test)]
 pub(super) fn resolve_unbuffered_body(
     ctx: &L7EvalContext,
     req: crate::l7::provider::L7Request,
     chain: &[openshell_supervisor_middleware::DescribedChainEntry],
     recoverable: bool,
 ) -> MiddlewareApplyResult {
+    resolve_unbuffered_body_correlated(ctx, req, chain, recoverable, None)
+}
+
+fn resolve_unbuffered_body_correlated(
+    ctx: &L7EvalContext,
+    req: crate::l7::provider::L7Request,
+    chain: &[openshell_supervisor_middleware::DescribedChainEntry],
+    recoverable: bool,
+    correlation: Option<&RequestCorrelation>,
+) -> MiddlewareApplyResult {
     let all_fail_open = chain
         .iter()
         .all(|entry| entry.on_error() == openshell_supervisor_middleware::OnError::FailOpen);
     if recoverable && all_fail_open {
-        emit_middleware_body_unavailable(ctx, false);
+        emit_middleware_body_unavailable(ctx, false, correlation);
         return MiddlewareApplyResult::Allowed(req);
     }
-    emit_middleware_body_unavailable(ctx, true);
-    MiddlewareApplyResult::Denied { denial: None }
+    emit_middleware_body_unavailable(ctx, true, correlation);
+    MiddlewareApplyResult::Denied {
+        denial: None,
+        termination: openshell_supervisor_middleware::ChainTermination::MiddlewareFailure,
+    }
 }
 
-fn emit_middleware_body_unavailable(ctx: &L7EvalContext, denied: bool) {
+fn emit_middleware_body_unavailable(
+    ctx: &L7EvalContext,
+    denied: bool,
+    correlation: Option<&RequestCorrelation>,
+) {
     let mut event = DetectionFindingBuilder::new(openshell_ocsf::ctx::ctx())
         .severity(if denied {
             SeverityId::High
@@ -830,7 +1013,7 @@ fn emit_middleware_body_unavailable(ctx: &L7EvalContext, denied: bool) {
     if denied {
         event = event.action(ActionId::Denied);
     }
-    egress_emit!(event.build());
+    emit_phase_events(correlation, MiddlewarePhase::Request, [event.build()]);
 }
 
 /// Parse the raw header block into middleware-visible headers, preserving
@@ -916,6 +1099,23 @@ pub(super) fn middleware_events(
     let mut events = Vec::new();
     for invocation in &outcome.applied {
         let allowed = invocation.decision == openshell_core::proto::Decision::Allow;
+        let failed = invocation.failed;
+        let status_detail = if failed {
+            Some(if allowed {
+                "middleware_failed_open".to_string()
+            } else {
+                "middleware_failed_closed".to_string()
+            })
+        } else {
+            outcome.denial.as_ref().and_then(|denial| {
+                (denial.config_name == invocation.name).then(|| {
+                    denial.reason_code.as_ref().map_or_else(
+                        || format!("middleware_denied:{}", denial.config_name),
+                        |code| format!("middleware_denied:{}:{code}", denial.config_name),
+                    )
+                })
+            })
+        };
         let mut event = HttpActivityBuilder::new(openshell_ocsf::ctx::ctx())
             .activity(ActivityId::Other)
             .action(if allowed {
@@ -928,10 +1128,10 @@ pub(super) fn middleware_events(
             } else {
                 DispositionId::Blocked
             })
-            .severity(if allowed {
-                SeverityId::Informational
-            } else {
+            .severity(if failed || !allowed {
                 SeverityId::Medium
+            } else {
+                SeverityId::Informational
             })
             .http_request(HttpRequest::new(&req.action, ctx.ocsf_url(&req.target)))
             .dst_endpoint(Endpoint::from_domain(&ctx.host, ctx.port))
@@ -942,10 +1142,13 @@ pub(super) fn middleware_events(
                 "MIDDLEWARE {} {} decision={:?}",
                 invocation.name, invocation.implementation, invocation.decision
             ));
-        if !allowed && !outcome.reason.is_empty() {
-            event = event
-                .status(StatusId::Failure)
-                .status_detail(&outcome.reason);
+        event = event.status(if failed || !allowed {
+            StatusId::Failure
+        } else {
+            StatusId::Success
+        });
+        if let Some(status_detail) = status_detail {
+            event = event.status_detail(status_detail);
         }
         let event = event.build();
         events.push(event);
@@ -1019,8 +1222,13 @@ fn emit_middleware_events(
     ctx: &L7EvalContext,
     req: &crate::l7::provider::L7Request,
     outcome: &openshell_supervisor_middleware::ChainOutcome,
+    correlation: Option<&RequestCorrelation>,
 ) {
-    crate::telemetry::emit_decision(middleware_events(ctx, req, outcome), None);
+    emit_phase_events(
+        correlation,
+        MiddlewarePhase::Request,
+        middleware_events(ctx, req, outcome),
+    );
 }
 
 #[cfg(test)]
@@ -1057,6 +1265,7 @@ mod trace_tests {
             metadata: std::collections::BTreeMap::new(),
             applied,
             denial: None,
+            termination: openshell_supervisor_middleware::ChainTermination::Completed,
         }
     }
 
@@ -1077,20 +1286,23 @@ mod trace_tests {
         };
         for (outcome, action_id) in [(Outcome::FailClosed, Some(2)), (Outcome::FailOpen, None)] {
             let (events, _) = exported("warn", || {
-                emit_websocket_invocations(
-                    &L7EvalContext::default(),
-                    &[WebSocketInvocation {
-                        config_name: "guard".to_string(),
-                        implementation: "test/guard".to_string(),
-                        outcome,
-                        sequence: None,
-                        original_size: 0,
-                        replacement_size: None,
-                        transformed: false,
-                        failed: true,
-                        stage_disabled: false,
-                        reason_code: None,
-                    }],
+                crate::telemetry::emit_decision(
+                    websocket_invocation_events(
+                        &L7EvalContext::default(),
+                        &[WebSocketInvocation {
+                            config_name: "guard".to_string(),
+                            implementation: "test/guard".to_string(),
+                            outcome,
+                            sequence: None,
+                            original_size: 0,
+                            replacement_size: None,
+                            transformed: false,
+                            failed: true,
+                            stage_disabled: false,
+                            reason_code: None,
+                        }],
+                    ),
+                    None,
                 );
             })
             .await;
@@ -1128,7 +1340,7 @@ mod trace_tests {
             let (events, received) = exported("warn", || {
                 let ctx = L7EvalContext::default();
                 emit_middleware_uninspectable(&ctx, "unknown protocol", denied);
-                emit_middleware_body_unavailable(&ctx, denied);
+                emit_middleware_body_unavailable(&ctx, denied, None);
             })
             .await;
             assert_eq!(events.len(), 2);
@@ -1169,6 +1381,7 @@ mod trace_tests {
                         saturated: false,
                         session_capacity_exhausted: true,
                     },
+                    None,
                 );
             })
             .await;
@@ -1211,6 +1424,7 @@ mod trace_tests {
                     &L7EvalContext::default(),
                     &request(),
                     &outcome(allowed, reason, vec![invocation], vec![finding()]),
+                    None,
                 );
             })
             .await;
@@ -1228,10 +1442,13 @@ mod trace_tests {
 #[cfg(test)]
 mod tests {
     use super::{
-        middleware_admission_exhausted_event, safe_middleware_headers,
-        send_middleware_rejection_response, websocket_coverage_events,
-        websocket_message_finding_events, websocket_preflight_finding_events,
+        emit_middleware_events, emit_websocket_message_events, emit_websocket_preflight_events,
+        middleware_admission_exhausted_event, request_chain_observation,
+        request_rejection_correlation, safe_middleware_headers, send_middleware_rejection_response,
+        websocket_coverage_events, websocket_message_finding_events,
+        websocket_preflight_finding_events,
     };
+    use crate::l7::correlation::{MiddlewareObservation, MiddlewareOutcome, RequestCorrelation};
     use crate::l7::relay::L7EvalContext;
     use tokio::io::AsyncReadExt;
 
@@ -1247,10 +1464,6 @@ mod tests {
 
         let serialized = serde_json::to_string(&middleware_admission_exhausted_event(&ctx))
             .expect("serialize admission event");
-        let event: serde_json::Value = serde_json::from_str(&serialized).unwrap();
-        assert_eq!(event["class_uid"], 2004);
-        assert_eq!(event["action_id"], 2);
-        assert_eq!(event["action"], "Denied");
         assert!(serialized.contains("openshell.middleware.admission_exhausted"));
         assert!(serialized.contains("api-policy"));
         assert!(serialized.contains("api.example.test"));
@@ -1616,5 +1829,344 @@ mod tests {
                 "middleware must reject malformed header fields"
             );
         }
+    }
+
+    #[test]
+    fn request_chain_observation_maps_only_bounded_aggregate_state() {
+        use openshell_core::proto::Decision;
+        use openshell_supervisor_middleware::{
+            ChainOutcome, ChainTermination, MiddlewareDenial, MiddlewareInvocation,
+        };
+
+        let outcome = |allowed, denial, termination, applied| ChainOutcome {
+            allowed,
+            reason: "SENTINEL_UNTRUSTED_REASON".into(),
+            body: b"SENTINEL_UNTRUSTED_BODY".to_vec(),
+            header_mutations: Vec::new(),
+            findings: Vec::new(),
+            metadata: std::collections::BTreeMap::new(),
+            applied,
+            denial,
+            termination,
+        };
+        let invocation = |decision, transformed, failed| MiddlewareInvocation {
+            name: "SENTINEL_UNTRUSTED_NAME".into(),
+            implementation: "SENTINEL_UNTRUSTED_IMPLEMENTATION".into(),
+            decision,
+            transformed,
+            failed,
+        };
+
+        assert_eq!(
+            request_chain_observation(&outcome(
+                true,
+                None,
+                ChainTermination::Completed,
+                vec![invocation(Decision::Allow, true, false)],
+            )),
+            (
+                MiddlewareObservation {
+                    mutated: true,
+                    ..Default::default()
+                },
+                MiddlewareOutcome::Allowed,
+            )
+        );
+        assert_eq!(
+            request_rejection_correlation(ChainTermination::TransformedBodyPolicyDenied),
+            ("denied", "post_middleware_policy")
+        );
+        assert_eq!(
+            request_rejection_correlation(ChainTermination::TransformedBodyPolicyEvaluationFailed),
+            ("platform_error", "post_middleware_policy")
+        );
+        assert_eq!(
+            request_chain_observation(&outcome(
+                true,
+                None,
+                ChainTermination::Completed,
+                vec![invocation(Decision::Allow, false, true)],
+            )),
+            (
+                MiddlewareObservation {
+                    fail_open: true,
+                    ..Default::default()
+                },
+                MiddlewareOutcome::Allowed,
+            )
+        );
+        assert_eq!(
+            request_chain_observation(&outcome(
+                false,
+                Some(MiddlewareDenial {
+                    config_name: "SENTINEL_UNTRUSTED_NAME".into(),
+                    reason_code: Some("SENTINEL_UNTRUSTED_REASON".into()),
+                }),
+                ChainTermination::MiddlewareDenied,
+                vec![invocation(Decision::Deny, false, false)],
+            )),
+            (MiddlewareObservation::default(), MiddlewareOutcome::Denied)
+        );
+        assert_eq!(
+            request_chain_observation(&outcome(
+                false,
+                None,
+                ChainTermination::MiddlewareFailure,
+                vec![invocation(Decision::Deny, false, true)],
+            )),
+            (
+                MiddlewareObservation {
+                    fail_closed: true,
+                    ..Default::default()
+                },
+                MiddlewareOutcome::PlatformError,
+            )
+        );
+        assert_eq!(
+            request_chain_observation(&outcome(
+                false,
+                None,
+                ChainTermination::TransformedBodyPolicyDenied,
+                vec![invocation(Decision::Allow, true, false)],
+            )),
+            (
+                MiddlewareObservation {
+                    mutated: true,
+                    ..Default::default()
+                },
+                MiddlewareOutcome::Allowed,
+            )
+        );
+        assert_eq!(
+            request_chain_observation(&outcome(
+                false,
+                None,
+                ChainTermination::TransformedBodyPolicyEvaluationFailed,
+                vec![invocation(Decision::Allow, true, false)],
+            )),
+            (
+                MiddlewareObservation {
+                    mutated: true,
+                    ..Default::default()
+                },
+                MiddlewareOutcome::Allowed,
+            )
+        );
+    }
+
+    #[test]
+    fn correlated_middleware_keeps_one_primary_without_payload_or_reason() {
+        use openshell_core::proto::Decision;
+        use openshell_supervisor_middleware::{
+            ChainOutcome, ChainTermination, MiddlewareDenial, MiddlewareInvocation,
+        };
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        const REQUEST_ID: &str = "00000000-0000-4000-8000-000000000080";
+        const SENTINEL: &str = "SENTINEL_PRIVATE_MIDDLEWARE_VALUE";
+        let ctx = L7EvalContext {
+            host: "api.example.test".into(),
+            port: 443,
+            policy_name: "api-policy".into(),
+            ..Default::default()
+        };
+        let request = crate::l7::provider::L7Request {
+            action: "POST".into(),
+            target: "/v1/search".into(),
+            query_params: std::collections::HashMap::new(),
+            raw_header: Vec::new(),
+            body_length: crate::l7::provider::BodyLength::ContentLength(1),
+        };
+        let outcome = ChainOutcome {
+            allowed: false,
+            reason: format!("middleware_denied:{SENTINEL}"),
+            body: SENTINEL.as_bytes().to_vec(),
+            header_mutations: Vec::new(),
+            findings: Vec::new(),
+            metadata: std::collections::BTreeMap::new(),
+            applied: vec![
+                MiddlewareInvocation {
+                    name: "request-redactor".into(),
+                    implementation: "test/redactor".into(),
+                    decision: Decision::Allow,
+                    transformed: true,
+                    failed: false,
+                },
+                MiddlewareInvocation {
+                    name: "request-guard".into(),
+                    implementation: "test/guard".into(),
+                    decision: Decision::Deny,
+                    transformed: false,
+                    failed: false,
+                },
+            ],
+            denial: Some(MiddlewareDenial {
+                config_name: "request-guard".into(),
+                reason_code: Some("content_match".into()),
+            }),
+            termination: ChainTermination::MiddlewareDenied,
+        };
+        let ocsf = openshell_ocsf::test_support::OcsfCapture::default();
+        let subscriber = tracing_subscriber::registry().with(ocsf.clone());
+
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::callsite::rebuild_interest_cache();
+            let correlation =
+                RequestCorrelation::with_request_id(&request, &ctx, REQUEST_ID.to_string());
+            emit_middleware_events(&ctx, &request, &outcome, Some(&correlation));
+            super::observe_request_chain_outcome(Some(&correlation), &outcome);
+            correlation.record_final_http_outcome("denied");
+            correlation.response_selected(403);
+        });
+
+        let events = ocsf
+            .json_events()
+            .into_iter()
+            .filter(|event| event["class_uid"] == 4002)
+            .collect::<Vec<_>>();
+        assert_eq!(events.len(), 1);
+        assert!(
+            events
+                .iter()
+                .all(|event| { event["metadata"]["correlation_uid"] == REQUEST_ID })
+        );
+        assert!(events.iter().any(|event| event["action"] == "Denied"));
+        assert!(!serde_json::to_string(&events).unwrap().contains(SENTINEL));
+    }
+
+    #[test]
+    fn branch08_detailed_middleware_event_without_request_correlation_has_no_receipt() {
+        use openshell_core::proto::Decision;
+        use openshell_supervisor_middleware::{
+            ChainOutcome, ChainTermination, MiddlewareInvocation,
+        };
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let ctx = L7EvalContext {
+            host: "api.example.test".into(),
+            port: 443,
+            policy_name: "api-policy".into(),
+            ..Default::default()
+        };
+        let request = crate::l7::provider::L7Request {
+            action: "GET".into(),
+            target: "/health".into(),
+            query_params: std::collections::HashMap::new(),
+            raw_header: Vec::new(),
+            body_length: crate::l7::provider::BodyLength::None,
+        };
+        let outcome = ChainOutcome {
+            allowed: true,
+            reason: "allowed".into(),
+            body: Vec::new(),
+            header_mutations: Vec::new(),
+            findings: Vec::new(),
+            metadata: std::collections::BTreeMap::new(),
+            applied: vec![MiddlewareInvocation {
+                name: "request-guard".into(),
+                implementation: "test/guard".into(),
+                decision: Decision::Allow,
+                transformed: false,
+                failed: false,
+            }],
+            denial: None,
+            termination: ChainTermination::Completed,
+        };
+        let ocsf = openshell_ocsf::test_support::OcsfCapture::default();
+        let subscriber = tracing_subscriber::registry().with(ocsf.clone());
+
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::callsite::rebuild_interest_cache();
+            emit_middleware_events(&ctx, &request, &outcome, None);
+        });
+
+        let event = ocsf
+            .json_events()
+            .into_iter()
+            .find(|event| event["firewall_rule"]["type"] == "middleware")
+            .expect("detailed middleware event");
+        assert!(event["metadata"].get("correlation_uid").is_none());
+    }
+
+    #[test]
+    fn branch08_websocket_only_correlates_upgrade_preflight_events() {
+        use openshell_supervisor_middleware::{
+            WebSocketInvocation, WebSocketInvocationOutcome, WebSocketMessageOutcome,
+            WebSocketPreflightResult,
+        };
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        const REQUEST_ID: &str = "00000000-0000-4000-8000-000000000081";
+        let ctx = L7EvalContext {
+            host: "stream.example.test".into(),
+            port: 443,
+            policy_name: "stream-policy".into(),
+            ..Default::default()
+        };
+        let request = crate::l7::provider::L7Request {
+            action: "GET".into(),
+            target: "/socket".into(),
+            query_params: std::collections::HashMap::new(),
+            raw_header: Vec::new(),
+            body_length: crate::l7::provider::BodyLength::None,
+        };
+        let invocation = |outcome| WebSocketInvocation {
+            config_name: "socket-guard".into(),
+            implementation: "test/socket-guard".into(),
+            outcome,
+            sequence: None,
+            original_size: 0,
+            replacement_size: None,
+            transformed: false,
+            failed: false,
+            stage_disabled: false,
+            reason_code: None,
+        };
+        let preflight = WebSocketPreflightResult {
+            allowed: false,
+            terminal_reason: Some(
+                openshell_core::proto::MiddlewareSessionEndReason::MiddlewareDenial,
+            ),
+            reason: "SENTINEL_PRIVATE_PREFLIGHT_REASON".into(),
+            denial: None,
+            session: None,
+            findings: Vec::new(),
+            metadata: std::collections::BTreeMap::new(),
+            invocations: vec![invocation(WebSocketInvocationOutcome::Deny)],
+            coverage: Vec::new(),
+            saturated: false,
+            session_capacity_exhausted: false,
+        };
+        let message = WebSocketMessageOutcome {
+            allowed: true,
+            reason: "allowed".into(),
+            payload: "SENTINEL_PRIVATE_MESSAGE".into(),
+            findings: Vec::new(),
+            metadata: std::collections::BTreeMap::new(),
+            invocations: vec![invocation(WebSocketInvocationOutcome::Allow)],
+            denial: None,
+            saturated: false,
+            platform_oversize: false,
+        };
+        let ocsf = openshell_ocsf::test_support::OcsfCapture::default();
+        let subscriber = tracing_subscriber::registry().with(ocsf.clone());
+
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::callsite::rebuild_interest_cache();
+            let correlation =
+                RequestCorrelation::with_request_id(&request, &ctx, REQUEST_ID.to_string());
+            emit_websocket_preflight_events(&ctx, &preflight, Some(&correlation));
+            emit_websocket_message_events(&ctx, &message);
+        });
+
+        let events = ocsf
+            .json_events()
+            .into_iter()
+            .filter(|event| event["firewall_rule"]["type"] == "supervisor-middleware")
+            .collect::<Vec<_>>();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0]["metadata"]["correlation_uid"], REQUEST_ID);
+        assert!(events[1]["metadata"].get("correlation_uid").is_none());
+        assert!(!serde_json::to_string(&events).unwrap().contains("SENTINEL"));
     }
 }
