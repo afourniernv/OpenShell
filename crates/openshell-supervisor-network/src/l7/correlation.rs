@@ -38,8 +38,28 @@ struct RequestState {
     outcome: Option<&'static str>,
     policy_span: Option<tracing::Span>,
     middleware: [Option<MiddlewareState>; 2],
+    resources: ResourceCorrelationState,
     credential: CredentialState,
     credential_span: Option<tracing::Span>,
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct ResourceCorrelationState {
+    policy_runtime_generation: Option<u64>,
+    policy_endpoint: Option<PolicyEndpointResources>,
+    provider_credential: Option<ProviderCredentialResources>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct PolicyEndpointResources {
+    policy_hash: String,
+    endpoint_id: String,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct ProviderCredentialResources {
+    environment_revision: String,
+    installation_id: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -335,6 +355,11 @@ impl RequestCorrelation {
             "server.address" = %ctx.host,
             "server.port" = ctx.port,
             "openshell.policy.name" = %ctx.policy_name,
+            "openshell.policy.runtime_generation" = tracing::field::Empty,
+            "openshell.policy.hash" = tracing::field::Empty,
+            "openshell.endpoint.id" = tracing::field::Empty,
+            "openshell.provider.environment.revision" = tracing::field::Empty,
+            "openshell.provider.credential.installation.id" = tracing::field::Empty,
             "openshell.target.reached" = false,
             "openshell.request.delivery_started" = false,
             "openshell.policy.decision" = tracing::field::Empty,
@@ -360,6 +385,7 @@ impl RequestCorrelation {
                 outcome: None,
                 policy_span: None,
                 middleware: [None, None],
+                resources: ResourceCorrelationState::default(),
                 credential: CredentialState::default(),
                 credential_span: None,
             })),
@@ -446,6 +472,75 @@ impl RequestCorrelation {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .upstream_status = Some(status);
+    }
+
+    pub(crate) fn record_policy_runtime_generation(&self, generation: u64) {
+        {
+            let mut resources = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let resources = &mut resources.resources;
+            if resources.policy_runtime_generation.is_some() {
+                return;
+            }
+            resources.policy_runtime_generation = Some(generation);
+        }
+        self.span.record(
+            "openshell.policy.runtime_generation",
+            tracing::field::display(generation),
+        );
+    }
+
+    pub(crate) fn record_selected_policy_endpoint(&self, policy_hash: &str, endpoint_id: &str) {
+        {
+            let mut resources = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let resources = &mut resources.resources;
+            if resources.policy_endpoint.is_some() {
+                return;
+            }
+            let Some(policy_endpoint) = policy_endpoint_resources(policy_hash, endpoint_id) else {
+                return;
+            };
+            resources.policy_endpoint = Some(policy_endpoint);
+        }
+        self.span.record("openshell.policy.hash", policy_hash);
+        self.span.record("openshell.endpoint.id", endpoint_id);
+    }
+
+    pub(crate) fn record_provider_credential_snapshot(
+        &self,
+        snapshot: &openshell_core::provider_credentials::ProviderCredentialSnapshot,
+    ) {
+        let installation_id = {
+            let mut resources = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let resources = &mut resources.resources;
+            if resources.provider_credential.is_some() {
+                return;
+            }
+            let Ok(installation_id) = uuid::Uuid::parse_str(&snapshot.installation_id) else {
+                return;
+            };
+            resources.provider_credential = Some(ProviderCredentialResources {
+                environment_revision: snapshot.revision.to_string(),
+                installation_id: installation_id.hyphenated().to_string(),
+            });
+            installation_id
+        };
+        self.span.record(
+            "openshell.provider.environment.revision",
+            tracing::field::display(snapshot.revision),
+        );
+        self.span.record(
+            "openshell.provider.credential.installation.id",
+            tracing::field::display(installation_id.hyphenated()),
+        );
     }
 
     pub(crate) fn record_target_reached(&self) {
@@ -818,8 +913,17 @@ impl RequestCorrelation {
         self.emit_correlated(event);
     }
 
-    fn emit_correlated(&self, mut event: OcsfEvent) {
+    fn enrich_event(&self, event: &mut OcsfEvent) {
         event.set_correlation_uid(self.request_id.clone());
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        add_resource_fields(event, &state.resources);
+    }
+
+    fn emit_correlated(&self, mut event: OcsfEvent) {
+        self.enrich_event(&mut event);
         self.span
             .in_scope(|| crate::telemetry::emit_correlated(event));
     }
@@ -900,7 +1004,7 @@ pub fn emit_phase_events(
                 continue;
             }
         }
-        event.set_correlation_uid(correlation.request_id.clone());
+        correlation.enrich_event(&mut event);
         span.in_scope(|| crate::telemetry::emit_correlated(event));
     }
 }
@@ -982,6 +1086,51 @@ impl<C: AsyncWrite + Unpin> AsyncWrite for AuditedClient<'_, C> {
     }
 }
 
+fn policy_endpoint_resources(
+    policy_hash: &str,
+    endpoint_id: &str,
+) -> Option<PolicyEndpointResources> {
+    const ENDPOINT_PREFIX: &str = "endpoint:v1:";
+    if !is_lower_hex_digest(policy_hash)
+        || endpoint_id
+            .strip_prefix(ENDPOINT_PREFIX)
+            .is_none_or(|digest| !is_lower_hex_digest(digest))
+    {
+        return None;
+    }
+    Some(PolicyEndpointResources {
+        policy_hash: policy_hash.to_string(),
+        endpoint_id: endpoint_id.to_string(),
+    })
+}
+
+fn is_lower_hex_digest(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn add_resource_fields(event: &mut OcsfEvent, resources: &ResourceCorrelationState) {
+    if let Some(generation) = resources.policy_runtime_generation {
+        event.add_unmapped("policy_runtime_generation", generation.to_string());
+    }
+    if let Some(policy_endpoint) = &resources.policy_endpoint {
+        event.add_unmapped("policy_hash", policy_endpoint.policy_hash.clone());
+        event.add_unmapped("endpoint_id", policy_endpoint.endpoint_id.clone());
+    }
+    if let Some(provider_credential) = &resources.provider_credential {
+        event.add_unmapped(
+            "provider_environment_revision",
+            provider_credential.environment_revision.clone(),
+        );
+        event.add_unmapped(
+            "provider_credential_installation_id",
+            provider_credential.installation_id.clone(),
+        );
+    }
+}
+
 fn bounded_http_method(method: &str) -> &'static str {
     [
         "CONNECT", "DELETE", "GET", "HEAD", "OPTIONS", "PATCH", "POST", "PUT", "TRACE",
@@ -1057,6 +1206,51 @@ fn trim_optional_whitespace(mut value: &[u8]) -> &[u8] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resource_pins_keep_the_first_valid_identity_and_full_width_revision() {
+        let correlation = RequestCorrelation::new(&request(), &L7EvalContext::default());
+        correlation.record_policy_runtime_generation(u64::MAX);
+        correlation.record_policy_runtime_generation(1);
+        correlation.record_selected_policy_endpoint("not-a-digest", "endpoint:v1:invalid");
+        let hash = "a".repeat(64);
+        let endpoint = format!("endpoint:v1:{}", "b".repeat(64));
+        correlation.record_selected_policy_endpoint(&hash, &endpoint);
+        correlation.record_selected_policy_endpoint(&"c".repeat(64), &endpoint);
+        let mut snapshot = openshell_core::provider_credentials::ProviderCredentialSnapshot {
+            installation_id: "not-a-uuid".into(),
+            revision: u64::MAX,
+            child_env: std::collections::HashMap::new(),
+            dynamic_credentials: std::collections::HashMap::new(),
+        };
+        correlation.record_provider_credential_snapshot(&snapshot);
+        snapshot.installation_id = "00000000-0000-4000-8000-000000000006".into();
+        correlation.record_provider_credential_snapshot(&snapshot);
+        snapshot.revision = 1;
+        correlation.record_provider_credential_snapshot(&snapshot);
+        let mut event = HttpActivityBuilder::new(openshell_ocsf::ctx::ctx())
+            .http_request(HttpRequest::new(
+                "GET",
+                L7EvalContext::default().ocsf_url("/"),
+            ))
+            .build();
+        correlation.enrich_event(&mut event);
+        let value = serde_json::to_value(event).unwrap();
+        assert_eq!(
+            value["unmapped"]["policy_runtime_generation"],
+            u64::MAX.to_string()
+        );
+        assert_eq!(
+            value["unmapped"]["provider_environment_revision"],
+            u64::MAX.to_string()
+        );
+        assert_eq!(value["unmapped"]["policy_hash"], hash);
+        assert_eq!(value["unmapped"]["endpoint_id"], endpoint);
+        assert_eq!(
+            value["unmapped"]["provider_credential_installation_id"],
+            snapshot.installation_id
+        );
+    }
 
     fn request() -> L7Request {
         L7Request {

@@ -106,3 +106,10 @@ placement and bounded result, never token material. The primary audit record
 includes notable credential outcomes such as withholding or unavailable material;
 successful preparation does not create another routine HTTP record. A completed
 preparation span does not establish that the target received the request.
+
+Correlated requests pin the selected policy generation, endpoint identity and
+provider installation. These describe the configuration used by that request,
+not whichever revision is current when an operator later reads its records.
+Revision values remain decimal strings so full-width values survive export.
+OCSF stores these request configuration identities in `unmapped`; they are not
+firewall-rule versions or claims about the currently active configuration.
