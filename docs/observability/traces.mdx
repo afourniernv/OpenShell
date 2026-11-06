@@ -94,9 +94,10 @@ the mechanism, placement and outcome without credential values. The primary
 OCSF record includes notable withholding, denial, unavailability or stale state.
 
 The primary HTTP Activity record describes the final response headers accepted
-by the client connection. Response-body completion is recorded separately in the
-trace. A successful header write does not establish that the caller received a complete
-body or that the external service committed an operation. Correlation attributes
+by the client connection. An `openshell.response.deliver` child records body
+completion separately; a later delivery failure adds a terminal OCSF record with
+the same request ID. A successful header write does not establish that the caller
+received a complete body or that the external service committed an operation. Correlation attributes
 exclude credentials, query values, bodies and MCP arguments.
 
 ## Next Steps

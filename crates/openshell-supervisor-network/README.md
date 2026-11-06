@@ -84,6 +84,14 @@ observer does not buffer headers or alter transport behavior. A receipt confirms
 only observation of a response head, not completion of its body. Process crashes
 and requests that remain hung cannot be finalized by the guard.
 
+An upstream HTTP child span measures the actual request and response, while a
+response-delivery child records framing, middleware selection and completion.
+A failure after final headers produces one additional terminal HTTP Activity
+record, since the primary record cannot be revised. Routine successful delivery
+does not add another OCSF record. A locally selected error response records its
+effective status separately from the upstream status; telemetry never substitutes
+an intended status for bytes that were not accepted by the client connection.
+
 When selected, request and response middleware have separate child spans. Routine
 invocations stay in sampled traces; security findings and notable failures remain
 in OCSF output, linked by the same request ID. Each phase closes when its work

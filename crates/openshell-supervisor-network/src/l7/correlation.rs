@@ -28,6 +28,7 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 pub struct RequestCorrelation {
     request_id: String,
     span: tracing::Span,
+    event_context: HttpEventContext,
     // Keep the audit payload off the async state machine.
     state: Box<Mutex<RequestState>>,
 }
@@ -40,11 +41,100 @@ struct RequestState {
     outcome: Option<&'static str>,
     policy_span: Option<tracing::Span>,
     middleware: [Option<MiddlewareState>; 2],
+    response: ResponseDeliveryState,
+    response_span: Option<tracing::Span>,
+    upstream_span: Option<tracing::Span>,
     jsonrpc: JsonRpcCorrelationState,
     mcp_span: Option<tracing::Span>,
     resources: ResourceCorrelationState,
     credential: CredentialState,
     credential_span: Option<tracing::Span>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResponseSelectionCause {
+    UpstreamResponse,
+    UpstreamIoError,
+    UpstreamTruncated,
+    UpstreamIdleTimeout,
+    UpstreamProtocolError,
+    MiddlewareDenied,
+    MiddlewareFailed,
+    PolicyReloaded,
+    Cancelled,
+    PlatformError,
+    Unknown,
+}
+
+impl ResponseSelectionCause {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::UpstreamResponse => "upstream_response",
+            Self::UpstreamIoError => "upstream_io_error",
+            Self::UpstreamTruncated => "upstream_truncated",
+            Self::UpstreamIdleTimeout => "upstream_idle_timeout",
+            Self::UpstreamProtocolError => "upstream_protocol_error",
+            Self::MiddlewareDenied => "middleware_denied",
+            Self::MiddlewareFailed => "middleware_failed",
+            Self::PolicyReloaded => "policy_reloaded",
+            Self::Cancelled => "cancelled",
+            Self::PlatformError => "platform_error",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResponseDeliveryOutcome {
+    Complete,
+    DownstreamIoError,
+    CancelledOrIncomplete,
+}
+
+impl ResponseDeliveryOutcome {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Complete => "complete",
+            Self::DownstreamIoError => "downstream_io_error",
+            Self::CancelledOrIncomplete => "cancelled_or_incomplete",
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct ResponseDeliveryState {
+    lifecycle_started: bool,
+    upstream_status: Option<u16>,
+    effective_status: Option<u16>,
+    selection_cause: Option<ResponseSelectionCause>,
+    http_outcome: Option<&'static str>,
+    error_stage: Option<&'static str>,
+    pending_delivery: Option<ResponseDeliveryOutcome>,
+    interim_bytes_forwarded: u64,
+    delivery_started: bool,
+    partial_delivery: bool,
+    terminal: Option<ResponseDeliveryOutcome>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ResponseDeliverySnapshot {
+    upstream_status: Option<u16>,
+    effective_status: Option<u16>,
+    selection_cause: ResponseSelectionCause,
+    interim_bytes_forwarded: u64,
+    delivery_started: bool,
+    partial_delivery: bool,
+    delivery_outcome: ResponseDeliveryOutcome,
+    http_outcome: &'static str,
+    error_stage: Option<&'static str>,
+}
+
+#[derive(Debug)]
+struct HttpEventContext {
+    method: &'static str,
+    host: String,
+    port: u16,
+    policy_name: String,
 }
 
 #[derive(Debug, Default)]
@@ -402,6 +492,12 @@ impl RequestCorrelation {
         Self {
             request_id,
             span,
+            event_context: HttpEventContext {
+                method,
+                host: ctx.host.clone(),
+                port: ctx.port,
+                policy_name: ctx.policy_name.clone(),
+            },
             state: Box::new(Mutex::new(RequestState {
                 primary: Some(fallback),
                 status: None,
@@ -409,6 +505,9 @@ impl RequestCorrelation {
                 outcome: None,
                 policy_span: None,
                 middleware: [None, None],
+                response: ResponseDeliveryState::default(),
+                response_span: None,
+                upstream_span: None,
                 jsonrpc: JsonRpcCorrelationState::default(),
                 mcp_span: None,
                 resources: ResourceCorrelationState::default(),
@@ -424,11 +523,7 @@ impl RequestCorrelation {
     }
 
     pub(crate) fn observe_response<'a, C>(&'a self, client: &'a mut C) -> AuditedClient<'a, C> {
-        AuditedClient {
-            inner: client,
-            correlation: self,
-            head: ResponseHead::default(),
-        }
+        observe_response(client, Some(self))
     }
 
     pub(crate) async fn within_span<F>(&self, future: F) -> F::Output
@@ -456,6 +551,7 @@ impl RequestCorrelation {
             .take();
         if let Some(span) = policy_span {
             span.record("openshell.policy.decision", decision);
+            close_span(span);
         }
     }
 
@@ -491,6 +587,11 @@ impl RequestCorrelation {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .status = Some(status);
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .response
+            .effective_status = Some(status);
     }
 
     pub(crate) fn record_upstream_status(&self, status: u16) {
@@ -498,6 +599,51 @@ impl RequestCorrelation {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .upstream_status = Some(status);
+    }
+
+    pub(crate) fn record_upstream_response_status(&self, status: u16) {
+        self.record_upstream_status(status);
+        let span = {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.response.upstream_status = Some(status);
+            state.upstream_span.clone()
+        };
+        if let Some(span) = span {
+            span.record("http.response.status_code", status);
+        }
+    }
+
+    fn delivery_span(&self) -> tracing::Span {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state
+            .response_span
+            .get_or_insert_with(|| {
+                self.span
+                    .with_subscriber(|(_, dispatch)| {
+                        tracing::dispatcher::with_default(dispatch, || {
+                            tracing::info_span!(parent: &self.span, "openshell.response.deliver",
+                otel.status_code = tracing::field::Empty,
+                "openshell.response.selection_cause" = tracing::field::Empty,
+                "openshell.response.delivery_outcome" = tracing::field::Empty,
+                "openshell.response.delivery_started" = false,
+                "openshell.response.partial_delivery" = false,
+                "openshell.response.interim_delivery_started" = false,
+                "openshell.response.interim_bytes_forwarded" = 0_i64,
+                "openshell.upstream.http.response.status_code" = tracing::field::Empty,
+                "http.response.status_code" = tracing::field::Empty,
+                "openshell.http.outcome" = tracing::field::Empty,
+                "openshell.error.stage" = tracing::field::Empty)
+                        })
+                    })
+                    .unwrap_or_else(tracing::Span::none)
+            })
+            .clone()
     }
 
     pub(crate) fn record_policy_runtime_generation(&self, generation: u64) {
@@ -631,20 +777,23 @@ impl RequestCorrelation {
 
     fn record_jsonrpc_attributes(&self) {
         let span = self.take_mcp_span();
-        let (summary, selected_revision, tools_call_observed) = {
+        let summary = {
             let state = self
                 .state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             let state = &state.jsonrpc;
-            let Some(summary) = state.effective else {
-                return;
-            };
-            (
-                summary,
-                state.selected_mcp_revision,
-                state.mcp_tools_call_observed,
-            )
+            state.effective.map(|summary| {
+                (
+                    summary,
+                    state.selected_mcp_revision,
+                    state.mcp_tools_call_observed,
+                )
+            })
+        };
+        let Some((summary, selected_revision, tools_call_observed)) = summary else {
+            close_span(span);
+            return;
         };
 
         span.record("openshell.l7.protocol", summary.protocol);
@@ -691,6 +840,7 @@ impl RequestCorrelation {
             }
             span.record("openshell.mcp.tools_call_observed", tools_call_observed);
         }
+        close_span(span);
     }
 
     fn new_mcp_span(&self) -> tracing::Span {
@@ -746,6 +896,7 @@ impl RequestCorrelation {
                     .mcp_span
                     .take();
             }
+            close_span(span);
             result
         }
     }
@@ -757,6 +908,24 @@ impl RequestCorrelation {
     pub(crate) fn record_request_delivery_started(&self) {
         self.span.record("openshell.request.delivery_started", true);
         self.finish_credential_span();
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.upstream_span.get_or_insert_with(|| {
+            self.span
+                .with_subscriber(|(_, dispatch)| {
+                    tracing::dispatcher::with_default(dispatch, || {
+                        tracing::info_span!(parent: &self.span, "openshell.upstream.http",
+                otel.kind = "client", otel.status_code = tracing::field::Empty,
+                "http.request.method" = self.event_context.method,
+                "server.address" = %self.event_context.host,
+                "server.port" = self.event_context.port,
+                "http.response.status_code" = tracing::field::Empty)
+                    })
+                })
+                .unwrap_or_else(tracing::Span::none)
+        });
     }
 
     fn credential_span(&self, state: &mut RequestState) {
@@ -864,6 +1033,7 @@ impl RequestCorrelation {
                 openshell_otel::mark_error(&span);
             }
         }
+        close_span(span);
     }
 
     pub(crate) fn record_error_stage(&self, _stage: &str) {
@@ -1027,25 +1197,210 @@ impl RequestCorrelation {
         }
     }
 
-    pub(crate) fn record_response_delivery_started(&self) {
-        self.observe_middleware(
-            MiddlewarePhase::Response,
-            MiddlewareObservation {
-                delivery_started: true,
-                ..Default::default()
-            },
+    pub(crate) fn begin_response_lifecycle(&self) {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .response
+            .lifecycle_started = true;
+    }
+
+    pub(crate) fn record_response_selection(
+        &self,
+        cause: ResponseSelectionCause,
+        http_outcome: &'static str,
+        error_stage: Option<&'static str>,
+    ) {
+        let mut response = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let response = &mut response.response;
+        response.lifecycle_started = true;
+        response.selection_cause = Some(cause);
+        response.http_outcome = Some(http_outcome);
+        response.error_stage = error_stage;
+    }
+
+    pub(crate) fn record_pending_response_delivery(&self, outcome: ResponseDeliveryOutcome) {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .response
+            .pending_delivery = Some(outcome);
+    }
+
+    pub(crate) fn record_interim_response_delivery(&self, accepted: usize) {
+        if accepted == 0 {
+            return;
+        }
+        let bytes = {
+            let mut response = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let response = &mut response.response;
+            response.lifecycle_started = true;
+            response.interim_bytes_forwarded = response
+                .interim_bytes_forwarded
+                .saturating_add(u64::try_from(accepted).unwrap_or(u64::MAX));
+            response.interim_bytes_forwarded
+        };
+        self.delivery_span()
+            .record("openshell.response.interim_delivery_started", true);
+        self.delivery_span().record(
+            "openshell.response.interim_bytes_forwarded",
+            i64::try_from(bytes).unwrap_or(i64::MAX),
         );
     }
 
-    pub(crate) fn record_response_partial_delivery(&self) {
-        self.observe_middleware(
-            MiddlewarePhase::Response,
-            MiddlewareObservation {
-                delivery_started: true,
-                partial_delivery: true,
-                ..Default::default()
-            },
+    pub(crate) fn record_response_delivery_started(&self) {
+        {
+            let mut response = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let response = &mut response.response;
+            response.lifecycle_started = true;
+            response.delivery_started = true;
+        }
+        self.delivery_span()
+            .record("openshell.response.delivery_started", true);
+    }
+
+    pub(crate) fn record_response_partial_delivery(&self) -> bool {
+        {
+            let mut response = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let response = &mut response.response;
+            if !response.delivery_started {
+                return false;
+            }
+            response.partial_delivery = true;
+        }
+        self.delivery_span()
+            .record("openshell.response.partial_delivery", true);
+        true
+    }
+
+    pub(crate) fn complete_pending_response_delivery(&self) {
+        let delivery = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .response
+            .pending_delivery
+            .unwrap_or(ResponseDeliveryOutcome::Complete);
+        self.complete_response_delivery(delivery, None, None, None);
+    }
+
+    pub(crate) fn complete_response_failure(
+        &self,
+        delivery: ResponseDeliveryOutcome,
+        cause: Option<ResponseSelectionCause>,
+        http_outcome: &'static str,
+        error_stage: &'static str,
+    ) {
+        self.complete_response_delivery(delivery, cause, Some(http_outcome), Some(error_stage));
+    }
+
+    fn complete_response_delivery(
+        &self,
+        delivery: ResponseDeliveryOutcome,
+        cause: Option<ResponseSelectionCause>,
+        http_outcome: Option<&'static str>,
+        error_stage: Option<&'static str>,
+    ) {
+        let snapshot = {
+            let mut response = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let response = &mut response.response;
+            if response.terminal.is_some() {
+                return;
+            }
+            response.lifecycle_started = true;
+            if let Some(cause) = cause {
+                response.selection_cause = Some(cause);
+            }
+            if let Some(http_outcome) = http_outcome {
+                response.http_outcome = Some(http_outcome);
+            }
+            if let Some(error_stage) = error_stage {
+                response.error_stage = Some(error_stage);
+            }
+            if delivery != ResponseDeliveryOutcome::Complete && response.delivery_started {
+                response.partial_delivery = true;
+            }
+            response.terminal = Some(delivery);
+            ResponseDeliverySnapshot {
+                upstream_status: response.upstream_status,
+                effective_status: response.effective_status,
+                selection_cause: response
+                    .selection_cause
+                    .unwrap_or(ResponseSelectionCause::Unknown),
+                interim_bytes_forwarded: response.interim_bytes_forwarded,
+                delivery_started: response.delivery_started,
+                partial_delivery: response.partial_delivery,
+                delivery_outcome: delivery,
+                http_outcome: response.http_outcome.unwrap_or("incomplete"),
+                error_stage: response.error_stage,
+            }
+        };
+
+        if let Some(status) = snapshot.upstream_status {
+            self.delivery_span()
+                .record("openshell.upstream.http.response.status_code", status);
+        }
+        if let Some(status) = snapshot.effective_status {
+            self.delivery_span()
+                .record("http.response.status_code", status);
+        }
+        self.delivery_span().record(
+            "openshell.response.selection_cause",
+            snapshot.selection_cause.as_str(),
         );
+        self.delivery_span()
+            .record("openshell.response.delivery_outcome", delivery.as_str());
+        self.delivery_span().record(
+            "openshell.response.delivery_started",
+            snapshot.delivery_started,
+        );
+        self.delivery_span().record(
+            "openshell.response.partial_delivery",
+            snapshot.partial_delivery,
+        );
+        self.delivery_span()
+            .record("openshell.http.outcome", snapshot.http_outcome);
+        if let Some(stage) = snapshot.error_stage {
+            self.delivery_span().record("openshell.error.stage", stage);
+        }
+
+        self.record_final_http_outcome(snapshot.http_outcome);
+        if snapshot.delivery_outcome != ResponseDeliveryOutcome::Complete
+            || snapshot.http_outcome != "allowed"
+        {
+            openshell_otel::mark_error(&self.span);
+            openshell_otel::mark_error(&self.delivery_span());
+        }
+        let committed = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .primary
+            .is_none();
+        if committed
+            && (snapshot.delivery_outcome != ResponseDeliveryOutcome::Complete
+                || snapshot.partial_delivery)
+        {
+            let mut event = response_terminal_event(&self.event_context, snapshot);
+            self.enrich_event(&mut event);
+            self.delivery_span()
+                .in_scope(|| crate::telemetry::emit_correlated(event));
+        }
     }
 
     pub(crate) fn emit(&self, event: OcsfEvent) {
@@ -1078,6 +1433,26 @@ impl RequestCorrelation {
                 return;
             };
             let mut primary = primary;
+            if let Some(outcome) = state.response.terminal {
+                primary.add_unmapped("response_delivery_outcome", outcome.as_str());
+                primary.add_unmapped("delivery_started", state.response.delivery_started);
+                primary.add_unmapped("partial_delivery", state.response.partial_delivery);
+                primary.add_unmapped(
+                    "interim_delivery_started",
+                    state.response.interim_bytes_forwarded > 0,
+                );
+                primary.add_unmapped(
+                    "interim_bytes_forwarded",
+                    state.response.interim_bytes_forwarded,
+                );
+            }
+            if let Some(cause) = state
+                .response
+                .selection_cause
+                .filter(|cause| *cause != ResponseSelectionCause::UpstreamResponse)
+            {
+                primary.add_unmapped("response_selection_cause", cause.as_str());
+            }
             if let Some(snapshot) = state.credential.snapshot()
                 && snapshot.outcome != CredentialOutcome::Prepared
                 && let OcsfEvent::HttpActivity(http) = &mut primary
@@ -1200,18 +1575,8 @@ pub fn emit_phase_events(
     };
     let span = correlation.middleware_span(phase);
     for mut event in events {
-        if let OcsfEvent::HttpActivity(http) = &event {
-            // Routine invocation records belong to the phase span. A late
-            // failure is separate from the already-written primary record.
-            let emitted = correlation
-                .state
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .primary
-                .is_none();
-            if !emitted || http.base.status != Some(StatusId::Failure) {
-                continue;
-            }
+        if matches!(event, OcsfEvent::HttpActivity(_)) {
+            continue;
         }
         correlation.enrich_event(&mut event);
         span.in_scope(|| crate::telemetry::emit_correlated(event));
@@ -1221,8 +1586,19 @@ pub fn emit_phase_events(
 /// Observe accepted response bytes without buffering or changing delivery.
 pub struct AuditedClient<'a, C> {
     inner: &'a mut C,
-    correlation: &'a RequestCorrelation,
+    correlation: Option<&'a RequestCorrelation>,
     head: ResponseHead,
+}
+
+pub fn observe_response<'a, C>(
+    client: &'a mut C,
+    correlation: Option<&'a RequestCorrelation>,
+) -> AuditedClient<'a, C> {
+    AuditedClient {
+        inner: client,
+        correlation,
+        head: ResponseHead::default(),
+    }
 }
 
 #[derive(Default)]
@@ -1247,8 +1623,9 @@ impl ResponseHead {
             if self.delimiter != u32::from_be_bytes(*b"\r\n\r\n") {
                 continue;
             }
-            let status = std::str::from_utf8(&self.prefix[9..12])
-                .ok()
+            let status = matches!(&self.prefix[..9], b"HTTP/1.0 " | b"HTTP/1.1 ")
+                .then(|| std::str::from_utf8(&self.prefix[9..12]).ok())
+                .flatten()
                 .and_then(|code| code.parse::<u16>().ok());
             if status.is_some_and(|code| (100..200).contains(&code) && code != 101) {
                 *self = Self::default();
@@ -1280,8 +1657,10 @@ impl<C: AsyncWrite + Unpin> AsyncWrite for AuditedClient<'_, C> {
     ) -> Poll<std::io::Result<usize>> {
         let this = self.get_mut();
         let result = Pin::new(&mut *this.inner).poll_write(cx, bytes);
-        if let Poll::Ready(Ok(accepted)) = result {
-            this.head.accept(&bytes[..accepted], this.correlation);
+        if let Poll::Ready(Ok(accepted)) = result
+            && let Some(correlation) = this.correlation
+        {
+            this.head.accept(&bytes[..accepted], correlation);
         }
         result
     }
@@ -1405,6 +1784,64 @@ fn mcp_method_classification(info: &jsonrpc::JsonRpcRequestInfo) -> &'static str
     }
 }
 
+fn response_terminal_event(
+    context: &HttpEventContext,
+    snapshot: ResponseDeliverySnapshot,
+) -> OcsfEvent {
+    let (severity, status, message) = match snapshot.delivery_outcome {
+        ResponseDeliveryOutcome::Complete => (
+            SeverityId::Informational,
+            StatusId::Success,
+            "HTTP response delivery completed",
+        ),
+        ResponseDeliveryOutcome::CancelledOrIncomplete => (
+            SeverityId::Low,
+            StatusId::Unknown,
+            "HTTP response delivery did not complete",
+        ),
+        ResponseDeliveryOutcome::DownstreamIoError => (
+            SeverityId::Medium,
+            StatusId::Failure,
+            "HTTP response delivery failed downstream",
+        ),
+    };
+    let mut event = HttpActivityBuilder::new(openshell_ocsf::ctx::ctx())
+        .activity(openshell_ocsf::ActivityId::for_http_method(context.method))
+        .action(ActionId::Observed)
+        .disposition(openshell_ocsf::DispositionId::Logged)
+        .severity(severity)
+        .status(status)
+        .http_request(HttpRequest {
+            http_method: context.method.parse().expect("bounded HTTP method"),
+            url: None,
+        })
+        .dst_endpoint(Endpoint::from_domain(&context.host, context.port))
+        .firewall_rule(&context.policy_name, "response-correlation")
+        .unmapped("response_event_kind", "delivery_terminal")
+        .unmapped(
+            "response_selection_cause",
+            snapshot.selection_cause.as_str(),
+        )
+        .unmapped(
+            "response_delivery_outcome",
+            snapshot.delivery_outcome.as_str(),
+        )
+        .unmapped(
+            "interim_delivery_started",
+            snapshot.interim_bytes_forwarded > 0,
+        )
+        .unmapped("interim_bytes_forwarded", snapshot.interim_bytes_forwarded)
+        .unmapped("delivery_started", snapshot.delivery_started)
+        .unmapped("partial_delivery", snapshot.partial_delivery);
+    if let Some(status) = snapshot.upstream_status {
+        event = event.unmapped("upstream_response_code", status);
+    }
+    if let Some(status) = snapshot.effective_status {
+        event = event.http_response(HttpResponse { code: status });
+    }
+    event.message(message).build()
+}
+
 fn bounded_http_method(method: &str) -> &'static str {
     [
         "CONNECT", "DELETE", "GET", "HEAD", "OPTIONS", "PATCH", "POST", "PUT", "TRACE",
@@ -1416,6 +1853,21 @@ fn bounded_http_method(method: &str) -> &'static str {
 
 impl Drop for RequestCorrelation {
     fn drop(&mut self) {
+        let unfinished_response = {
+            let state = self
+                .state
+                .get_mut()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.response.lifecycle_started && state.response.terminal.is_none()
+        };
+        if unfinished_response {
+            self.complete_response_failure(
+                ResponseDeliveryOutcome::CancelledOrIncomplete,
+                Some(ResponseSelectionCause::Cancelled),
+                "incomplete",
+                "response_cancelled_or_incomplete",
+            );
+        }
         if self
             .state
             .get_mut()
@@ -1427,6 +1879,24 @@ impl Drop for RequestCorrelation {
             openshell_otel::mark_error(&self.span);
         }
         self.emit_primary(true);
+        let root = std::mem::replace(&mut self.span, tracing::Span::none());
+        if let Some(dispatch) = root.with_subscriber(|(_, dispatch)| dispatch.clone()) {
+            tracing::dispatcher::with_default(&dispatch, || {
+                let state = self
+                    .state
+                    .get_mut()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                drop(std::mem::take(&mut state.middleware));
+                drop([
+                    state.policy_span.take(),
+                    state.credential_span.take(),
+                    state.mcp_span.take(),
+                    state.response_span.take(),
+                    state.upstream_span.take(),
+                ]);
+                drop(root);
+            });
+        }
     }
 }
 
@@ -1683,6 +2153,58 @@ mod tests {
             assert_eq!(attributes["openshell.response.partial_delivery"], "true");
             assert_eq!(span.dropped_attributes_count, 0);
         }
+    }
+
+    #[test]
+    fn request_children_close_under_their_own_subscriber() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let left_exporter = opentelemetry_sdk::trace::InMemorySpanExporterBuilder::new().build();
+        let right_exporter = opentelemetry_sdk::trace::InMemorySpanExporterBuilder::new().build();
+        let left_provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+            .with_simple_exporter(left_exporter.clone())
+            .build();
+        let right_provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+            .with_simple_exporter(right_exporter.clone())
+            .build();
+        let left =
+            tracing_subscriber::registry().with(openshell_otel::layer(&left_provider, "left"));
+        let right =
+            tracing_subscriber::registry().with(openshell_otel::layer(&right_provider, "right"));
+        let correlation = tracing::subscriber::with_default(left, || {
+            let correlation = RequestCorrelation::new(&request(), &L7EvalContext::default());
+            correlation
+                .observe_middleware(MiddlewarePhase::Request, MiddlewareObservation::default());
+            correlation
+                .observe_credential(CredentialMechanism::TokenGrant, CredentialSurface::Header);
+            correlation.begin_response_lifecycle();
+            correlation.record_response_delivery_started();
+            correlation
+        });
+        tracing::subscriber::with_default(right, || {
+            let other = tracing::info_span!("unrelated");
+            drop(correlation);
+            other.in_scope(|| tracing::info!("still usable"));
+        });
+
+        let left_spans = left_exporter.get_finished_spans().unwrap();
+        let root = left_spans
+            .iter()
+            .find(|span| span.name == "openshell.http.request")
+            .unwrap();
+        assert_eq!(left_spans.len(), 4);
+        assert!(
+            left_spans
+                .iter()
+                .filter(|span| span.name != root.name)
+                .all(|span| {
+                    span.parent_span_id == root.span_context.span_id()
+                        && span.span_context.trace_id() == root.span_context.trace_id()
+                })
+        );
+        let right_spans = right_exporter.get_finished_spans().unwrap();
+        assert_eq!(right_spans.len(), 1);
+        assert_eq!(right_spans[0].name, "unrelated");
     }
 
     #[test]
