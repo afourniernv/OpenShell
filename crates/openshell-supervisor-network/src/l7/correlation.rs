@@ -150,7 +150,14 @@ impl RequestCorrelation {
                 return;
             }
             let fail_open = incoming.action == Some(ActionId::Other)
-                && incoming.disposition == Some(DispositionId::Allowed);
+                && (incoming.disposition == Some(DispositionId::Allowed)
+                    || incoming
+                        .base
+                        .unmapped
+                        .as_ref()
+                        .and_then(|fields| fields.get("response_middleware_outcome"))
+                        .and_then(serde_json::Value::as_str)
+                        == Some("failopen"));
             if !is_failure(&incoming) || fail_open || state.late_failure_emitted {
                 return;
             }

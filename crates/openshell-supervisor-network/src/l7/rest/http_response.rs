@@ -2623,6 +2623,59 @@ mod tests {
         }
     }
 
+    #[test]
+    fn late_fail_open_invocation_does_not_hide_block_delivery() {
+        let capture = openshell_ocsf::test_support::OcsfCapture::default();
+        let _subscriber = capture.install();
+        let correlation = test_correlation("late-response-receipt");
+        let target = HttpRequestTarget {
+            method: "GET".into(),
+            scheme: "https".into(),
+            host: "example.test".into(),
+            path: "/data".into(),
+            port: 443,
+            ..Default::default()
+        };
+        correlation.emit(
+            openshell_ocsf::HttpActivityBuilder::new(openshell_ocsf::ctx::ctx())
+                .http_request(openshell_ocsf::HttpRequest::new(
+                    "GET",
+                    openshell_ocsf::Url::new("https", "example.test", "/data", 443),
+                ))
+                .action(openshell_ocsf::ActionId::Allowed)
+                .status(openshell_ocsf::StatusId::Success)
+                .build(),
+        );
+        correlation.response_selected(200);
+        for (outcome, failed) in [(Outcome::FailOpen, true), (Outcome::BlockDelivery, false)] {
+            for event in super::http_response_middleware_invocation_events(
+                "response-policy",
+                &target,
+                200,
+                &[invocation(outcome, failed)],
+            ) {
+                correlation.emit(event);
+            }
+        }
+        drop(correlation);
+        let events: Vec<_> = capture
+            .json_events()
+            .into_iter()
+            .filter(|event| event["class_uid"] == 4002)
+            .collect();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[1]["action"], "Denied");
+        assert_eq!(events[1]["http_response"]["code"], 200);
+        assert_eq!(
+            events[1]["unmapped"]["response_middleware_outcome"],
+            "blockdelivery"
+        );
+        assert_eq!(
+            events[1]["metadata"]["correlation_uid"],
+            "late-response-receipt"
+        );
+    }
+
     use super::{
         DEFAULT_HTTP_RESPONSE_WHOLE_BODY_TIMEOUT, HttpResponseMiddlewareRelay,
         RelayResponseOptions, ResponseFraming, parse_connection_keep_alive,
