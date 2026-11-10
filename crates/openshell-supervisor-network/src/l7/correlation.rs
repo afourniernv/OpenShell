@@ -18,6 +18,9 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use crate::l7::provider::L7Request;
 use crate::l7::relay::L7EvalContext;
 
+mod resources;
+use resources::RequestResources;
+
 #[derive(Debug)]
 pub struct RequestCorrelation {
     request_id: String,
@@ -36,6 +39,7 @@ struct RequestState {
     blocked: bool,
     failure_reason: Option<&'static str>,
     late_failure_emitted: bool,
+    resources: RequestResources,
 }
 
 impl RequestCorrelation {
@@ -85,6 +89,33 @@ impl RequestCorrelation {
     #[must_use]
     pub(crate) fn request_id(&self) -> &str {
         &self.request_id
+    }
+
+    pub(crate) fn record_policy_runtime_generation(&self, generation: u64) {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .resources
+            .record_policy_generation(generation);
+    }
+
+    pub(crate) fn record_selected_policy_endpoint(&self, policy_hash: &str, endpoint_id: &str) {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .resources
+            .record_endpoint(policy_hash, endpoint_id);
+    }
+
+    pub(crate) fn record_provider_credential_snapshot(
+        &self,
+        snapshot: &openshell_core::provider_credentials::ProviderCredentialSnapshot,
+    ) {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .resources
+            .record_provider(snapshot);
     }
 
     pub(crate) fn observe_response<'a, C>(&'a self, client: &'a mut C) -> AuditedClient<'a, C> {
@@ -271,6 +302,11 @@ impl RequestCorrelation {
 
     fn emit_correlated(&self, mut event: OcsfEvent) {
         event.set_correlation_uid(self.request_id.clone());
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .resources
+            .enrich(&mut event);
         crate::telemetry::emit_decision([event], None);
     }
 }

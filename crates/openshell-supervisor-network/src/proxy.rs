@@ -5568,6 +5568,9 @@ async fn inject_token_grant_for_forward_request(
     let Some(snapshot) = crate::l7::token_grant_injection::pin_live_credentials(l7_ctx) else {
         return Ok(request.raw_header);
     };
+    if let Some(correlation) = correlation {
+        correlation.record_provider_credential_snapshot(&snapshot);
+    }
     Ok(
         crate::l7::token_grant_injection::inject_for_selectors_correlated(
             request,
@@ -5980,6 +5983,10 @@ async fn handle_forward_proxy(
         request_correlation.map(crate::l7::correlation::RequestCorrelation::request_id);
     let mut audited_client = correlation.observe_response(client);
     let client = &mut audited_client;
+    if let Some(correlation) = request_correlation {
+        correlation
+            .record_policy_runtime_generation(forward_generation_guard.captured_generation());
+    }
     correlation.record_enforcement_action("allow");
     let mut primary = build_forward_allow_ocsf_event(
         workload_addr,
@@ -6141,6 +6148,10 @@ async fn handle_forward_proxy(
             .await?;
             return Ok(());
         };
+        correlation.record_selected_policy_endpoint(
+            &l7_config.config.policy_hash,
+            &l7_config.config.endpoint_id,
+        );
         endpoint_observer = crate::l7::EndpointObserver::begin_captured(
             l7_ctx.endpoint_observation_tx.as_ref(),
             &l7_config.config,

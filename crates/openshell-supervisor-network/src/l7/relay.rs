@@ -41,6 +41,8 @@ use tracing::{debug, warn};
 #[cfg(test)]
 mod correlation_dispatch_tests;
 #[cfg(test)]
+mod resource_revision_tests;
+#[cfg(test)]
 mod token_grant_ownership_tests;
 
 const CONNECTION_READ_AHEAD_BYTES: usize = 8 * 1024;
@@ -179,6 +181,9 @@ pub(crate) async fn prepare_inspected_request(
 ) -> Result<(crate::l7::provider::L7Request, L7EvalContext)> {
     let mut scoped = ctx.clone();
     let snapshot = crate::l7::token_grant_injection::pin_live_credentials(&mut scoped);
+    if let (Some(correlation), Some(snapshot)) = (correlation, snapshot.as_deref()) {
+        correlation.record_provider_credential_snapshot(snapshot);
+    }
     // Admission-gated injection reads credentials only from the pinned snapshot,
     // so a context without one never acquires a grant.
     let grant_snapshot = snapshot.as_deref().filter(|snapshot| {
@@ -1434,6 +1439,8 @@ where
         let correlation = RequestCorrelation::new(&req, ctx);
         let mut audited_client = correlation.observe_response(client);
         let client = &mut audited_client;
+        correlation
+            .record_policy_runtime_generation(engine.generation_guard().captured_generation());
         if !request_authority_matches_endpoint(&req, ctx) {
             reject_request_authority_mismatch(client, ctx, &req.action, Some(&correlation)).await?;
             return Ok(());
@@ -1477,6 +1484,7 @@ where
                 .await?;
             return Ok(());
         };
+        correlation.record_selected_policy_endpoint(&config.policy_hash, &config.endpoint_id);
         let observer = EndpointObserver::begin_captured(
             ctx.endpoint_observation_tx.as_ref(),
             config,
@@ -2436,6 +2444,9 @@ where
         let correlation = RequestCorrelation::new(&req, ctx);
         let mut audited_client = correlation.observe_response(client);
         let client = &mut audited_client;
+        correlation
+            .record_policy_runtime_generation(engine.generation_guard().captured_generation());
+        correlation.record_selected_policy_endpoint(&config.policy_hash, &config.endpoint_id);
         if !request_authority_matches_endpoint(&req, ctx) {
             reject_request_authority_mismatch(client, ctx, &req.action, Some(&correlation)).await?;
             return Ok(());
@@ -2932,6 +2943,9 @@ where
         let correlation = RequestCorrelation::new(&req, ctx);
         let mut audited_client = correlation.observe_response(client);
         let client = &mut audited_client;
+        correlation
+            .record_policy_runtime_generation(engine.generation_guard().captured_generation());
+        correlation.record_selected_policy_endpoint(&config.policy_hash, &config.endpoint_id);
         let observer = EndpointObserver::begin_captured(
             ctx.endpoint_observation_tx.as_ref(),
             config,
@@ -3245,6 +3259,10 @@ where
         let correlation = RequestCorrelation::new(&req, ctx);
         let mut audited_client = correlation.observe_response(client);
         let client = &mut audited_client;
+
+        correlation
+            .record_policy_runtime_generation(engine.generation_guard().captured_generation());
+        correlation.record_selected_policy_endpoint(&config.policy_hash, &config.endpoint_id);
 
         if !request_authority_matches_endpoint(&req, ctx) {
             reject_request_authority_mismatch(client, ctx, &req.action, Some(&correlation)).await?;
@@ -4111,6 +4129,9 @@ where
         let receipt = inspected.then_some(&correlation);
         let mut audited_client = correlation.observe_response(client);
         let client = &mut audited_client;
+        if let Some(correlation) = receipt {
+            correlation.record_policy_runtime_generation(generation_guard.captured_generation());
+        }
         if !request_authority_matches_endpoint(&req, ctx) {
             reject_request_authority_mismatch(client, ctx, &req.action, receipt).await?;
             return Ok(());
@@ -4237,6 +4258,9 @@ where
         let injected = match crate::l7::token_grant_injection::pin_live_credentials(&mut grant_ctx)
         {
             Some(snapshot) => {
+                if let Some(correlation) = receipt {
+                    correlation.record_provider_credential_snapshot(&snapshot);
+                }
                 crate::l7::token_grant_injection::inject_for_selectors_correlated(
                     req,
                     &grant_ctx,

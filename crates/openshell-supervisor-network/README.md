@@ -71,3 +71,9 @@ Request IDs do not depend on OpenTelemetry or collector availability. This layer
 adds no request spans or workload-controlled supervisor trace context and keeps
 the existing bounded deny-span path. Request-stage tracing is a separate layer
 that requires operator-controlled supervisor sampling.
+
+Inspected request records retain the policy generation/hash, selected endpoint
+identity and pinned provider installation/revision under OCSF `unmapped`.
+Identities are captured at selection, not looked up when the record is emitted;
+later reloads and rotations cannot rewrite historical records. Numeric revisions
+are decimal strings to preserve their full width. Unknown identities are omitted.

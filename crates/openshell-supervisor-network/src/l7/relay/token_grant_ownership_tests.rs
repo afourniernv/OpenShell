@@ -31,6 +31,7 @@ use tokio::io::{AsyncReadExt, DuplexStream, ReadBuf};
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
+use tracing::instrument::WithSubscriber as _;
 
 const POLICY: &str = include_str!("../../../data/sandbox-policy.rego");
 const HOST: &str = "api.example.test";
@@ -304,17 +305,20 @@ impl Fixture {
             notified: false,
         };
         let (mut relay_upstream, upstream) = tokio::io::duplex(16 * 1024);
-        let relay = tokio::spawn(async move {
-            crate::proxy::relay_inspected_http_stream_for_test(
-                &mut client,
-                &mut relay_upstream,
-                configs,
-                engine,
-                &middleware_engine,
-                &ctx,
-            )
-            .await
-        });
+        let relay = tokio::spawn(
+            async move {
+                crate::proxy::relay_inspected_http_stream_for_test(
+                    &mut client,
+                    &mut relay_upstream,
+                    configs,
+                    engine,
+                    &middleware_engine,
+                    &ctx,
+                )
+                .await
+            }
+            .with_current_subscriber(),
+        );
         Connection {
             app,
             relay,
@@ -1060,6 +1064,9 @@ async fn route_selected_keepalive_uses_live_grant_state_after_refresh() {
 
 async fn refresh_during_grant(same_revision_repair: bool, route_selection: bool) {
     let fixture = refresh_fixture(route_selection);
+    let records = openshell_ocsf::test_support::OcsfCapture::default();
+    let _subscriber = records.install();
+    let old_snapshot = fixture.state.snapshot();
     let old_key = fixture.grant_key("/a/**", "a");
     fixture.resolver.hold_once.store(true, Ordering::SeqCst);
     let mut first = fixture.connect();
@@ -1079,6 +1086,7 @@ async fn refresh_during_grant(same_revision_repair: bool, route_selection: bool)
         fixture.install(2, &[("/a/**", "a", "aud-new")]);
     }
     let new_key = fixture.grant_key("/a/**", "a");
+    let new_snapshot = fixture.state.snapshot();
     assert_ne!(new_key, old_key, "replacement changes cache authority");
     fixture.resolver.release.notify_one();
     let _closed_or_denied = first.response().await;
@@ -1096,6 +1104,35 @@ async fn refresh_during_grant(same_revision_repair: bool, route_selection: bool)
     fixture
         .resolver
         .assert_calls(&[(&old_key, "aud-old"), (&new_key, "aud-new")]);
+    let http = records
+        .json_events()
+        .into_iter()
+        .filter(|event| event["class_uid"] == 4002)
+        .collect::<Vec<_>>();
+    assert_eq!(http.len(), 2, "one correlated record per request");
+    for (record, snapshot) in http.iter().zip([old_snapshot, new_snapshot]) {
+        assert_eq!(
+            record["unmapped"]["provider_environment_revision"],
+            snapshot.revision.to_string()
+        );
+        assert_eq!(
+            record["unmapped"]["provider_credential_installation_id"],
+            snapshot.installation_id
+        );
+        assert_eq!(
+            record["unmapped"]["policy_runtime_generation"],
+            fixture.generation.to_string()
+        );
+        assert!(
+            uuid::Uuid::parse_str(record["metadata"]["correlation_uid"].as_str().unwrap()).is_ok()
+        );
+    }
+    assert_ne!(
+        http[0]["metadata"]["correlation_uid"],
+        http[1]["metadata"]["correlation_uid"]
+    );
+    assert_eq!(http[0]["status"], "Failure");
+    assert_eq!(http[1]["http_response"]["code"], 204);
 }
 
 #[tokio::test]
@@ -1120,6 +1157,10 @@ async fn route_selected_same_revision_repair_during_grant_rejects_old_installati
 
 async fn policy_reload_during_grant(route_selection: bool) {
     let mut fixture = refresh_fixture(route_selection);
+    let records = openshell_ocsf::test_support::OcsfCapture::default();
+    let _subscriber = records.install();
+    let old_generation = fixture.generation;
+    let snapshot = fixture.state.snapshot();
     fixture.resolver.hold_once.store(true, Ordering::SeqCst);
     let mut first = fixture.connect();
     first.send("GET", "/a/item", true).await;
@@ -1144,6 +1185,32 @@ async fn policy_reload_during_grant(route_selection: bool) {
     fixture
         .resolver
         .assert_calls(&[(&key, "aud-old"), (&key, "aud-old")]);
+    let http = records
+        .json_events()
+        .into_iter()
+        .filter(|event| event["class_uid"] == 4002)
+        .collect::<Vec<_>>();
+    assert_eq!(http.len(), 2, "one correlated record per request");
+    for (record, generation) in http.iter().zip([old_generation, fixture.generation]) {
+        assert_eq!(
+            record["unmapped"]["policy_runtime_generation"],
+            generation.to_string()
+        );
+        assert_eq!(
+            record["unmapped"]["provider_environment_revision"],
+            snapshot.revision.to_string()
+        );
+        assert_eq!(
+            record["unmapped"]["provider_credential_installation_id"],
+            snapshot.installation_id
+        );
+    }
+    assert_ne!(
+        http[0]["metadata"]["correlation_uid"],
+        http[1]["metadata"]["correlation_uid"]
+    );
+    assert_eq!(http[0]["status"], "Failure");
+    assert_eq!(http[1]["http_response"]["code"], 204);
 }
 
 #[tokio::test]

@@ -343,6 +343,14 @@ are unchanged. An instrumented client can record the receipt on its own trace
 and use the request ID to find OpenShell's security records; it does not need to
 receive those records inside the sandbox.
 
+Inspected request records also identify the configuration selected for that
+request in `unmapped`: `policy_runtime_generation`, `policy_hash`, `endpoint_id`,
+`provider_environment_revision`, and `provider_credential_installation_id`.
+Unknown identities are omitted. Revisions are decimal strings, preserving the
+full 64-bit value. These fields describe the request's captured configuration,
+not the latest configuration when you read the record. They contain no
+credential values and do not require trace export.
+
 ## OCSF Event Classes in JSON
 
 The `class_uid` field identifies the event type:
