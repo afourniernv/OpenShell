@@ -26,9 +26,9 @@ use openshell_ocsf::{
 };
 use tracing::warn;
 
+use crate::l7::correlation::RequestCorrelation;
 use crate::l7::provider::L7Request;
 use crate::l7::relay::L7EvalContext;
-use crate::telemetry::egress_emit;
 
 /// Borrowed grant configuration for one endpoint-bound provider credential.
 pub struct TokenGrantRequest<'a> {
@@ -174,6 +174,7 @@ pub fn pin_live_credentials(ctx: &mut L7EvalContext) -> Option<Arc<ProviderCrede
 /// `snapshot` by [`pin_live_credentials`]. `request_id` is the supervisor-minted
 /// ID of this exchange; it is sent to the token service and gateway and
 /// recorded on the refusal event.
+#[cfg(test)]
 pub async fn inject_for_selectors(
     req: L7Request,
     ctx: &L7EvalContext,
@@ -181,8 +182,27 @@ pub async fn inject_for_selectors(
     request_id: &str,
     observation_context: Option<&EndpointObservationContext>,
 ) -> Result<L7Request, TokenGrantInjectionError> {
+    inject_for_selectors_correlated(req, ctx, snapshot, request_id, observation_context, None).await
+}
+
+pub async fn inject_for_selectors_correlated(
+    req: L7Request,
+    ctx: &L7EvalContext,
+    snapshot: &ProviderCredentialSnapshot,
+    request_id: &str,
+    observation_context: Option<&EndpointObservationContext>,
+    correlation: Option<&RequestCorrelation>,
+) -> Result<L7Request, TokenGrantInjectionError> {
     let selected = select_scoped(snapshot, ctx, request_path(&req.target), None);
-    inject_or_report(req, ctx, selected, request_id, observation_context).await
+    inject_or_report(
+        req,
+        ctx,
+        selected,
+        request_id,
+        observation_context,
+        correlation,
+    )
+    .await
 }
 
 /// Inject only grants owned by endpoints that admitted the inspected request.
@@ -192,6 +212,7 @@ pub async fn inject_for_selectors(
 /// Credentials come from the pinned `snapshot`, and each selected key is scoped
 /// to its revision and installation after selection so the one-grant-per-header
 /// ambiguity check still compares the original credential identities.
+#[cfg(test)]
 pub(super) async fn inject_for_admitted_owners(
     req: L7Request,
     ctx: &L7EvalContext,
@@ -199,6 +220,27 @@ pub(super) async fn inject_for_admitted_owners(
     admitted_owners: &HashSet<String>,
     request_id: &str,
     observation_context: Option<&EndpointObservationContext>,
+) -> Result<L7Request, TokenGrantInjectionError> {
+    inject_for_admitted_owners_correlated(
+        req,
+        ctx,
+        snapshot,
+        admitted_owners,
+        request_id,
+        observation_context,
+        None,
+    )
+    .await
+}
+
+pub(super) async fn inject_for_admitted_owners_correlated(
+    req: L7Request,
+    ctx: &L7EvalContext,
+    snapshot: &ProviderCredentialSnapshot,
+    admitted_owners: &HashSet<String>,
+    request_id: &str,
+    observation_context: Option<&EndpointObservationContext>,
+    correlation: Option<&RequestCorrelation>,
 ) -> Result<L7Request, TokenGrantInjectionError> {
     let request_path = request_path(&req.target);
     let unowned = snapshot
@@ -220,7 +262,15 @@ pub(super) async fn inject_for_admitted_owners(
     } else {
         select_scoped(snapshot, ctx, request_path, Some(admitted_owners))
     };
-    inject_or_report(req, ctx, selected, request_id, observation_context).await
+    inject_or_report(
+        req,
+        ctx,
+        selected,
+        request_id,
+        observation_context,
+        correlation,
+    )
+    .await
 }
 
 fn select_scoped(
@@ -251,6 +301,7 @@ async fn inject_or_report(
     selected: Result<Vec<(String, ProviderProfileCredential)>, TokenGrantInjectionError>,
     request_id: &str,
     observation_context: Option<&EndpointObservationContext>,
+    correlation: Option<&RequestCorrelation>,
 ) -> Result<L7Request, TokenGrantInjectionError> {
     if selected.as_ref().is_ok_and(Vec::is_empty) {
         // Most requests need no grant; keep that path free of allocation.
@@ -276,11 +327,11 @@ async fn inject_or_report(
         Vec::new()
     };
     let result = match selected {
-        Ok(credentials) => inject_selected(req, ctx, credentials, request_id).await,
+        Ok(credentials) => inject_selected(req, ctx, credentials, request_id, correlation).await,
         Err(error) => Err(error),
     };
     if let Err(error) = &result {
-        report_refused_grant(ctx, &method, &request_path, request_id, error);
+        report_refused_grant(ctx, &method, &request_path, request_id, error, correlation);
     }
     if let Some((sender, context)) = ctx
         .endpoint_observation_tx
@@ -323,6 +374,7 @@ fn report_refused_grant(
     request_path: &str,
     request_id: &str,
     error: &TokenGrantInjectionError,
+    correlation: Option<&RequestCorrelation>,
 ) {
     let credential = error
         .credential
@@ -341,8 +393,9 @@ fn report_refused_grant(
             .map_or_else(|| "none".to_string(), |status| status.to_string()),
         "Token grant failed"
     );
-    egress_emit!(
-        HttpActivityBuilder::new(ocsf_ctx())
+    crate::l7::middleware::emit_request_events(
+        correlation,
+        [HttpActivityBuilder::new(ocsf_ctx())
             .activity(ActivityId::Fail)
             .action(ActionId::Denied)
             .disposition(DispositionId::Blocked)
@@ -355,7 +408,7 @@ fn report_refused_grant(
                 ctx.host, ctx.port
             ))
             .unmapped("request_id", request_id)
-            .build()
+            .build()],
     );
 }
 
@@ -367,6 +420,7 @@ async fn inject_selected(
     ctx: &L7EvalContext,
     credentials: Vec<(String, ProviderProfileCredential)>,
     request_id: &str,
+    correlation: Option<&RequestCorrelation>,
 ) -> Result<L7Request, TokenGrantInjectionError> {
     let resolver = ctx
         .token_grant_resolver
@@ -399,8 +453,9 @@ async fn inject_selected(
             inject_header(&raw_header, &name, &value).map_err(TokenGrantInjectionError::new)?;
     }
     for (provider_key, _) in credentials {
-        egress_emit!(
-            HttpActivityBuilder::new(ocsf_ctx())
+        crate::l7::middleware::emit_request_events(
+            correlation,
+            [HttpActivityBuilder::new(ocsf_ctx())
                 .activity(ActivityId::Other)
                 .action(ActionId::Allowed)
                 .disposition(DispositionId::Allowed)
@@ -418,7 +473,7 @@ async fn inject_selected(
                     ctx.host,
                     ctx.port
                 ))
-                .build()
+                .build()],
         );
     }
     Ok(L7Request { raw_header, ..req })

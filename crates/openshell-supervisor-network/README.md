@@ -51,3 +51,23 @@ domain event and a detection finding without credential values or placeholders.
 Explicit body and WebSocket
 rewrite flags authorize those locations for ordinary static credentials. SigV4
 signing retains the endpoint-scoped resolver's existing trusted access.
+
+## HTTP enforcement correlation
+
+Each inspected HTTP request has one UUID shared by middleware, OCSF
+`metadata.correlation_uid`, and the protected `x-openshell-request-id` response
+header. Application correlation must use another header. The receipt is only a
+join key: it does not establish identity, authorization or complete delivery.
+L4 and passthrough traffic do not provide this header guarantee.
+
+The audit state commits one primary HTTP Activity record when the final response
+head is written, with an early-termination fallback. It retains the original
+request and process context while consolidating middleware and credential
+outcomes. Routine outcomes do not add records; existing security findings and
+post-header failure records remain distinct. A process crash or indefinitely
+hung request cannot be finalized by the fallback.
+
+Request IDs do not depend on OpenTelemetry or collector availability. This layer
+adds no request spans or workload-controlled supervisor trace context and keeps
+the existing bounded deny-span path. Request-stage tracing is a separate layer
+that requires operator-controlled supervisor sampling.

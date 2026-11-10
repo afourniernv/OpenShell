@@ -52,18 +52,19 @@ impl HttpMiddlewareExchange {
         }
     }
 
-    pub async fn apply_request<C>(
+    pub(crate) async fn apply_request_correlated<C>(
         &self,
         request: crate::l7::provider::L7Request,
         client: &mut C,
         ctx: &L7EvalContext,
         scheme: &str,
         transformed_body_policy: openshell_supervisor_middleware::TransformedBodyPolicy<'_>,
+        correlation: Option<&super::correlation::RequestCorrelation>,
     ) -> Result<MiddlewareApplyResult>
     where
         C: AsyncRead + AsyncWrite + Unpin + Send,
     {
-        apply_middleware_chain_for_scheme_with_request_id(
+        apply_middleware_chain_for_scheme_with_request_id_correlated(
             request,
             client,
             ctx,
@@ -73,6 +74,7 @@ impl HttpMiddlewareExchange {
             &self.generation_guard,
             transformed_body_policy,
             &self.request_id,
+            correlation,
         )
         .await
     }
@@ -493,10 +495,6 @@ fn middleware_admission_exhausted_event(ctx: &L7EvalContext) -> openshell_ocsf::
         .build()
 }
 
-fn emit_middleware_admission_exhausted(ctx: &L7EvalContext) {
-    egress_emit!(middleware_admission_exhausted_event(ctx));
-}
-
 /// Largest body-buffering limit across the entries that actually resolved to a
 /// registered binding. Buffering for the most capable stage lets every stage
 /// that can handle the body run; stages whose own limit is smaller are failed
@@ -516,6 +514,7 @@ pub(super) fn middleware_chain_body_limit(
         .max()
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub async fn apply_middleware_chain_with_request_id<C: AsyncRead + AsyncWrite + Unpin + Send>(
     req: crate::l7::provider::L7Request,
@@ -541,6 +540,7 @@ pub async fn apply_middleware_chain_with_request_id<C: AsyncRead + AsyncWrite + 
     .await
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub async fn apply_middleware_chain_for_scheme_with_request_id<
     C: AsyncRead + AsyncWrite + Unpin + Send,
@@ -555,6 +555,65 @@ pub async fn apply_middleware_chain_for_scheme_with_request_id<
     transformed_body_policy: openshell_supervisor_middleware::TransformedBodyPolicy<'_>,
     request_id: &str,
 ) -> Result<MiddlewareApplyResult> {
+    apply_middleware_chain_for_scheme_with_request_id_correlated(
+        req,
+        client,
+        ctx,
+        scheme,
+        chain,
+        runner,
+        generation_guard,
+        transformed_body_policy,
+        request_id,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn apply_middleware_chain_with_request_id_correlated<
+    C: AsyncRead + AsyncWrite + Unpin + Send,
+>(
+    req: crate::l7::provider::L7Request,
+    client: &mut C,
+    ctx: &L7EvalContext,
+    chain: Vec<openshell_supervisor_middleware::ChainEntry>,
+    runner: &openshell_supervisor_middleware::ChainRunner,
+    generation_guard: &PolicyGenerationGuard,
+    transformed_body_policy: openshell_supervisor_middleware::TransformedBodyPolicy<'_>,
+    request_id: &str,
+    correlation: Option<&super::correlation::RequestCorrelation>,
+) -> Result<MiddlewareApplyResult> {
+    apply_middleware_chain_for_scheme_with_request_id_correlated(
+        req,
+        client,
+        ctx,
+        ctx.request_scheme(),
+        chain,
+        runner,
+        generation_guard,
+        transformed_body_policy,
+        request_id,
+        correlation,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn apply_middleware_chain_for_scheme_with_request_id_correlated<
+    C: AsyncRead + AsyncWrite + Unpin + Send,
+>(
+    req: crate::l7::provider::L7Request,
+    client: &mut C,
+    ctx: &L7EvalContext,
+    scheme: &str,
+    chain: Vec<openshell_supervisor_middleware::ChainEntry>,
+    runner: &openshell_supervisor_middleware::ChainRunner,
+    generation_guard: &PolicyGenerationGuard,
+    transformed_body_policy: openshell_supervisor_middleware::TransformedBodyPolicy<'_>,
+    request_id: &str,
+    correlation: Option<&super::correlation::RequestCorrelation>,
+) -> Result<MiddlewareApplyResult> {
     if chain.is_empty() {
         return Ok(MiddlewareApplyResult::Allowed(req));
     }
@@ -568,7 +627,7 @@ pub async fn apply_middleware_chain_for_scheme_with_request_id<
                 admission,
             ) => Some(admission),
             openshell_supervisor_middleware::MiddlewareWorkAdmissionOutcome::QueueExhausted => {
-                emit_middleware_admission_exhausted(ctx);
+                emit_request_events(correlation, [middleware_admission_exhausted_event(ctx)]);
                 return Ok(MiddlewareApplyResult::AdmissionExhausted);
             }
         }
@@ -597,7 +656,7 @@ pub async fn apply_middleware_chain_for_scheme_with_request_id<
                 admission,
             )
             .await?;
-        emit_middleware_events(ctx, &req, &outcome);
+        emit_request_events(correlation, middleware_events(ctx, &req, &outcome));
         return Ok(if outcome.allowed {
             MiddlewareApplyResult::Allowed(req)
         } else {
@@ -620,7 +679,13 @@ pub async fn apply_middleware_chain_for_scheme_with_request_id<
     {
         crate::l7::rest::BufferResult::Buffered(buffered) => buffered,
         crate::l7::rest::BufferResult::OverCapacity { recoverable } => {
-            return Ok(resolve_unbuffered_body(ctx, req, &chain, recoverable));
+            return Ok(resolve_unbuffered_body_correlated(
+                ctx,
+                req,
+                &chain,
+                recoverable,
+                correlation,
+            ));
         }
     };
     let headers = safe_middleware_headers(&buffered.headers)?;
@@ -647,7 +712,7 @@ pub async fn apply_middleware_chain_for_scheme_with_request_id<
             Some(admission),
         )
         .await?;
-    emit_middleware_events(ctx, &req, &outcome);
+    emit_request_events(correlation, middleware_events(ctx, &req, &outcome));
     if !outcome.allowed {
         return Ok(MiddlewareApplyResult::Denied {
             denial: outcome.denial,
@@ -668,8 +733,11 @@ pub async fn send_middleware_rejection_response<C: AsyncRead + AsyncWrite + Unpi
     ctx: &L7EvalContext,
     denial: Option<&openshell_supervisor_middleware::MiddlewareDenial>,
     redacted_target: &str,
+    request_id: Option<&str>,
 ) -> Result<()> {
-    let context = Some(crate::l7::rest::DenyResponseContext::from_l7_context(ctx));
+    let context = crate::l7::rest::DenyResponseContext::from_l7_context(ctx);
+    let context = request_id.map_or(context, |request_id| context.with_request_id(request_id));
+    let context = Some(context);
     if let Some(denial) = denial {
         crate::l7::rest::send_middleware_deny_response(
             req,
@@ -699,13 +767,16 @@ pub async fn send_middleware_admission_exhausted_response<
     client: &mut C,
     ctx: &L7EvalContext,
     redacted_target: &str,
+    request_id: Option<&str>,
 ) -> Result<()> {
+    let context = crate::l7::rest::DenyResponseContext::from_l7_context(ctx);
+    let context = request_id.map_or(context, |request_id| context.with_request_id(request_id));
     crate::l7::rest::send_middleware_unavailable_response(
         req,
         &ctx.policy_name,
         client,
         Some(redacted_target),
-        Some(crate::l7::rest::DenyResponseContext::from_l7_context(ctx)),
+        Some(context),
     )
     .await
 }
@@ -783,24 +854,39 @@ pub(super) fn raw_query_from_request_headers(headers: &[u8]) -> Result<String> {
 /// would individually fail with `request_body_over_capacity`; the aggregate is
 /// a deny unless every attached middleware is `fail_open`, and passing the
 /// body through is only safe when no bytes were consumed.
+#[cfg(test)]
 pub(super) fn resolve_unbuffered_body(
     ctx: &L7EvalContext,
     req: crate::l7::provider::L7Request,
     chain: &[openshell_supervisor_middleware::DescribedChainEntry],
     recoverable: bool,
 ) -> MiddlewareApplyResult {
+    resolve_unbuffered_body_correlated(ctx, req, chain, recoverable, None)
+}
+
+fn resolve_unbuffered_body_correlated(
+    ctx: &L7EvalContext,
+    req: crate::l7::provider::L7Request,
+    chain: &[openshell_supervisor_middleware::DescribedChainEntry],
+    recoverable: bool,
+    correlation: Option<&super::correlation::RequestCorrelation>,
+) -> MiddlewareApplyResult {
     let all_fail_open = chain
         .iter()
         .all(|entry| entry.on_error() == openshell_supervisor_middleware::OnError::FailOpen);
     if recoverable && all_fail_open {
-        emit_middleware_body_unavailable(ctx, false);
+        emit_middleware_body_unavailable(ctx, false, correlation);
         return MiddlewareApplyResult::Allowed(req);
     }
-    emit_middleware_body_unavailable(ctx, true);
+    emit_middleware_body_unavailable(ctx, true, correlation);
     MiddlewareApplyResult::Denied { denial: None }
 }
 
-fn emit_middleware_body_unavailable(ctx: &L7EvalContext, denied: bool) {
+fn emit_middleware_body_unavailable(
+    ctx: &L7EvalContext,
+    denied: bool,
+    correlation: Option<&super::correlation::RequestCorrelation>,
+) {
     let mut event = DetectionFindingBuilder::new(openshell_ocsf::ctx::ctx())
         .severity(if denied {
             SeverityId::High
@@ -824,7 +910,7 @@ fn emit_middleware_body_unavailable(ctx: &L7EvalContext, denied: bool) {
     if denied {
         event = event.action(ActionId::Denied);
     }
-    egress_emit!(event.build());
+    emit_request_events(correlation, [event.build()]);
 }
 
 /// Parse the raw header block into middleware-visible headers, preserving
@@ -1009,12 +1095,26 @@ pub(super) fn middleware_events(
 
 /// Emit the OCSF events describing a middleware chain outcome through the
 /// tracing pipeline.
+#[cfg(test)]
 fn emit_middleware_events(
     ctx: &L7EvalContext,
     req: &crate::l7::provider::L7Request,
     outcome: &openshell_supervisor_middleware::ChainOutcome,
 ) {
     crate::telemetry::emit_decision(middleware_events(ctx, req, outcome), None);
+}
+
+pub fn emit_request_events(
+    correlation: Option<&super::correlation::RequestCorrelation>,
+    events: impl IntoIterator<Item = openshell_ocsf::OcsfEvent>,
+) {
+    if let Some(correlation) = correlation {
+        for event in events {
+            correlation.emit(event);
+        }
+    } else {
+        crate::telemetry::emit_decision(events, None);
+    }
 }
 
 #[cfg(test)]
@@ -1122,7 +1222,7 @@ mod trace_tests {
             let (events, received) = exported("warn", || {
                 let ctx = L7EvalContext::default();
                 emit_middleware_uninspectable(&ctx, "unknown protocol", denied);
-                emit_middleware_body_unavailable(&ctx, denied);
+                emit_middleware_body_unavailable(&ctx, denied, None);
             })
             .await;
             assert_eq!(events.len(), 2);
@@ -1397,9 +1497,16 @@ mod tests {
         };
         let (mut client, mut server) = tokio::io::duplex(4096);
 
-        send_middleware_rejection_response(&req, &mut server, &ctx, Some(&denial), "/v1/messages")
-            .await
-            .expect("send denial");
+        send_middleware_rejection_response(
+            &req,
+            &mut server,
+            &ctx,
+            Some(&denial),
+            "/v1/messages",
+            Some("00000000-0000-4000-8000-000000000010"),
+        )
+        .await
+        .expect("send denial");
         drop(server);
 
         let mut response = Vec::new();
@@ -1408,9 +1515,13 @@ mod tests {
             .await
             .expect("read denial");
         let response = String::from_utf8(response).expect("UTF-8 response");
+        assert!(
+            response.contains("x-openshell-request-id: 00000000-0000-4000-8000-000000000010\r\n")
+        );
         let (_, body) = response.split_once("\r\n\r\n").expect("HTTP response");
         let body: serde_json::Value = serde_json::from_str(body).expect("JSON response");
         assert_eq!(body["error"], "middleware_denied");
+        assert_eq!(body["request_id"], "00000000-0000-4000-8000-000000000010");
         assert_eq!(body["middleware"], "prototype-content-guard");
         assert_eq!(body["reason_code"], "content_match");
         assert!(body.get("rule_missing").is_none());
@@ -1490,9 +1601,16 @@ mod tests {
         };
         let (mut client, mut server) = tokio::io::duplex(4096);
 
-        send_middleware_rejection_response(&req, &mut server, &ctx, None, "/v1/messages")
-            .await
-            .expect("send failure");
+        send_middleware_rejection_response(
+            &req,
+            &mut server,
+            &ctx,
+            None,
+            "/v1/messages",
+            Some("00000000-0000-4000-8000-000000000011"),
+        )
+        .await
+        .expect("send failure");
         drop(server);
 
         let mut response = Vec::new();
@@ -1501,9 +1619,13 @@ mod tests {
             .await
             .expect("read failure");
         let response = String::from_utf8(response).expect("UTF-8 response");
+        assert!(
+            response.contains("x-openshell-request-id: 00000000-0000-4000-8000-000000000011\r\n")
+        );
         let (_, body) = response.split_once("\r\n\r\n").expect("HTTP response");
         let body: serde_json::Value = serde_json::from_str(body).expect("JSON response");
         assert_eq!(body["error"], "middleware_failed");
+        assert_eq!(body["request_id"], "00000000-0000-4000-8000-000000000011");
         assert_eq!(
             body["detail"],
             "Request could not be processed by configured middleware"

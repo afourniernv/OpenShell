@@ -317,6 +317,32 @@ To bound telemetry volume when a workload retries blocked destinations, the supe
 
 Gateway records and their OTLP trace context can inherit the caller's incoming `traceparent`, including before authentication succeeds. The caller also decides whether they are correlated at all, because an unsampled `traceparent` suppresses `trace.uid`. Treat gateway trace IDs as correlation hints, not evidence of the caller's identity, and do not treat a missing `trace.uid` as meaningful.
 
+## Join Inspected HTTP Requests
+
+The supervisor assigns each inspected HTTP request a UUID shared by middleware
+`RequestContext.request_id`, OCSF `metadata.correlation_uid`, and the
+`x-openshell-request-id` response header. It also exports the ID as the OTLP log
+attribute `ocsf.metadata.correlation_uid`.
+
+This header is reserved for OpenShell: workload and upstream values are removed,
+and middleware cannot set or remove it. Use a different header for
+application-owned correlation. The receipt is a join key, not proof of identity,
+authorization or downstream execution. L4 and uninspected traffic do not provide
+this receipt guarantee.
+
+One primary HTTP Activity record is emitted when the final response head is
+written. If the request ends earlier, a guard emits the available outcome.
+Routine middleware outcomes share that record; security findings remain separate.
+A failure observed after the primary record can produce an additional correlated
+record. The response header does not prove that the body was delivered.
+
+The request ID join works without tracing, when spans are not sampled, and when
+the collector is unavailable. This feature adds no request spans and does not
+adopt workload trace headers into supervisor traces. Existing bounded deny spans
+are unchanged. An instrumented client can record the receipt on its own trace
+and use the request ID to find OpenShell's security records; it does not need to
+receive those records inside the sandbox.
+
 ## OCSF Event Classes in JSON
 
 The `class_uid` field identifies the event type:
