@@ -720,6 +720,7 @@ where
             &middleware.target,
             status_code,
             &preflight.invocations,
+            response_correlation.is_none(),
         ));
         if preflight.denial.is_none() {
             preflight_events.push(http_response_middleware_failure_event(
@@ -862,9 +863,7 @@ where
             &finish.invocations,
             response_correlation,
         );
-        for event in crate::l7::middleware::middleware_finding_events(&finish.findings) {
-            crate::telemetry::egress_emit!(event);
-        }
+        emit_http_response_findings(&finish.findings, response_correlation);
         emit_http_response_diagnostic_truncation(
             middleware.policy_name,
             &middleware.target,
@@ -1157,9 +1156,7 @@ where
         &finish.invocations,
         response_correlation,
     );
-    for event in crate::l7::middleware::middleware_finding_events(&finish.findings) {
-        crate::telemetry::egress_emit!(event);
-    }
+    emit_http_response_findings(&finish.findings, response_correlation);
     emit_http_response_diagnostic_truncation(
         middleware.policy_name,
         &middleware.target,
@@ -1324,9 +1321,15 @@ fn http_response_decision_events(
     target: &HttpRequestTarget,
     status_code: u16,
     invocations: &[openshell_supervisor_middleware::HttpResponseInvocation],
+    include_routine: bool,
 ) -> Vec<openshell_ocsf::OcsfEvent> {
-    let mut events =
-        http_response_middleware_invocation_events(policy_name, target, status_code, invocations);
+    let mut events = http_response_middleware_invocation_events(
+        policy_name,
+        target,
+        status_code,
+        invocations,
+        include_routine,
+    );
     for invocation in invocations {
         events.extend(http_response_middleware_fail_open_finding_event(
             policy_name,
@@ -1468,7 +1471,24 @@ fn emit_http_response_middleware_invocations(
     emit_phase_events(
         correlation,
         MiddlewarePhase::Response,
-        http_response_decision_events(policy_name, target, status_code, invocations),
+        http_response_decision_events(
+            policy_name,
+            target,
+            status_code,
+            invocations,
+            correlation.is_none(),
+        ),
+    );
+}
+
+fn emit_http_response_findings(
+    findings: &[openshell_supervisor_middleware::NamespacedFinding],
+    correlation: Option<&RequestCorrelation>,
+) {
+    emit_phase_events(
+        correlation,
+        MiddlewarePhase::Response,
+        crate::l7::middleware::middleware_finding_events(findings),
     );
 }
 
@@ -1481,8 +1501,13 @@ fn emit_http_response_diagnostics(
     terminal_failure: Option<bool>,
     correlation: Option<&RequestCorrelation>,
 ) {
-    let mut events =
-        http_response_decision_events(policy_name, target, status_code, &diagnostics.invocations);
+    let mut events = http_response_decision_events(
+        policy_name,
+        target,
+        status_code,
+        &diagnostics.invocations,
+        correlation.is_none(),
+    );
     events.extend(crate::l7::middleware::middleware_finding_events(
         &diagnostics.findings,
     ));
@@ -1544,9 +1569,19 @@ pub(super) fn http_response_middleware_invocation_events(
     target: &HttpRequestTarget,
     status_code: u16,
     invocations: &[openshell_supervisor_middleware::HttpResponseInvocation],
+    include_routine: bool,
 ) -> Vec<openshell_ocsf::OcsfEvent> {
     invocations
         .iter()
+        .filter(|invocation| {
+            include_routine
+                || invocation.failed
+                || matches!(
+                    invocation.outcome,
+                    openshell_supervisor_middleware::HttpResponseInvocationOutcome::BlockDelivery
+                        | openshell_supervisor_middleware::HttpResponseInvocationOutcome::FailClosed
+                )
+        })
         .map(|invocation| {
             let outcome = format!("{:?}", invocation.outcome).to_ascii_lowercase();
             let failed = invocation.failed;
@@ -2822,6 +2857,70 @@ mod tests {
         }
     }
 
+    #[test]
+    fn response_finalization_findings_keep_the_request_id_without_trace_export() {
+        use std::sync::{Arc, Mutex};
+        use tracing_subscriber::layer::SubscriberExt as _;
+        use tracing_subscriber::{Layer, layer::Context, registry::LookupSpan};
+
+        #[derive(Clone, Default)]
+        struct EventScopes(Arc<Mutex<Vec<&'static str>>>);
+
+        impl<S: tracing::Subscriber + for<'lookup> LookupSpan<'lookup>> Layer<S> for EventScopes {
+            fn on_event(&self, event: &tracing::Event<'_>, ctx: Context<'_, S>) {
+                if event.metadata().target() == "ocsf"
+                    && let Some(span) = ctx.event_span(event)
+                {
+                    self.0.lock().unwrap().push(span.metadata().name());
+                }
+            }
+        }
+
+        for export in [false, true] {
+            let capture = openshell_ocsf::test_support::OcsfCapture::default();
+            let scopes = EventScopes::default();
+            let exporter = opentelemetry_sdk::trace::InMemorySpanExporterBuilder::new().build();
+            let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+                .with_simple_exporter(exporter.clone())
+                .build();
+            let subscriber = tracing_subscriber::registry()
+                .with(capture.clone())
+                .with(scopes.clone())
+                .with(export.then(|| openshell_otel::layer(&provider, "response-findings")));
+            tracing::subscriber::with_default(subscriber, || {
+                let correlation = test_correlation("response-finalization");
+                let _phase =
+                    correlation.begin_middleware(crate::l7::correlation::MiddlewarePhase::Response);
+                super::emit_http_response_findings(&[finding()], Some(&correlation));
+            });
+            let findings = capture
+                .json_events()
+                .into_iter()
+                .filter(|event| event["finding_info"]["uid"] == "test.finding")
+                .collect::<Vec<_>>();
+            assert_eq!(findings.len(), 1);
+            assert_eq!(
+                findings[0]["metadata"]["correlation_uid"],
+                "response-finalization"
+            );
+            provider.force_flush().unwrap();
+            let spans = exporter.get_finished_spans().unwrap();
+            assert_eq!(spans.is_empty(), !export);
+            assert_eq!(
+                scopes
+                    .0
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|scope| **scope == "openshell.middleware.response")
+                    .count(),
+                1,
+                "finding uses response context regardless of export",
+            );
+            provider.shutdown().unwrap();
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn response_terminal_failure_without_diagnostics_has_no_deny_trace() {
         use crate::telemetry::tests::{assert_no_deny, exported};
@@ -2909,12 +3008,21 @@ mod tests {
                 &target,
                 200,
                 &[invocation(outcome, failed)],
+                true,
             );
             assert_eq!(
                 events[0].to_json().unwrap()["action_id"],
                 action_id,
                 "{outcome:?}"
             );
+            let notable = super::http_response_middleware_invocation_events(
+                "p",
+                &target,
+                200,
+                &[invocation(outcome, failed)],
+                false,
+            );
+            assert_eq!(notable.len(), usize::from(failed || action_id == 2));
         }
         for denied in [false, true] {
             let failure =

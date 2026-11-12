@@ -8339,6 +8339,7 @@ mod tests {
                 reason_code: Some("stable_reason".into()),
                 failure_category: Some("timeout".into()),
             }],
+            true,
         );
         let json = events[0].to_json().unwrap().to_string();
         for forbidden in [
@@ -8393,6 +8394,7 @@ mod tests {
                     &target,
                     200,
                     std::slice::from_ref(&invocation),
+                    true,
                 )
                 .len(),
                 1

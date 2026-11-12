@@ -9076,7 +9076,7 @@ network_policies:
         // tracing pipeline: its callsite-interest cache is process-global, so a
         // parallel test that emits OCSF with no subscriber installed can cache
         // the callsite as disabled and make captured-event assertions flaky.
-        let events = middleware_events(&ctx, &req, &outcome);
+        let events = middleware_events(&ctx, &req, &outcome, true);
 
         // Per-invocation decisions are HTTP Activity (class 4002).
         assert!(
@@ -9089,6 +9089,9 @@ network_policies:
             .find(|e| e.class_uid() == 2004)
             .expect("expected a Detection Finding event");
         assert_eq!(finding_event.base().severity, SeverityId::Medium);
+        let notable = middleware_events(&ctx, &req, &outcome, false);
+        assert_eq!(notable.len(), 1);
+        assert_eq!(notable[0].class_uid(), 2004);
 
         // No raw payload material may appear in any emitted event.
         let serialized = serde_json::to_string(&events).expect("serialize events");
@@ -9127,7 +9130,7 @@ network_policies:
                 },
             }))
             .collect();
-        let bounded_events = middleware_events(&ctx, &req, &bounded_outcome);
+        let bounded_events = middleware_events(&ctx, &req, &bounded_outcome, true);
         assert_eq!(
             bounded_events
                 .iter()
@@ -9157,7 +9160,7 @@ network_policies:
             }),
             termination: ChainTermination::MiddlewareDenied,
         };
-        let denied_events = middleware_events(&ctx, &req, &denied_outcome);
+        let denied_events = middleware_events(&ctx, &req, &denied_outcome, true);
         let denied_http = denied_events
             .iter()
             .find(|event| event.class_uid() == 4002)
@@ -9187,7 +9190,7 @@ network_policies:
             }],
             ..denied_outcome
         };
-        let failure_events = middleware_events(&ctx, &req, &external_failure_outcome);
+        let failure_events = middleware_events(&ctx, &req, &external_failure_outcome, true);
         let serialized = serde_json::to_string(&failure_events).expect("serialize failure events");
         assert!(serialized.contains("middleware_failed_closed"));
         assert!(!serialized.contains("header_mutation_invalid_name"));
@@ -9210,7 +9213,7 @@ network_policies:
             denial: None,
             termination: ChainTermination::Completed,
         };
-        let fail_open_events = middleware_events(&ctx, &req, &fail_open_outcome);
+        let fail_open_events = middleware_events(&ctx, &req, &fail_open_outcome, true);
         let fail_open_http = fail_open_events
             .iter()
             .find(|event| event.class_uid() == 4002)

@@ -1095,11 +1095,15 @@ pub(super) fn middleware_events(
     ctx: &L7EvalContext,
     req: &crate::l7::provider::L7Request,
     outcome: &openshell_supervisor_middleware::ChainOutcome,
+    include_routine: bool,
 ) -> Vec<openshell_ocsf::OcsfEvent> {
     let mut events = Vec::new();
     for invocation in &outcome.applied {
         let allowed = invocation.decision == openshell_core::proto::Decision::Allow;
         let failed = invocation.failed;
+        if !include_routine && allowed && !failed {
+            continue;
+        }
         let status_detail = if failed {
             Some(if allowed {
                 "middleware_failed_open".to_string()
@@ -1227,7 +1231,7 @@ fn emit_middleware_events(
     emit_phase_events(
         correlation,
         MiddlewarePhase::Request,
-        middleware_events(ctx, req, outcome),
+        middleware_events(ctx, req, outcome, correlation.is_none()),
     );
 }
 
@@ -1326,6 +1330,7 @@ mod trace_tests {
                 &L7EvalContext::default(),
                 &request(),
                 &outcome(false, reason, vec![], vec![]),
+                true,
             );
             assert_eq!(events.len(), 1, "{reason}");
             let finding = events[0].to_json().unwrap();
