@@ -164,13 +164,13 @@ impl CredentialState {
         merge_credential_outcome(current, outcome);
     }
 
-    fn snapshot(&self) -> Option<CredentialSnapshot> {
+    fn effective_outcome(&self) -> Option<CredentialOutcome> {
         self.selected.then(|| {
             let has_incomplete = self
                 .mechanisms
                 .values()
                 .any(|outcome| *outcome == CredentialOutcome::Incomplete);
-            let outcome = match self.outcome {
+            match self.outcome {
                 Some(
                     outcome @ (CredentialOutcome::Denied
                     | CredentialOutcome::Stale
@@ -179,14 +179,16 @@ impl CredentialState {
                 _ if has_incomplete => CredentialOutcome::Incomplete,
                 Some(outcome) => outcome,
                 None => CredentialOutcome::Incomplete,
-            };
-
-            CredentialSnapshot {
-                mechanisms: sorted_values(self.mechanisms.keys().map(|value| value.as_str())),
-                surfaces: sorted_values(self.surfaces.iter().map(|value| value.as_str())),
-                outcome,
-                mechanism_outcomes: self.mechanisms.clone(),
             }
+        })
+    }
+
+    fn snapshot(&self) -> Option<CredentialSnapshot> {
+        self.effective_outcome().map(|outcome| CredentialSnapshot {
+            mechanisms: sorted_values(self.mechanisms.keys().map(|value| value.as_str())),
+            surfaces: sorted_values(self.surfaces.iter().map(|value| value.as_str())),
+            outcome,
+            mechanism_outcomes: self.mechanisms.clone(),
         })
     }
 }
@@ -776,14 +778,14 @@ impl RequestCorrelation {
                 return;
             };
             let mut primary = primary;
-            if let Some(snapshot) = state.credential.snapshot()
-                && snapshot.outcome != CredentialOutcome::Prepared
+            if let Some(outcome) = state.credential.effective_outcome()
+                && outcome != CredentialOutcome::Prepared
                 && let OcsfEvent::HttpActivity(http) = &mut primary
             {
                 http.base
                     .unmapped
                     .get_or_insert_with(|| serde_json::json!({}))["credential_outcome"] =
-                    snapshot.outcome.as_str().into();
+                    outcome.as_str().into();
             }
             (primary, state.status, state.upstream_status, state.outcome)
         };
@@ -1057,6 +1059,41 @@ fn trim_optional_whitespace(mut value: &[u8]) -> &[u8] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn effective_credential_outcome_preserves_selection_and_failure_precedence() {
+        let mut state = CredentialState::default();
+        assert_eq!(state.effective_outcome(), None);
+        state.observe(
+            CredentialMechanism::StaticPlaceholder,
+            CredentialSurface::Header,
+        );
+        assert_eq!(
+            state.effective_outcome(),
+            Some(CredentialOutcome::Incomplete)
+        );
+        state.complete_mechanism(
+            CredentialMechanism::StaticPlaceholder,
+            CredentialOutcome::Prepared,
+        );
+        assert_eq!(state.effective_outcome(), Some(CredentialOutcome::Prepared));
+        state.observe(CredentialMechanism::TokenGrant, CredentialSurface::Header);
+        assert_eq!(
+            state.effective_outcome(),
+            Some(CredentialOutcome::Incomplete)
+        );
+        state.complete_mechanism(CredentialMechanism::TokenGrant, CredentialOutcome::Withheld);
+        assert_eq!(state.effective_outcome(), Some(CredentialOutcome::Prepared));
+        for outcome in [
+            CredentialOutcome::Unavailable,
+            CredentialOutcome::Stale,
+            CredentialOutcome::Denied,
+        ] {
+            state.complete(outcome);
+            assert_eq!(state.effective_outcome(), Some(outcome));
+            assert_eq!(state.snapshot().unwrap().outcome, outcome);
+        }
+    }
 
     fn request() -> L7Request {
         L7Request {
