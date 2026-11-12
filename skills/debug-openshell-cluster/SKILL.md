@@ -869,8 +869,12 @@ kubectl -n openshell describe hpa openshell
 
 The JSONPath filter keeps only pods whose first container is the gateway
 (`openshell-gateway`). It skips certificate hook Job pods, which older charts
-labeled like gateway pods. The metrics port is `service.metricsPort` (default
-`9090`).
+labeled like gateway pods. Helm enables metrics with `metrics.enabled=true`
+(the default). Set it to `false` to omit the listener and its container and
+Service ports. `service.metricsPort` selects the port (default `9090`) and
+must remain between 1 and 65535 even when metrics are disabled. Migrate legacy
+port `0` or `false` to `metrics.enabled=false` and a valid port in the same
+upgrade; those legacy values fail rendering. Metrics TLS requires enablement.
 
 The API server proxy connects to each pod from the control plane. A
 NetworkPolicy that accepts the metrics port only from a monitoring namespace
@@ -1640,8 +1644,9 @@ credential failures.
 | Provider profiles disappear after enabling an interceptor catalog | `provider_profile_sources` selected only an authoritative interceptor or returned invalid/duplicate IDs | Inspect source list and interceptor `Describe`/catalog logs; include `user` when composition with imported profiles is intended |
 | `provider list-profiles` is empty on a new gateway | Profiles are import-only and nothing has been imported | Import with `openshell provider profile import --from providers --global`; an empty catalog is a valid ready state, not a failure |
 | Sandbox create or provider attach fails naming a missing profile | The provider's profile was never imported, was deleted, or lives at another scope | Import it at the scope the provider uses; the error names the profile ID and the command |
-| Gateway fails after registering supervisor middleware | Service unavailable, invalid manifest, duplicate binding, reserved name, or invalid payload/timeout limit | Middleware service and gateway logs; `[[openshell.supervisor.middleware]]`; `Describe` response |
-| Policy update rejects `network_middlewares` | Unknown middleware name, implementation-owned config invalid, duplicate order, broad/invalid host selector, or fail-closed coverage of `tls: skip` | Policy error, gateway logs, middleware `ValidateConfig`, selector and order fields |
+| Gateway fails after registering supervisor middleware | Service unavailable, invalid manifest, duplicate binding, reserved name, invalid payload/timeout limit, or an HTTP hooks capability that is supported but not required | Middleware service and gateway logs; `[[openshell.supervisor.middleware]]`; `Describe` response |
+| Policy update rejects `network_middlewares` | Unknown middleware name, implementation-owned config invalid, duplicate order, broad/invalid host selector, `fail_open` on an HTTP hook service, overlapping selectors with different HTTP hook versions, or fail-closed coverage of `tls: skip` | Policy error, gateway logs, middleware `ValidateConfig`, selector, order, and `on_error` fields |
+| HTTP traffic fails with `failure_code` `middleware_hook_versions_mixed`, `middleware_cannot_inspect`, `middleware_lifecycle_violation` (OCSF reason `middleware_unimplemented`), `middleware_timeout`, or `stream_idle_timeout`, or with `408 request_timeout` | HTTP hook middleware failure (always fail-closed) or a stalled streaming upload | [Supervisor middleware reference](references/supervisor-middleware.md); sandbox OCSF middleware events |
 | Gateway or extension rejects its peer before serving health | Missing peer metadata, incompatible protocol major, or unmet `required_capabilities` | Gateway and extension startup logs; compare `PeerMetadata`; legacy-to-current migration requires a coordinated gateway and extension outage |
 | Policy mutation returns `FAILED_PRECONDITION` for endpoint ambiguity | Equally specific effective endpoint selectors disagree on connection or request-processing metadata | CLI error, base and provider-composed policy, affected profile attachments; confirm no new revision was stored |
 | Supervisor enters policy quarantine | A runtime candidate failed validation while `policy_validation_failure_mode = "fail_closed"` | Sandbox OCSF config/finding events, validation rationale, active generation, `previous_policy_active` |

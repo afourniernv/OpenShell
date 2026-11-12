@@ -3,6 +3,8 @@
 
 //! HTTP response relay and pre-return middleware integration.
 
+mod http_hooks;
+
 use super::*;
 use crate::l7::correlation::{HttpOutcome, RequestCorrelation, RequestStage};
 
@@ -19,6 +21,31 @@ pub struct HttpResponseMiddlewareRelay<'a> {
     pub(crate) policy_name: &'a str,
     pub(crate) generation_guard: Option<&'a PolicyGenerationGuard>,
     pub(crate) whole_body_timeout: std::time::Duration,
+    /// The client request used HTTP/1.1, so an HTTP hook response may
+    /// be re-framed chunked. An HTTP/1.0 client cannot decode chunked framing.
+    pub(crate) client_accepts_chunked: bool,
+    /// The request head as request middleware forwarded it, before
+    /// credentials. HTTP hook response stages receive its headers, and
+    /// fail closed without it.
+    pub(crate) request_head: Option<crate::l7::middleware::ForwardedRequestHead>,
+}
+
+impl HttpResponseMiddlewareRelay<'_> {
+    /// Whether an HTTP hook stage of this response chain may inspect bodies.
+    ///
+    /// A chain that cannot be described fails when the response arrives, so
+    /// the request is left unchanged.
+    pub(super) async fn inspects_bodies(&self) -> bool {
+        if self.chain.is_empty() {
+            return false;
+        }
+        self.runner
+            .describe_http_response_chain(self.chain)
+            .await
+            .is_ok_and(|described| {
+                openshell_supervisor_middleware::chain_inspects_http_response_bodies(&described)
+            })
+    }
 }
 
 #[derive(Clone)]
@@ -316,12 +343,6 @@ fn record_denied_response(correlation: Option<&RequestCorrelation>, stage: &'sta
     }
 }
 
-fn record_platform_response_error(correlation: Option<&RequestCorrelation>, stage: &'static str) {
-    if let Some(correlation) = correlation {
-        correlation.record_rejection(502, HttpOutcome::PlatformError, Some(stage));
-    }
-}
-
 fn record_upstream_response_error(correlation: Option<&RequestCorrelation>, stage: &'static str) {
     if let Some(correlation) = correlation {
         correlation.record_failure(HttpOutcome::UpstreamError, stage);
@@ -517,7 +538,7 @@ fn strip_platform_request_id_from_connection(headers: Cow<'_, [u8]>) -> Cow<'_, 
 /// request is permitted. Signal EOF (including TLS `close_notify`) before the
 /// caller tears down a closing CONNECT tunnel; waiting for another request
 /// deadlocks clients that are themselves waiting for EOF.
-async fn finish_response<C>(client: &mut C, close: bool) -> Result<RelayOutcome>
+pub(super) async fn finish_response<C>(client: &mut C, close: bool) -> Result<RelayOutcome>
 where
     C: AsyncWrite + Unpin,
 {
@@ -631,6 +652,8 @@ where
                 request_method,
                 middleware.policy_name,
                 &middleware.target,
+                None,
+                HttpOutcome::PlatformError,
                 "response_middleware_headers",
                 response_correlation,
             )
@@ -638,6 +661,52 @@ where
             return Ok(Some(RelayOutcome::Consumed));
         }
     };
+    match openshell_supervisor_middleware::chain_http_hook_version(&described) {
+        openshell_supervisor_middleware::ChainHttpHookVersion::Legacy => {}
+        openshell_supervisor_middleware::ChainHttpHookVersion::Current => {
+            return Box::pin(http_hooks::relay_response_through_pipeline(
+                request_method,
+                upstream,
+                client,
+                middleware,
+                described,
+                parsed,
+                buffered,
+                header_end,
+                status_code,
+                body_length,
+                server_wants_close,
+                event_stream,
+                response_correlation,
+            ))
+            .await;
+        }
+        openshell_supervisor_middleware::ChainHttpHookVersion::Mixed => {
+            debug!(
+                reason = openshell_supervisor_middleware::MIDDLEWARE_HOOK_VERSIONS_MIXED,
+                "HTTP response middleware chain mixes HTTP hook versions"
+            );
+            emit_http_response_middleware_failure(
+                response_correlation,
+                middleware.policy_name,
+                &middleware.target,
+                status_code,
+                false,
+            );
+            send_response_delivery_failure(
+                client,
+                request_method,
+                middleware.policy_name,
+                &middleware.target,
+                None,
+                HttpOutcome::PlatformError,
+                "response_middleware_hook_version",
+                response_correlation,
+            )
+            .await?;
+            return Ok(Some(RelayOutcome::Consumed));
+        }
+    }
     let original_headers = parsed.headers.clone();
     let preserved_credential_headers = parsed.preserved_credential_headers;
     let upstream_declared_trailers = parsed.declared_trailers.clone();
@@ -652,6 +721,8 @@ where
         },
         headers: parsed.headers,
         connection_nominated_headers: parsed.connection_nominated,
+        // Legacy response hooks do not receive request headers.
+        request_headers: Vec::new(),
     };
     let preflight_result = if parsed.representable {
         middleware
@@ -679,6 +750,8 @@ where
                 request_method,
                 middleware.policy_name,
                 &middleware.target,
+                None,
+                HttpOutcome::PlatformError,
                 "response_middleware_preflight",
                 response_correlation,
             )
@@ -740,6 +813,8 @@ where
                 request_method,
                 middleware.policy_name,
                 &middleware.target,
+                None,
+                HttpOutcome::PlatformError,
                 "response_middleware_preflight",
                 response_correlation,
             )
@@ -810,6 +885,8 @@ where
                     request_method,
                     middleware.policy_name,
                     &middleware.target,
+                    None,
+                    HttpOutcome::PlatformError,
                     "response_middleware_finish",
                     response_correlation,
                 )
@@ -991,6 +1068,8 @@ where
                     request_method,
                     middleware.policy_name,
                     &middleware.target,
+                    None,
+                    HttpOutcome::PlatformError,
                     "response_middleware_body",
                     response_correlation,
                 )
@@ -1065,6 +1144,8 @@ where
                     request_method,
                     middleware.policy_name,
                     &middleware.target,
+                    None,
+                    HttpOutcome::PlatformError,
                     "response_middleware_finish",
                     response_correlation,
                 )
@@ -2423,16 +2504,28 @@ async fn send_response_middleware_denial<C: AsyncWrite + Unpin>(
     Ok(())
 }
 
+/// Answer a response that middleware failed before its head was committed.
+/// An HTTP hook failure carries its platform-owned code and stage.
+#[allow(clippy::too_many_arguments)]
 async fn send_response_delivery_failure<C: AsyncWrite + Unpin>(
     client: &mut C,
     request_method: &str,
     policy_name: &str,
     target: &HttpRequestTarget,
+    failure: Option<&openshell_supervisor_middleware::MiddlewareFailureDetail>,
+    outcome: HttpOutcome,
     stage: &'static str,
     correlation: Option<&RequestCorrelation>,
 ) -> Result<()> {
-    record_platform_response_error(correlation, stage);
-    let body = serde_json::to_vec(&serde_json::json!({
+    if let Some(correlation) = correlation {
+        if outcome == HttpOutcome::UpstreamError {
+            correlation.record_response_status(502);
+            correlation.record_failure(outcome, stage);
+        } else {
+            correlation.record_rejection(502, outcome, Some(stage));
+        }
+    }
+    let mut body = serde_json::json!({
         "error": "response_delivery_failed",
         "detail": "The upstream request may have completed, but OpenShell could not deliver its response. Retrying may repeat upstream side effects.",
         "policy": policy_name,
@@ -2441,8 +2534,12 @@ async fn send_response_delivery_failure<C: AsyncWrite + Unpin>(
         "path": target.path,
         "host": target.host,
         "port": target.port,
-    }))
-    .into_diagnostic()?;
+    });
+    if let Some(failure) = failure {
+        insert_middleware_failure(&mut body, failure);
+    }
+    let body = body_with_request_id(body, correlation.map(RequestCorrelation::request_id));
+    let body = serde_json::to_vec(&body).into_diagnostic()?;
     let head = format!(
         "HTTP/1.1 502 Bad Gateway\r\nContent-Type: application/json\r\nContent-Length: {}\r\nX-OpenShell-Policy: {policy_name}\r\nConnection: close\r\n\r\n",
         body.len()
@@ -2528,6 +2625,7 @@ pub(super) fn response_is_event_stream(headers: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{final_response_head, strip_platform_request_id_from_connection};
+    use crate::l7::correlation::HttpOutcome;
     use crate::l7::rest::strip_platform_request_id_from_head;
     use openshell_supervisor_middleware::{
         HttpResponseInvocation, HttpResponseInvocationOutcome as Outcome, NamespacedFinding,
@@ -3018,6 +3116,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn delivery_failure_receipt_distinguishes_upstream_error_from_local_block() {
+        for outcome in [HttpOutcome::UpstreamError, HttpOutcome::PlatformError] {
+            let capture = openshell_ocsf::test_support::OcsfCapture::default();
+            let _subscriber = capture.install();
+            let correlation = test_correlation("delivery-failure");
+            let target = HttpRequestTarget {
+                scheme: "https".into(),
+                host: "example.test".into(),
+                port: 443,
+                method: "GET".into(),
+                path: "/data".into(),
+                query: String::new(),
+            };
+            let mut client = Vec::new();
+            {
+                let mut client = correlation.observe_response(&mut client);
+                super::send_response_delivery_failure(
+                    &mut client,
+                    "GET",
+                    "policy",
+                    &target,
+                    None,
+                    outcome,
+                    "response_body",
+                    Some(&correlation),
+                )
+                .await
+                .unwrap();
+            }
+            drop(correlation);
+            assert_eq!(request_id_header_count(&client), 1);
+            let events = capture.json_events();
+            assert_eq!(events.len(), 1);
+            assert_eq!(events[0]["http_response"]["code"], 502);
+            assert_eq!(events[0]["metadata"]["correlation_uid"], "delivery-failure");
+            assert_eq!(
+                events[0]["action"] == "Denied",
+                outcome == HttpOutcome::PlatformError
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn correlated_upstream_eof_preserves_transport_close_and_audits_failure() {
         let capture = openshell_ocsf::test_support::OcsfCapture::default();
         let _subscriber = capture.install();
@@ -3142,6 +3283,8 @@ mod tests {
             policy_name: "test-policy",
             generation_guard: None,
             whole_body_timeout: DEFAULT_HTTP_RESPONSE_WHOLE_BODY_TIMEOUT,
+            client_accepts_chunked: true,
+            request_head: None,
         };
         let mut upstream = &b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"[..];
         let mut client = Vec::new();
@@ -3424,6 +3567,8 @@ mod tests {
             policy_name: "test-policy",
             generation_guard: None,
             whole_body_timeout: DEFAULT_HTTP_RESPONSE_WHOLE_BODY_TIMEOUT,
+            client_accepts_chunked: true,
+            request_head: None,
         };
         let mut upstream = &b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nbody\r\n0\r\nX-OpenShell-Request-ID: forged\r\n\r\n"[..];
         let mut client = Vec::new();

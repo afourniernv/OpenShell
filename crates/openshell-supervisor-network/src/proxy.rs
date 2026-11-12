@@ -1951,13 +1951,16 @@ impl ForwardMiddlewarePipeline<'_> {
             None => openshell_supervisor_middleware::TransformedBodyPolicy::NotPolicyRelevant,
         };
 
+        // The forward proxy writes the request as one buffer, so middleware
+        // output is withheld and inlined.
         self.exchange
-            .apply_request_correlated(
+            .apply_request_with_delivery_correlated(
                 request,
                 client,
                 self.ctx,
                 self.scheme,
                 transformed_body_policy,
+                crate::l7::middleware::RequestBodyDelivery::WITHHOLD,
                 self.correlation,
             )
             .await
@@ -3180,6 +3183,49 @@ async fn handle_mediated_connection(
         return Ok(());
     }
 
+    // Build request-processing context shared by CONNECT and forward HTTP.
+    let mut ctx = relay::http_context(
+        &decision,
+        provider_credentials,
+        secret_resolver.clone(),
+        policy_local_ctx.as_deref(),
+        agent_proposals,
+        relay::RelaySignals {
+            activity: activity_tx.clone(),
+            endpoint_observation: endpoint_observation_tx,
+        },
+    );
+
+    // Gate a `tls: skip` tunnel before `200 Connection Established`, so a
+    // denial is a plain 403. Policy validation rejects fail-closed middleware
+    // overlapping `tls: skip` endpoints; this runtime gate is defense in depth.
+    if effective_tls_skip {
+        match middleware_uninspectable_gate(&opa_engine, &ctx)? {
+            crate::l7::middleware::UninspectableTrafficGate::Deny => {
+                crate::l7::middleware::emit_middleware_uninspectable(&ctx, "tls-skip tunnel", true);
+                respond(
+                    &mut client,
+                    &build_json_error_response(
+                        403,
+                        "Forbidden",
+                        "middleware_required",
+                        "tls: skip tunnel cannot be inspected by required middleware",
+                    ),
+                )
+                .await?;
+                return Ok(());
+            }
+            crate::l7::middleware::UninspectableTrafficGate::BypassWithFinding => {
+                crate::l7::middleware::emit_middleware_uninspectable(
+                    &ctx,
+                    "tls-skip tunnel",
+                    false,
+                );
+            }
+            crate::l7::middleware::UninspectableTrafficGate::Unrestricted => {}
+        }
+    }
+
     let dial_span = egress::dial_span(&connect_span);
     let upstream_result = tokio::select! {
         result = dial_upstream(&upstream_proxy, &host_lc, &raw_host_lc, port, connector.addrs())
@@ -3243,46 +3289,7 @@ async fn handle_mediated_connection(
     // `effective_tls_skip` was resolved before the `200` above (the fail-closed
     // gate needs it) and drives the raw-tunnel branch below.
 
-    // Build request-processing context shared by CONNECT and forward HTTP.
-    let mut ctx = relay::http_context(
-        &decision,
-        provider_credentials,
-        secret_resolver.clone(),
-        policy_local_ctx.as_deref(),
-        agent_proposals,
-        relay::RelaySignals {
-            activity: activity_tx.clone(),
-            endpoint_observation: endpoint_observation_tx,
-        },
-    );
-
     if effective_tls_skip {
-        // Policy validation rejects fail-closed middleware overlapping
-        // `tls: skip` endpoints; this runtime gate is defense in depth.
-        match middleware_uninspectable_gate(&opa_engine, &ctx)? {
-            crate::l7::middleware::UninspectableTrafficGate::Deny => {
-                crate::l7::middleware::emit_middleware_uninspectable(&ctx, "tls-skip tunnel", true);
-                respond(
-                    &mut client,
-                    &build_json_error_response(
-                        403,
-                        "Forbidden",
-                        "middleware_required",
-                        "tls: skip tunnel cannot be inspected by required middleware",
-                    ),
-                )
-                .await?;
-                return Ok(());
-            }
-            crate::l7::middleware::UninspectableTrafficGate::BypassWithFinding => {
-                crate::l7::middleware::emit_middleware_uninspectable(
-                    &ctx,
-                    "tls-skip tunnel",
-                    false,
-                );
-            }
-            crate::l7::middleware::UninspectableTrafficGate::Unrestricted => {}
-        }
         // tls: skip — raw tunnel, no termination, no credential injection.
         debug!(
             host = %host_lc,
@@ -5506,6 +5513,7 @@ where
             websocket_extensions: options.websocket_extensions,
             request_body_credential_rewrite: options.request_body_credential_rewrite,
             deny_uninspected_credentials: options.deny_uninspected_credentials,
+            identity_response_coding: false,
             credential_signing: options.credential_signing,
             signing_service: options.signing_service,
             signing_region: options.signing_region,
@@ -5547,7 +5555,7 @@ async fn inject_token_grant_for_forward_request(
         )?
     };
     if let Some(inspection) = inspection {
-        let (request, prepared_ctx) = crate::l7::relay::prepare_inspected_request(
+        let (request, prepared_ctx, _) = crate::l7::relay::prepare_inspected_request(
             request,
             l7_ctx,
             inspection.engine,
@@ -5577,6 +5585,7 @@ async fn inject_token_grant_for_forward_request(
             correlation,
         )
         .await?
+        .0
         .raw_header,
     )
 }
@@ -6701,13 +6710,36 @@ async fn handle_forward_proxy(
             l7_reevaluation,
             correlation: request_correlation,
         };
-        forward_request_bytes = match pipeline
+        let middleware_result = pipeline
             .apply(request, client)
             .instrument(connect_span.clone())
-            .await?
-        {
+            .await?;
+        forward_request_bytes = match middleware_result {
             crate::l7::middleware::MiddlewareApplyResult::Allowed(request) => request.raw_header,
-            crate::l7::middleware::MiddlewareApplyResult::Denied { denial, .. } => {
+            crate::l7::middleware::MiddlewareApplyResult::Streamed { .. } => {
+                return Err(miette::miette!(
+                    "forward proxy request middleware must withhold its output"
+                ));
+            }
+            crate::l7::middleware::MiddlewareApplyResult::RequestTimeout => {
+                emit_activity_simple(activity_tx, true, "middleware");
+                correlation.record_rejection(
+                    408,
+                    HttpOutcome::PlatformError,
+                    Some("request_timeout"),
+                );
+                let response = build_json_error_response_with_request_id(
+                    408,
+                    "Request Timeout",
+                    "request_timeout",
+                    "Request body was not received in time",
+                    receipt_id,
+                );
+                respond(client, &response).await?;
+                crate::l7::middleware::close_after_early_response(client).await?;
+                return Ok(());
+            }
+            crate::l7::middleware::MiddlewareApplyResult::Denied { denial, failure } => {
                 emit_activity_simple(activity_tx, true, "middleware");
                 correlation.record_rejection(
                     403,
@@ -6719,12 +6751,19 @@ async fn handle_forward_proxy(
                     None,
                 );
                 let response = denial.as_ref().map_or_else(
-                    || build_middleware_failure_response(&l7_ctx.policy_name, receipt_id),
+                    || {
+                        build_middleware_failure_response(
+                            &l7_ctx.policy_name,
+                            failure.as_ref(),
+                            receipt_id,
+                        )
+                    },
                     |denial| {
                         build_middleware_deny_response(&l7_ctx.policy_name, denial, receipt_id)
                     },
                 );
                 respond(client, &response).await?;
+                crate::l7::middleware::close_after_early_response(client).await?;
                 return Ok(());
             }
             crate::l7::middleware::MiddlewareApplyResult::AdmissionExhausted => {
@@ -6733,6 +6772,7 @@ async fn handle_forward_proxy(
                 let response =
                     build_middleware_unavailable_response(&l7_ctx.policy_name, receipt_id);
                 respond(client, &response).await?;
+                crate::l7::middleware::close_after_early_response(client).await?;
                 return Ok(());
             }
         };
@@ -6799,7 +6839,7 @@ async fn handle_forward_proxy(
                 None,
             );
             let response = preflight.denial.as_ref().map_or_else(
-                || build_middleware_failure_response(&l7_ctx.policy_name, receipt_id),
+                || build_middleware_failure_response(&l7_ctx.policy_name, None, receipt_id),
                 |denial| build_middleware_deny_response(&l7_ctx.policy_name, denial, receipt_id),
             );
             respond(client, &response).await?;
@@ -7536,17 +7576,30 @@ fn build_middleware_deny_response(
     .into_bytes()
 }
 
-fn build_middleware_failure_response(policy_name: &str, request_id: Option<&str>) -> Vec<u8> {
-    build_middleware_platform_response(policy_name, "403 Forbidden", request_id)
+fn build_middleware_failure_response(
+    policy_name: &str,
+    failure: Option<&openshell_supervisor_middleware::MiddlewareFailureDetail>,
+    request_id: Option<&str>,
+) -> Vec<u8> {
+    build_middleware_platform_response(policy_name, "403 Forbidden", failure, request_id)
 }
 
 fn build_middleware_unavailable_response(policy_name: &str, request_id: Option<&str>) -> Vec<u8> {
-    build_middleware_platform_response(policy_name, "503 Service Unavailable", request_id)
+    build_middleware_platform_response(
+        policy_name,
+        "503 Service Unavailable",
+        Some(&openshell_supervisor_middleware::MiddlewareFailureDetail {
+            config_name: None,
+            code: openshell_supervisor_middleware::HttpFailureCode::Unavailable,
+        }),
+        request_id,
+    )
 }
 
 fn build_middleware_platform_response(
     policy_name: &str,
     status: &str,
+    failure: Option<&openshell_supervisor_middleware::MiddlewareFailureDetail>,
     request_id: Option<&str>,
 ) -> Vec<u8> {
     let mut body = serde_json::json!({
@@ -7556,6 +7609,9 @@ fn build_middleware_platform_response(
     });
     if let (Some(request_id), serde_json::Value::Object(fields)) = (request_id, &mut body) {
         fields.insert("request_id".to_string(), serde_json::json!(request_id));
+    }
+    if let Some(failure) = failure {
+        crate::l7::rest::insert_middleware_failure(&mut body, failure);
     }
     let body_str = body.to_string();
     let request_id_header = request_id.map_or_else(String::new, |request_id| {
@@ -10686,7 +10742,7 @@ network_policies:
     }
 
     #[tokio::test]
-    async fn plaintext_websocket_middleware_inspects_compressed_ws_messages() {
+    async fn plaintext_websocket_inspects_messages_without_invoking_connection_hook() {
         if !cfg!(target_os = "linux") {
             eprintln!("skipping: handler identity binding requires /proc (Linux)");
             return;
@@ -10994,7 +11050,7 @@ network_policies:
 
     #[test]
     fn middleware_failure_response_uses_platform_text_without_policy_guidance() {
-        let response = build_middleware_failure_response("api-policy", None);
+        let response = build_middleware_failure_response("api-policy", None, None);
         let response = String::from_utf8(response).expect("UTF-8 error response");
         let (_, body) = response.split_once("\r\n\r\n").expect("HTTP response");
         let body: serde_json::Value = serde_json::from_str(body).expect("JSON response");
@@ -11028,6 +11084,7 @@ network_policies:
         let body: serde_json::Value = serde_json::from_str(body).expect("JSON response");
         assert_eq!(body["error"], "middleware_failed");
         assert_eq!(body["policy"], "api-policy");
+        assert_eq!(body["failure_code"], "middleware_unavailable");
         assert!(body.get("middleware").is_none());
         assert!(body.get("reason_code").is_none());
     }
@@ -11779,7 +11836,7 @@ network_policies:
             .expect("forward middleware pipeline");
 
         match outcome {
-            crate::l7::middleware::MiddlewareApplyResult::Denied { denial } => {
+            crate::l7::middleware::MiddlewareApplyResult::Denied { denial, .. } => {
                 assert!(denial.is_none());
             }
             crate::l7::middleware::MiddlewareApplyResult::Allowed(_) => {
@@ -11787,6 +11844,10 @@ network_policies:
             }
             crate::l7::middleware::MiddlewareApplyResult::AdmissionExhausted => {
                 panic!("test middleware work admission must be available")
+            }
+            crate::l7::middleware::MiddlewareApplyResult::Streamed { .. }
+            | crate::l7::middleware::MiddlewareApplyResult::RequestTimeout => {
+                panic!("legacy middleware collects the request body")
             }
         }
     }
@@ -11885,6 +11946,10 @@ network_policies:
             }
             crate::l7::middleware::MiddlewareApplyResult::AdmissionExhausted => {
                 panic!("blocking middleware should already hold admission")
+            }
+            crate::l7::middleware::MiddlewareApplyResult::Streamed { .. }
+            | crate::l7::middleware::MiddlewareApplyResult::RequestTimeout => {
+                panic!("legacy middleware collects the request body")
             }
         };
 
