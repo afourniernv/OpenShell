@@ -24,9 +24,9 @@ use openshell_ocsf::{
     ActionId, ActivityId, DispositionId, Endpoint, HttpActivityBuilder, HttpRequest, SeverityId,
     StatusId, ctx::ctx as ocsf_ctx,
 };
-use tracing::warn;
+use tracing::{Instrument as _, warn};
 
-use crate::l7::correlation::RequestCorrelation;
+use crate::l7::correlation::{RequestCorrelation, RequestStage};
 use crate::l7::provider::L7Request;
 use crate::l7::relay::L7EvalContext;
 
@@ -326,9 +326,16 @@ async fn inject_or_report(
     } else {
         Vec::new()
     };
+    let span = correlation.map_or_else(tracing::Span::none, |correlation| {
+        correlation.stage(RequestStage::CredentialPrepare)
+    });
     let result = match selected {
-        Ok(credentials) => inject_selected(req, ctx, credentials, request_id, correlation).await,
-        Err(error) => Err(error),
+        Ok(credentials) => {
+            inject_selected(req, ctx, credentials, request_id, correlation)
+                .instrument(span)
+                .await
+        }
+        Err(error) => span.in_scope(|| Err(error)),
     };
     if let Err(error) = &result {
         report_refused_grant(ctx, &method, &request_path, request_id, error, correlation);

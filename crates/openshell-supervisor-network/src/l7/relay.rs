@@ -7,7 +7,7 @@
 //! Parses each request within the tunnel, evaluates it against OPA policy,
 //! and either forwards or denies the request.
 
-use crate::l7::correlation::RequestCorrelation;
+use crate::l7::correlation::{RequestCorrelation, RequestStage};
 use crate::l7::middleware::{
     MiddlewareApplyResult, UninspectableTrafficGate,
     apply_middleware_chain_with_request_id_correlated, emit_middleware_uninspectable,
@@ -36,10 +36,10 @@ use std::collections::BTreeMap;
 use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
-use tracing::{debug, warn};
+use tracing::{Instrument as _, debug, warn};
 
 #[cfg(test)]
-mod correlation_dispatch_tests;
+pub(crate) mod correlation_dispatch_tests;
 #[cfg(test)]
 mod token_grant_ownership_tests;
 
@@ -1704,7 +1704,9 @@ where
         let (allowed, reason) = if let Some(reason) = hard_deny_reason {
             (false, reason)
         } else {
-            evaluate_l7_request(&engine, ctx, &request_info)?
+            correlation
+                .stage(RequestStage::PolicyEvaluate)
+                .in_scope(|| evaluate_l7_request(&engine, ctx, &request_info))?
         };
 
         if close_if_stale(engine.generation_guard(), ctx) {
@@ -1821,6 +1823,11 @@ where
                 }
             };
             let mut middleware_session = if let Some(chain) = websocket_chain.as_deref() {
+                let preflight_span = if chain.is_empty() {
+                    tracing::Span::none()
+                } else {
+                    correlation.stage(RequestStage::WebsocketPreflight)
+                };
                 let preflight = websocket_middleware_preflight(
                     &req,
                     chain,
@@ -1828,6 +1835,7 @@ where
                     ctx,
                     ctx.websocket_scheme(),
                 )
+                .instrument(preflight_span)
                 .await;
                 let preflight = match preflight {
                     Ok(preflight) => preflight,
@@ -1842,7 +1850,11 @@ where
                         return Ok(());
                     }
                 };
-                crate::l7::middleware::emit_websocket_preflight_events(ctx, &preflight);
+                crate::l7::middleware::emit_websocket_preflight_events_correlated(
+                    ctx,
+                    &preflight,
+                    Some(&correlation),
+                );
                 if preflight.terminal_reason.is_some() {
                     {
                         correlation.record_enforcement_action("block");
@@ -1962,6 +1974,7 @@ where
                     options.websocket.permessage_deflate = websocket_permessage_deflate;
                     options.middleware_session = middleware_session.take();
                     options.selected_subprotocol = websocket_subprotocol;
+                    correlation.finish_http_trace();
                     return handle_upgrade(
                         client, upstream, overflow, &ctx.host, ctx.port, options,
                     )
@@ -2508,7 +2521,9 @@ where
         }
 
         // Evaluate L7 policy via Rego (using redacted target)
-        let (allowed, reason) = evaluate_l7_request(engine, ctx, &request_info)?;
+        let (allowed, reason) = correlation
+            .stage(RequestStage::PolicyEvaluate)
+            .in_scope(|| evaluate_l7_request(engine, ctx, &request_info))?;
 
         if close_if_stale(engine.generation_guard(), ctx) {
             return Ok(());
@@ -2647,6 +2662,11 @@ where
                 }
             };
             let mut middleware_session = if let Some(chain) = websocket_chain.as_deref() {
+                let preflight_span = if chain.is_empty() {
+                    tracing::Span::none()
+                } else {
+                    correlation.stage(RequestStage::WebsocketPreflight)
+                };
                 let preflight = websocket_middleware_preflight(
                     &req,
                     chain,
@@ -2654,6 +2674,7 @@ where
                     ctx,
                     ctx.websocket_scheme(),
                 )
+                .instrument(preflight_span)
                 .await;
                 let preflight = match preflight {
                     Ok(preflight) => preflight,
@@ -2666,7 +2687,11 @@ where
                         return Ok(());
                     }
                 };
-                crate::l7::middleware::emit_websocket_preflight_events(ctx, &preflight);
+                crate::l7::middleware::emit_websocket_preflight_events_correlated(
+                    ctx,
+                    &preflight,
+                    Some(&correlation),
+                );
                 if preflight.terminal_reason.is_some() {
                     correlation.record_enforcement_action("block");
                     correlation.record_response_status(403);
@@ -2774,6 +2799,7 @@ where
                     options.websocket.permessage_deflate = websocket_permessage_deflate;
                     options.middleware_session = middleware_session.take();
                     options.selected_subprotocol = websocket_subprotocol;
+                    correlation.finish_http_trace();
                     return handle_upgrade(
                         client, upstream, overflow, &ctx.host, ctx.port, options,
                     )
@@ -3002,8 +3028,11 @@ where
         let (allowed, reason, jsonrpc_log_info) = if let Some(reason) = hard_deny_reason {
             (false, reason, jsonrpc_info.clone())
         } else {
-            let evaluation =
-                evaluate_jsonrpc_l7_request_for_log(engine, ctx, &request_info, &jsonrpc_info)?;
+            let evaluation = correlation
+                .stage(RequestStage::PolicyEvaluate)
+                .in_scope(|| {
+                    evaluate_jsonrpc_l7_request_for_log(engine, ctx, &request_info, &jsonrpc_info)
+                })?;
             (evaluation.allowed, evaluation.reason, evaluation.log_info)
         };
 
@@ -3328,7 +3357,9 @@ where
         let (allowed, reason) = if let Some(reason) = hard_deny_reason {
             (false, reason)
         } else {
-            evaluate_l7_request(engine, ctx, &request_info)?
+            correlation
+                .stage(RequestStage::PolicyEvaluate)
+                .in_scope(|| evaluate_l7_request(engine, ctx, &request_info))?
         };
 
         if close_if_stale(engine.generation_guard(), ctx) {
@@ -3820,7 +3851,11 @@ fn reevaluate_transformed_body(
         return Ok(Some(reason));
     }
 
-    let (allowed, reason) = evaluate_l7_request(engine, ctx, &transformed_info)?;
+    let (allowed, reason) = correlation
+        .map_or_else(tracing::Span::none, |correlation| {
+            correlation.stage(RequestStage::PolicyEvaluate)
+        })
+        .in_scope(|| evaluate_l7_request(engine, ctx, &transformed_info))?;
     if allowed {
         return Ok(None);
     }
@@ -4295,6 +4330,7 @@ where
             RelayOutcome::Reusable => {} // continue loop
             RelayOutcome::Consumed => break,
             RelayOutcome::Upgraded { overflow, .. } => {
+                correlation.finish_http_trace();
                 return handle_upgrade(
                     client,
                     upstream,

@@ -4,7 +4,7 @@
 //! HTTP response relay and pre-return middleware integration.
 
 use super::*;
-use crate::l7::correlation::RequestCorrelation;
+use crate::l7::correlation::{RequestCorrelation, RequestStage};
 
 /// Default wall-clock bound shared by whole-body stages in one response.
 pub const DEFAULT_HTTP_RESPONSE_WHOLE_BODY_TIMEOUT: std::time::Duration =
@@ -575,6 +575,50 @@ where
         }
         Err(error) => Err(error),
     };
+    let span = response_correlation.map_or_else(tracing::Span::none, |correlation| {
+        correlation.stage(RequestStage::ResponseMiddleware)
+    });
+    relay_described_response_through_middleware(
+        request_method,
+        upstream,
+        client,
+        middleware,
+        buffered,
+        header_end,
+        status_code,
+        body_length,
+        server_wants_close,
+        event_stream,
+        response_correlation,
+        parsed,
+    )
+    .instrument(span)
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn relay_described_response_through_middleware<U, C>(
+    request_method: &str,
+    upstream: &mut U,
+    client: &mut C,
+    middleware: HttpResponseMiddlewareRelay<'_>,
+    buffered: &[u8],
+    header_end: usize,
+    status_code: u16,
+    body_length: BodyLength,
+    server_wants_close: bool,
+    event_stream: bool,
+    response_correlation: Option<&RequestCorrelation>,
+    parsed: Result<(
+        Vec<openshell_supervisor_middleware::DescribedChainEntry>,
+        ParsedResponseHead,
+    )>,
+) -> Result<Option<RelayOutcome>>
+where
+    U: AsyncRead + Unpin,
+    C: AsyncWrite + Unpin,
+{
+    let header_bytes = &buffered[..header_end];
     if let Some(guard) = middleware.generation_guard {
         guard.ensure_current()?;
     }
@@ -3017,6 +3061,12 @@ mod tests {
     async fn response_middleware_denial_has_one_correlated_primary_without_tracing() {
         let capture = openshell_ocsf::test_support::OcsfCapture::default();
         let _subscriber = capture.install();
+        exercise_response_middleware_block().await;
+
+        assert_response_middleware_block_record(&capture.json_events(), false);
+    }
+
+    async fn exercise_response_middleware_block() {
         let correlation = test_correlation_for_method("response-denied", "POST");
         correlation.emit(
             openshell_ocsf::HttpActivityBuilder::new(openshell_ocsf::ctx::ctx())
@@ -3081,8 +3131,9 @@ mod tests {
                 .contains("x-openshell-request-id: response-denied\r\n")
         );
         drop(correlation);
+    }
 
-        let records = capture.json_events();
+    fn assert_response_middleware_block_record(records: &[serde_json::Value], traced: bool) {
         let primary: Vec<_> = records
             .iter()
             .filter(|event| event["class_uid"] == 4002)
@@ -3094,7 +3145,32 @@ mod tests {
         assert_eq!(primary[0]["http_request"]["url"]["path"], "/mutate");
         assert_eq!(primary[0]["firewall_rule"]["type"], "l7-rest");
         assert_eq!(primary[0]["metadata"]["correlation_uid"], "response-denied");
-        assert!(primary[0].get("trace").is_none());
+        assert_eq!(primary[0].get("trace").is_some(), traced);
+    }
+
+    #[tokio::test]
+    async fn response_middleware_block_never_creates_a_denial_only_span() {
+        use crate::l7::relay::correlation_dispatch_tests::capture_request_spans;
+
+        for sampled in [true, false] {
+            let evidence = Box::pin(capture_request_spans(
+                sampled,
+                exercise_response_middleware_block(),
+            ))
+            .await;
+            evidence.assert_no_deny_span(sampled);
+            assert_response_middleware_block_record(&evidence.events, sampled);
+            if sampled {
+                assert_eq!(
+                    evidence
+                        .spans
+                        .iter()
+                        .filter(|span| span.name == "openshell.middleware.response")
+                        .count(),
+                    1
+                );
+            }
+        }
     }
 
     #[tokio::test]

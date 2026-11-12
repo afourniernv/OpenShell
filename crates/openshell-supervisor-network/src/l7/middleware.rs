@@ -13,6 +13,9 @@ use openshell_ocsf::{
 };
 use std::path::PathBuf;
 use tokio::io::{AsyncRead, AsyncWrite};
+use tracing::Instrument as _;
+
+use super::correlation::RequestStage;
 
 pub enum MiddlewareApplyResult {
     Allowed(crate::l7::provider::L7Request),
@@ -176,20 +179,30 @@ pub fn emit_middleware_uninspectable(ctx: &L7EvalContext, detail: &str, denied: 
     egress_emit!(event.build());
 }
 
+#[cfg(test)]
 pub fn emit_websocket_preflight_events(
     ctx: &L7EvalContext,
     outcome: &openshell_supervisor_middleware::WebSocketPreflightResult,
 ) {
-    emit_websocket_invocations(ctx, &outcome.invocations);
-    emit_websocket_coverage(ctx, &outcome.coverage);
-    for event in websocket_preflight_finding_events(outcome) {
-        egress_emit!(event);
-    }
+    emit_websocket_preflight_events_correlated(ctx, outcome, None);
+}
+
+pub fn emit_websocket_preflight_events_correlated(
+    ctx: &L7EvalContext,
+    outcome: &openshell_supervisor_middleware::WebSocketPreflightResult,
+    correlation: Option<&super::correlation::RequestCorrelation>,
+) {
+    emit_websocket_invocations_correlated(ctx, &outcome.invocations, correlation);
+    emit_request_events(
+        correlation,
+        websocket_coverage_events(ctx, &outcome.coverage),
+    );
+    emit_request_events(correlation, websocket_preflight_finding_events(outcome));
     if outcome.saturated {
-        emit_websocket_saturation(ctx);
+        emit_websocket_saturation_correlated(ctx, correlation);
     }
     if outcome.session_capacity_exhausted {
-        emit_middleware_session_capacity_exhausted(ctx, !outcome.allowed);
+        emit_middleware_session_capacity_exhausted(ctx, !outcome.allowed, correlation);
     }
 }
 
@@ -320,6 +333,14 @@ fn emit_websocket_invocations(
     ctx: &L7EvalContext,
     invocations: &[openshell_supervisor_middleware::WebSocketInvocation],
 ) {
+    emit_websocket_invocations_correlated(ctx, invocations, None);
+}
+
+fn emit_websocket_invocations_correlated(
+    ctx: &L7EvalContext,
+    invocations: &[openshell_supervisor_middleware::WebSocketInvocation],
+    correlation: Option<&super::correlation::RequestCorrelation>,
+) {
     for invocation in invocations {
         use openshell_supervisor_middleware::WebSocketInvocationOutcome as Outcome;
         let (action, disposition, severity, status, outcome_name) = match invocation.outcome {
@@ -390,7 +411,7 @@ fn emit_websocket_invocations(
                 invocation.transformed,
             ))
             .build();
-        egress_emit!(event);
+        emit_request_events(correlation, [event]);
         if invocation.failed {
             let fail_closed = invocation.outcome == Outcome::FailClosed;
             let mut finding = DetectionFindingBuilder::new(openshell_ocsf::ctx::ctx());
@@ -416,7 +437,7 @@ fn emit_websocket_invocations(
                 ])
                 .message("WebSocket middleware stage failed")
                 .build();
-            egress_emit!(event);
+            emit_request_events(correlation, [event]);
         }
         if invocation.stage_disabled {
             let event = DetectionFindingBuilder::new(openshell_ocsf::ctx::ctx())
@@ -436,12 +457,19 @@ fn emit_websocket_invocations(
                     "WebSocket middleware stage stream became unusable and was disabled for this session",
                 )
                 .build();
-            egress_emit!(event);
+            emit_request_events(correlation, [event]);
         }
     }
 }
 
 fn emit_websocket_saturation(ctx: &L7EvalContext) {
+    emit_websocket_saturation_correlated(ctx, None);
+}
+
+fn emit_websocket_saturation_correlated(
+    ctx: &L7EvalContext,
+    correlation: Option<&super::correlation::RequestCorrelation>,
+) {
     let event = DetectionFindingBuilder::new(openshell_ocsf::ctx::ctx())
         .severity(SeverityId::Medium)
         .finding_info(FindingInfo::new(
@@ -455,10 +483,14 @@ fn emit_websocket_saturation(ctx: &L7EvalContext) {
         ])
         .message("WebSocket middleware work waited for admission capacity")
         .build();
-    egress_emit!(event);
+    emit_request_events(correlation, [event]);
 }
 
-fn emit_middleware_session_capacity_exhausted(ctx: &L7EvalContext, denied: bool) {
+fn emit_middleware_session_capacity_exhausted(
+    ctx: &L7EvalContext,
+    denied: bool,
+    correlation: Option<&super::correlation::RequestCorrelation>,
+) {
     let mut event = DetectionFindingBuilder::new(openshell_ocsf::ctx::ctx())
         .severity(SeverityId::Medium)
         .finding_info(FindingInfo::new(
@@ -474,7 +506,7 @@ fn emit_middleware_session_capacity_exhausted(ctx: &L7EvalContext, denied: bool)
     if denied {
         event = event.action(ActionId::Denied);
     }
-    egress_emit!(event.build());
+    emit_request_events(correlation, [event.build()]);
 }
 
 fn middleware_admission_exhausted_event(ctx: &L7EvalContext) -> openshell_ocsf::OcsfEvent {
@@ -618,10 +650,20 @@ pub async fn apply_middleware_chain_for_scheme_with_request_id_correlated<
         return Ok(MiddlewareApplyResult::Allowed(req));
     }
     let chain = runner.describe_chain(&chain).await?;
+    let span = if chain.is_empty() {
+        tracing::Span::none()
+    } else {
+        correlation.map_or_else(tracing::Span::none, |correlation| {
+            correlation.stage(RequestStage::RequestMiddleware)
+        })
+    };
     let admission = if chain.is_empty() {
         None
     } else {
-        let outcome = runner.reserve_middleware_work().await?;
+        let outcome = runner
+            .reserve_middleware_work()
+            .instrument(span.clone())
+            .await?;
         match outcome {
             openshell_supervisor_middleware::MiddlewareWorkAdmissionOutcome::Admitted(
                 admission,
@@ -655,6 +697,7 @@ pub async fn apply_middleware_chain_for_scheme_with_request_id_correlated<
                 openshell_supervisor_middleware::TransformedBodyPolicy::NotPolicyRelevant,
                 admission,
             )
+            .instrument(span.clone())
             .await?;
         emit_request_events(correlation, middleware_events(ctx, &req, &outcome));
         return Ok(if outcome.allowed {
@@ -675,6 +718,7 @@ pub async fn apply_middleware_chain_for_scheme_with_request_id_correlated<
         Some(generation_guard),
         max_body_bytes,
     )
+    .instrument(span.clone())
     .await?
     {
         crate::l7::rest::BufferResult::Buffered(buffered) => buffered,
@@ -711,6 +755,7 @@ pub async fn apply_middleware_chain_for_scheme_with_request_id_correlated<
             transformed_body_policy,
             Some(admission),
         )
+        .instrument(span)
         .await?;
     emit_request_events(correlation, middleware_events(ctx, &req, &outcome));
     if !outcome.allowed {
