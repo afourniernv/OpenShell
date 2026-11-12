@@ -67,10 +67,12 @@ outcomes. Routine outcomes do not add records; existing security findings and
 post-header failure records remain distinct. A process crash or indefinitely
 hung request cannot be finalized by the fallback.
 
-Request IDs do not depend on OpenTelemetry or collector availability. This layer
-adds no request spans or workload-controlled supervisor trace context and keeps
-the existing bounded deny-span path. Request-stage tracing is a separate layer
-that requires operator-controlled supervisor sampling.
+Request IDs and audit outcomes do not depend on OpenTelemetry, sampling or
+collector availability. Inspected requests have a supervisor-owned request span
+and children around stages that actually run, with valid workload W3C context
+only as an untrusted link. Their records never create an extra denial-only span,
+even if the request span is disabled or unsampled. Other egress paths retain the
+legacy bounded deny-span behavior. End HTTP tracing before an upgraded session.
 
 Inspected request records retain the policy generation/hash, selected endpoint
 identity and pinned provider installation/revision under OCSF `unmapped`.

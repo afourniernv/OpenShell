@@ -63,6 +63,135 @@ fn http_events(capture: &openshell_ocsf::test_support::OcsfCapture) -> Vec<serde
 }
 
 #[test]
+fn audit_receipt_and_denial_are_independent_of_sampling_or_exporter() {
+    use opentelemetry::trace::TracerProvider as _;
+    use opentelemetry_sdk::trace::{InMemorySpanExporter, Sampler, SdkTracerProvider};
+    use tracing_subscriber::layer::SubscriberExt as _;
+
+    crate::telemetry::tests::init_trace_extractor();
+    for sampler in [Some(Sampler::AlwaysOn), Some(Sampler::AlwaysOff), None] {
+        let sampled = matches!(sampler, Some(Sampler::AlwaysOn));
+        let exporter = InMemorySpanExporter::default();
+        let provider = sampler.map(|sampler| {
+            SdkTracerProvider::builder()
+                .with_sampler(sampler)
+                .with_simple_exporter(exporter.clone())
+                .build()
+        });
+        let layer = provider.as_ref().map(|provider| {
+            tracing_opentelemetry::layer().with_tracer(provider.tracer("request-audit-test"))
+        });
+        let capture = openshell_ocsf::test_support::OcsfCapture::default();
+        let subscriber = tracing_subscriber::registry()
+            .with(capture.clone())
+            .with(layer);
+        tracing::subscriber::with_default(subscriber, || {
+            let correlation = RequestCorrelation::with_request_id(
+                &request(),
+                &context(),
+                "00000000-0000-4000-8000-000000000001".into(),
+            );
+            correlation.emit(allowed());
+            correlation.emit(denied());
+            correlation.record_final_http_outcome("denied");
+            correlation.response_selected(403);
+        });
+        let events = http_events(&capture);
+        assert_eq!(events.len(), 1);
+        let event = &events[0];
+        assert_eq!(
+            event["metadata"]["correlation_uid"],
+            "00000000-0000-4000-8000-000000000001"
+        );
+        assert_eq!(event["action"], "Denied");
+        assert_eq!(event["status"], "Failure");
+        assert_eq!(event["http_response"]["code"], 403);
+        assert_eq!(event["http_request"]["url"]["path"], "/data");
+        assert_eq!(event["trace"]["uid"].is_string(), sampled);
+        if let Some(provider) = provider {
+            provider.force_flush().unwrap();
+            let spans = exporter.get_finished_spans().unwrap();
+            assert_eq!(spans.len(), usize::from(sampled));
+            if sampled {
+                assert_eq!(spans[0].name, "openshell.http.request");
+                assert_eq!(
+                    event["trace"]["uid"],
+                    spans[0].span_context.trace_id().to_string()
+                );
+            }
+            provider.shutdown().unwrap();
+        }
+    }
+}
+
+#[test]
+fn finished_http_trace_is_not_retained_by_an_upgraded_session() {
+    use opentelemetry::trace::TracerProvider as _;
+    use opentelemetry_sdk::trace::{InMemorySpanExporter, SdkTracerProvider};
+    use tracing_subscriber::layer::SubscriberExt as _;
+
+    let exporter = InMemorySpanExporter::default();
+    let provider = SdkTracerProvider::builder()
+        .with_simple_exporter(exporter.clone())
+        .build();
+    let subscriber = tracing_subscriber::registry()
+        .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("request-upgrade-test")));
+    tracing::subscriber::with_default(subscriber, || {
+        let correlation = RequestCorrelation::new(&request(), &context());
+        correlation.emit(allowed());
+        correlation.response_selected(101);
+        correlation.finish_http_trace();
+        assert_eq!(exporter.get_finished_spans().unwrap().len(), 1);
+        assert!(correlation.trace_span().is_disabled());
+        assert!(
+            correlation
+                .stage(RequestStage::UpstreamExchange)
+                .is_disabled()
+        );
+        correlation.finish_http_trace();
+        drop(correlation);
+        assert_eq!(exporter.get_finished_spans().unwrap().len(), 1);
+    });
+    provider.shutdown().unwrap();
+}
+
+#[test]
+fn a_provider_without_an_exporter_still_emits_the_request_id_join() {
+    use opentelemetry::trace::TracerProvider as _;
+    use opentelemetry_sdk::trace::{Sampler, SdkTracerProvider};
+    use tracing_subscriber::layer::SubscriberExt as _;
+
+    crate::telemetry::tests::init_trace_extractor();
+    let provider = SdkTracerProvider::builder()
+        .with_sampler(Sampler::AlwaysOn)
+        .build();
+    let capture = openshell_ocsf::test_support::OcsfCapture::default();
+    let subscriber = tracing_subscriber::registry()
+        .with(capture.clone())
+        .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("no-exporter-test")));
+    let mut id = None;
+    tracing::subscriber::with_default(subscriber, || {
+        let correlation = RequestCorrelation::new(&request(), &context());
+        id = Some(correlation.request_id().to_owned());
+        assert_eq!(
+            correlation
+                .stage(RequestStage::PolicyEvaluate)
+                .in_scope(|| 42),
+            42
+        );
+        correlation.emit(allowed());
+        correlation.record_final_http_outcome("allowed");
+        correlation.response_selected(200);
+    });
+    let events = http_events(&capture);
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0]["metadata"]["correlation_uid"], id.unwrap());
+    assert_eq!(events[0]["http_response"]["code"], 200);
+    assert_eq!(events[0]["action"], "Allowed");
+    provider.shutdown().unwrap();
+}
+
+#[test]
 fn request_ids_are_unique_canonical_uuids() {
     let capture = openshell_ocsf::test_support::OcsfCapture::default();
     let _subscriber = capture.install();

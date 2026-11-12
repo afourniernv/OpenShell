@@ -21,7 +21,7 @@ use http_response::{
 };
 
 use crate::l7::EndpointObserver;
-use crate::l7::correlation::RequestCorrelation;
+use crate::l7::correlation::{RequestCorrelation, RequestStage};
 use crate::l7::http::{parse_chunk_size_line, validate_chunk_trailer_line};
 use crate::l7::provider::{BodyLength, L7Provider, L7Request, RelayOutcome};
 use crate::opa::PolicyGenerationGuard;
@@ -42,7 +42,7 @@ use sha1::{Digest, Sha1};
 use std::collections::{HashMap, HashSet};
 use std::fmt::{self, Write as _};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tracing::debug;
+use tracing::{Instrument as _, debug};
 
 const MAX_HEADER_BYTES: usize = 16384; // 16 KiB for HTTP headers
 const MAX_REWRITE_BODY_BYTES: usize = 256 * 1024;
@@ -967,7 +967,12 @@ where
     C: AsyncRead + AsyncWrite + Unpin,
     U: AsyncRead + AsyncWrite + Unpin,
 {
-    let mut observed_upstream = ObservedUpstream { upstream, observer };
+    let mut observed_upstream = ObservedUpstream {
+        upstream,
+        observer,
+        correlation,
+        request_span: None,
+    };
     let upstream = &mut observed_upstream;
     ensure_credential_generation_current(options)?;
     let header_end = req
@@ -1011,8 +1016,18 @@ where
                 offered_subprotocols: request.subprotocols.clone(),
             });
 
-    let rewrite_result =
-        rewrite_http_header_block(&header_bytes, options.resolver).map_err(miette::Report::new)?;
+    let rewrite_span =
+        if options.resolver.is_some() || contains_reserved_credential_marker_bytes(&header_bytes) {
+            correlation.map_or_else(tracing::Span::none, |correlation| {
+                correlation.stage(RequestStage::CredentialPrepare)
+            })
+        } else {
+            tracing::Span::none()
+        };
+    let rewrite_result = rewrite_span
+        .in_scope(|| rewrite_http_header_block(&header_bytes, options.resolver))
+        .map_err(miette::Report::new)?;
+    drop(rewrite_span);
 
     if let Some(validation) = options.mcp_request_validation {
         // Header credential resolution and hop-by-hop cleanup must finish
@@ -1167,15 +1182,22 @@ where
                             guard.ensure_current()?;
                         }
 
-                        let signed = crate::sigv4::apply_sigv4_to_request(
-                            &full_request,
-                            options.host,
-                            &region,
-                            service,
-                            access_key,
-                            secret_key,
-                            session_token,
-                        )?;
+                        let signing_span = correlation
+                            .map_or_else(tracing::Span::none, |correlation| {
+                                correlation.stage(RequestStage::CredentialPrepare)
+                            });
+                        let signed = signing_span.in_scope(|| {
+                            crate::sigv4::apply_sigv4_to_request(
+                                &full_request,
+                                options.host,
+                                &region,
+                                service,
+                                access_key,
+                                secret_key,
+                                session_token,
+                            )
+                        })?;
+                        drop(signing_span);
                         ensure_credential_generation_current(options)?;
                         upstream.write_all(&signed).await.into_diagnostic()?;
                     } else {
@@ -1186,16 +1208,23 @@ where
                             }
                             _ => SignableBody::UnsignedPayload,
                         };
-                        let signed_headers = crate::sigv4::apply_sigv4_headers_only_with_body(
-                            &rewrite_result.rewritten,
-                            options.host,
-                            &region,
-                            service,
-                            access_key,
-                            secret_key,
-                            session_token,
-                            signable_body,
-                        )?;
+                        let signing_span = correlation
+                            .map_or_else(tracing::Span::none, |correlation| {
+                                correlation.stage(RequestStage::CredentialPrepare)
+                            });
+                        let signed_headers = signing_span.in_scope(|| {
+                            crate::sigv4::apply_sigv4_headers_only_with_body(
+                                &rewrite_result.rewritten,
+                                options.host,
+                                &region,
+                                service,
+                                access_key,
+                                secret_key,
+                                session_token,
+                                signable_body,
+                            )
+                        })?;
+                        drop(signing_span);
                         ensure_credential_generation_current(options)?;
                         upstream
                             .write_all(&signed_headers)
@@ -1340,7 +1369,11 @@ where
         }
     }
     upstream.flush().await.into_diagnostic()?;
+    upstream.request_span.take();
 
+    let response_span = correlation.map_or_else(tracing::Span::none, |correlation| {
+        correlation.stage(RequestStage::Response)
+    });
     let outcome = relay_response(
         &req.action,
         upstream,
@@ -1354,6 +1387,7 @@ where
         },
         response_middleware,
     )
+    .instrument(response_span)
     .await?;
 
     Ok(outcome)
@@ -1378,6 +1412,8 @@ fn ensure_body_generation_current(options: RelayRequestOptions<'_>) -> Result<()
 struct ObservedUpstream<'a, U> {
     upstream: &'a mut U,
     observer: Option<&'a EndpointObserver>,
+    correlation: Option<&'a RequestCorrelation>,
+    request_span: Option<tracing::Span>,
 }
 
 impl<U: AsyncRead + Unpin> AsyncRead for ObservedUpstream<'_, U> {
@@ -1404,7 +1440,13 @@ impl<U: AsyncWrite + Unpin> AsyncWrite for ObservedUpstream<'_, U> {
         buf: &[u8],
     ) -> std::task::Poll<std::io::Result<usize>> {
         let this = self.get_mut();
-        let result = std::pin::Pin::new(&mut *this.upstream).poll_write(cx, buf);
+        let span = this.request_span.get_or_insert_with(|| {
+            this.correlation
+                .map_or_else(tracing::Span::none, |correlation| {
+                    correlation.stage(RequestStage::UpstreamExchange)
+                })
+        });
+        let result = span.in_scope(|| std::pin::Pin::new(&mut *this.upstream).poll_write(cx, buf));
         if matches!(result, std::task::Poll::Ready(Err(_)))
             && let Some(observer) = this.observer
         {
@@ -1418,7 +1460,11 @@ impl<U: AsyncWrite + Unpin> AsyncWrite for ObservedUpstream<'_, U> {
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
         let this = self.get_mut();
-        let result = std::pin::Pin::new(&mut *this.upstream).poll_flush(cx);
+        let result = if let Some(span) = &this.request_span {
+            span.in_scope(|| std::pin::Pin::new(&mut *this.upstream).poll_flush(cx))
+        } else {
+            std::pin::Pin::new(&mut *this.upstream).poll_flush(cx)
+        };
         if matches!(result, std::task::Poll::Ready(Err(_)))
             && let Some(observer) = this.observer
         {
@@ -6874,6 +6920,8 @@ mod tests {
             let mut upstream = ObservedUpstream {
                 upstream: &mut response,
                 observer: Some(&observer),
+                correlation: None,
+                request_span: None,
             };
             let mut client = Vec::new();
             relay_response(

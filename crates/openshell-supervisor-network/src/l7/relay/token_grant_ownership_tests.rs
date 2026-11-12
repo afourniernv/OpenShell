@@ -1008,6 +1008,58 @@ async fn failure_then_reconnect(route_selection: bool) {
 }
 
 #[tokio::test]
+async fn token_grant_refusal_never_creates_a_denial_only_span() {
+    use super::correlation_dispatch_tests::capture_request_spans;
+
+    for sampled in [true, false] {
+        let evidence = capture_request_spans(sampled, async {
+            let fixture = Fixture::new(&[route("a", "/a/**")], &[("/a/**", "a", "aud-a")], 1);
+            fixture.resolver.fail_once.store(true, Ordering::SeqCst);
+            let mut connection = fixture.connect();
+            let response = connection.exchange("GET", "/a/item", true).await;
+            assert!(connection.observes_eof().await);
+            let capture = connection.finish().await;
+            assert_eq!(capture.bytes_seen, 0);
+            response
+        })
+        .await;
+        evidence.assert_no_deny_span(sampled);
+        assert!(evidence.output.starts_with("HTTP/1.1 502"));
+        if sampled {
+            assert_eq!(
+                evidence
+                    .spans
+                    .iter()
+                    .filter(|span| span.name == "openshell.credential.prepare")
+                    .count(),
+                1
+            );
+            assert!(
+                evidence
+                    .spans
+                    .iter()
+                    .all(|span| span.name != "openshell.upstream.exchange")
+            );
+        }
+        let records: Vec<_> = evidence
+            .events
+            .iter()
+            .filter(|event| event["class_uid"] == 4002)
+            .collect();
+        assert_eq!(records.len(), 1, "{:?}", evidence.events);
+        assert_eq!(records[0]["action"], "Denied");
+        assert_eq!(records[0]["http_response"]["code"], 502);
+        let receipt = records[0]["metadata"]["correlation_uid"].as_str().unwrap();
+        assert!(
+            evidence
+                .output
+                .to_ascii_lowercase()
+                .contains(&format!("x-openshell-request-id: {receipt}\r\n"))
+        );
+    }
+}
+
+#[tokio::test]
 async fn single_endpoint_recovers_after_one_grant_failure() {
     failure_then_reconnect(false).await;
 }

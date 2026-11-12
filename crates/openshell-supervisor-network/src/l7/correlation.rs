@@ -17,6 +17,8 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 use crate::l7::provider::L7Request;
 use crate::l7::relay::L7EvalContext;
+pub use crate::l7::request_trace::RequestStage;
+use crate::l7::request_trace::RequestTrace;
 
 mod resources;
 use resources::RequestResources;
@@ -31,6 +33,7 @@ pub struct RequestCorrelation {
 
 #[derive(Debug, Default)]
 struct RequestState {
+    trace: Option<RequestTrace>,
     primary: Option<OcsfEvent>,
     seeded: bool,
     status: Option<u16>,
@@ -76,10 +79,18 @@ impl RequestCorrelation {
             .dst_endpoint(Endpoint::from_domain(&ctx.host, ctx.port))
             .message("HTTP request ended before a response was selected")
             .build();
+        let trace = RequestTrace::new(
+            &request_id,
+            &request.action,
+            &ctx.host,
+            ctx.port,
+            &request.raw_header,
+        );
         Self {
             request_id,
             inspected: true,
             state: Box::new(Mutex::new(RequestState {
+                trace: Some(trace),
                 primary: Some(fallback),
                 ..RequestState::default()
             })),
@@ -118,6 +129,41 @@ impl RequestCorrelation {
             .record_provider(snapshot);
     }
 
+    pub(crate) fn stage(&self, stage: RequestStage) -> tracing::Span {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .trace
+            .as_ref()
+            .map_or_else(tracing::Span::none, |trace| trace.stage(stage))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn trace_span(&self) -> tracing::Span {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .trace
+            .as_ref()
+            .map_or_else(tracing::Span::none, RequestTrace::span)
+    }
+
+    pub(crate) fn finish_http_trace(&self) {
+        let (mut trace, status) = {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            (state.trace.take(), state.status)
+        };
+        if status == Some(101)
+            && let Some(trace) = &mut trace
+        {
+            trace.record_outcome("upgraded");
+        }
+        drop(trace);
+    }
+
     pub(crate) fn observe_response<'a, C>(&'a self, client: &'a mut C) -> AuditedClient<'a, C> {
         AuditedClient {
             inner: client,
@@ -134,17 +180,25 @@ impl RequestCorrelation {
     }
 
     pub(crate) fn record_final_http_outcome(&self, outcome: &'static str) {
-        self.state
+        let mut state = self
+            .state
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .outcome = Some(outcome);
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.outcome = Some(outcome);
+        if let Some(trace) = &mut state.trace {
+            trace.record_outcome(outcome);
+        }
     }
 
     pub(crate) fn record_response_status(&self, status: u16) {
-        self.state
+        let mut state = self
+            .state
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .status = Some(status);
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.status = Some(status);
+        if let Some(trace) = &state.trace {
+            trace.record_status(status);
+        }
     }
 
     pub(crate) fn record_upstream_status(&self, status: u16) {
@@ -155,10 +209,14 @@ impl RequestCorrelation {
     }
 
     pub(crate) fn record_failure_reason(&self, reason: &'static str) {
-        self.state
+        let mut state = self
+            .state
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .failure_reason = Some(reason);
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.failure_reason = Some(reason);
+        if let Some(trace) = &state.trace {
+            trace.record_failure_reason(reason);
+        }
     }
 
     pub(crate) fn emit(&self, event: OcsfEvent) {
@@ -302,12 +360,20 @@ impl RequestCorrelation {
 
     fn emit_correlated(&self, mut event: OcsfEvent) {
         event.set_correlation_uid(self.request_id.clone());
-        self.state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .resources
-            .enrich(&mut event);
-        crate::telemetry::emit_decision([event], None);
+        let parent = {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.resources.enrich(&mut event);
+            state.trace.as_mut().map(|trace| {
+                if let OcsfEvent::HttpActivity(http) = &event {
+                    trace.observe_http(http);
+                }
+                trace.span()
+            })
+        };
+        crate::telemetry::emit_inspected_decision([event], parent.as_ref());
     }
 }
 
@@ -487,6 +553,7 @@ impl<C: AsyncWrite + Unpin> AsyncWrite for AuditedClient<'_, C> {
 impl Drop for RequestCorrelation {
     fn drop(&mut self) {
         self.emit_primary(true);
+        self.finish_http_trace();
     }
 }
 

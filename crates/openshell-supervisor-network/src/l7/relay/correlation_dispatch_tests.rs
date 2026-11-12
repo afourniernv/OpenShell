@@ -6,12 +6,117 @@
 use super::L7EvalContext;
 use crate::l7::L7EndpointConfig;
 use crate::opa::{NetworkInput, OpaEngine, TunnelPolicyEngine};
+use opentelemetry_sdk::trace::{InMemorySpanExporter, Sampler, SdkTracerProvider, SpanData};
+use std::future::Future;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tracing::instrument::WithSubscriber as _;
 use tracing_subscriber::layer::SubscriberExt as _;
 
 const POLICY: &str = include_str!("../../../data/sandbox-policy.rego");
+
+#[derive(Clone, Default)]
+struct CreatedSpans(Arc<Mutex<Vec<String>>>);
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CreatedSpans {
+    fn on_new_span(
+        &self,
+        attributes: &tracing::span::Attributes<'_>,
+        _id: &tracing::Id,
+        _context: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        self.0
+            .lock()
+            .unwrap()
+            .push(attributes.metadata().name().into());
+    }
+}
+
+pub struct TracedOperation<T> {
+    pub(crate) output: T,
+    pub(crate) events: Vec<serde_json::Value>,
+    pub(crate) spans: Vec<SpanData>,
+    created: Vec<String>,
+}
+
+impl<T> TracedOperation<T> {
+    pub(crate) fn assert_no_deny_span(&self, sampled: bool) {
+        assert!(
+            self.created
+                .iter()
+                .all(|name| name != "supervisor.egress.deny")
+        );
+        assert_eq!(
+            self.created
+                .iter()
+                .filter(|name| *name == "openshell.http.request")
+                .count(),
+            1
+        );
+        let roots: Vec<_> = self
+            .spans
+            .iter()
+            .filter(|span| span.name == "openshell.http.request")
+            .collect();
+        assert_eq!(roots.len(), usize::from(sampled));
+        if let Some(root) = roots.first() {
+            assert!(
+                self.spans
+                    .iter()
+                    .all(|span| span.name == "openshell.http.request"
+                        || (span.parent_span_id == root.span_context.span_id()
+                            && span.span_context.trace_id() == root.span_context.trace_id()))
+            );
+            for event in self
+                .events
+                .iter()
+                .filter(|event| event["class_uid"] == 4002)
+            {
+                assert_eq!(
+                    event["trace"]["uid"],
+                    root.span_context.trace_id().to_string()
+                );
+            }
+        } else {
+            assert!(self.spans.is_empty());
+            assert!(self.events.iter().all(|event| event.get("trace").is_none()));
+        }
+    }
+}
+
+pub async fn capture_request_spans<T>(
+    sampled: bool,
+    operation: impl Future<Output = T>,
+) -> TracedOperation<T> {
+    let _lock = openshell_otel_test_support::tracing_test_lock().await;
+    crate::telemetry::tests::init_trace_extractor();
+    let exporter = InMemorySpanExporter::default();
+    let provider = SdkTracerProvider::builder()
+        .with_sampler(if sampled {
+            Sampler::AlwaysOn
+        } else {
+            Sampler::AlwaysOff
+        })
+        .with_simple_exporter(exporter.clone())
+        .build();
+    let events = openshell_ocsf::test_support::OcsfCapture::default();
+    let created = CreatedSpans::default();
+    let subscriber = tracing_subscriber::registry()
+        .with(events.clone())
+        .with(created.clone())
+        .with(openshell_otel::layer(&provider, "request-dispatch-test"));
+    let output = Box::pin(operation.with_subscriber(subscriber)).await;
+    provider.force_flush().unwrap();
+    let spans = exporter.get_finished_spans().unwrap();
+    provider.shutdown().unwrap();
+    TracedOperation {
+        output,
+        events: events.json_events(),
+        spans,
+        created: created.0.lock().unwrap().clone(),
+    }
+}
 
 struct Fixture {
     config: L7EndpointConfig,
@@ -115,8 +220,25 @@ async fn run_allowed(
     request: Vec<u8>,
     upstream_response: &'static [u8],
 ) -> Exchange {
+    Box::pin(run_allowed_with_dispatch(
+        fixture,
+        request,
+        upstream_response,
+        None,
+    ))
+    .await
+}
+
+async fn run_allowed_with_dispatch(
+    fixture: Fixture,
+    request: Vec<u8>,
+    upstream_response: &'static [u8],
+    dispatch: Option<tracing::Dispatch>,
+) -> Exchange {
     let ocsf = openshell_ocsf::test_support::OcsfCapture::default();
-    let subscriber = tracing_subscriber::registry().with(ocsf.clone());
+    let subscriber = dispatch.unwrap_or_else(|| {
+        tracing::Dispatch::new(tracing_subscriber::registry().with(ocsf.clone()))
+    });
     let (mut app, mut relay_client) = tokio::io::duplex(32 * 1024);
     let (mut relay_upstream, mut upstream) = tokio::io::duplex(32 * 1024);
     let Fixture {
@@ -167,8 +289,18 @@ async fn run_allowed(
 }
 
 async fn run_denied(fixture: Fixture, request: Vec<u8>) -> Exchange {
+    Box::pin(run_denied_with_dispatch(fixture, request, None)).await
+}
+
+async fn run_denied_with_dispatch(
+    fixture: Fixture,
+    request: Vec<u8>,
+    dispatch: Option<tracing::Dispatch>,
+) -> Exchange {
     let ocsf = openshell_ocsf::test_support::OcsfCapture::default();
-    let subscriber = tracing_subscriber::registry().with(ocsf.clone());
+    let subscriber = dispatch.unwrap_or_else(|| {
+        tracing::Dispatch::new(tracing_subscriber::registry().with(ocsf.clone()))
+    });
     let (mut app, mut relay_client) = tokio::io::duplex(32 * 1024);
     let (mut relay_upstream, mut upstream) = tokio::io::duplex(32 * 1024);
     let Fixture {
@@ -285,6 +417,193 @@ fn request(host: &str, path: &str, extra_headers: &str, body: &str) -> Vec<u8> {
         body.len(),
     )
     .into_bytes()
+}
+
+struct BlockingRequestMiddleware;
+
+#[tonic::async_trait]
+impl openshell_supervisor_middleware::InProcessMiddleware for BlockingRequestMiddleware {
+    async fn describe(&self) -> openshell_core::proto::MiddlewareManifest {
+        use openshell_core::proto::{
+            MiddlewareBinding, SupervisorMiddlewareOperation, SupervisorMiddlewarePhase,
+        };
+        openshell_core::proto::MiddlewareManifest {
+            name: "test/block-request".into(),
+            service_version: "test".into(),
+            bindings: vec![MiddlewareBinding {
+                operation: SupervisorMiddlewareOperation::HttpRequest as i32,
+                phase: SupervisorMiddlewarePhase::PreCredentials as i32,
+                max_payload_bytes: 4096,
+                request_timeout: None,
+            }],
+            extension: Some(openshell_core::extension_protocol::extension_metadata(
+                openshell_core::extension_protocol::ExtensionFamily::SupervisorMiddleware,
+                "openshell/test-block-request",
+                "test",
+                [],
+            )),
+            ..Default::default()
+        }
+    }
+
+    async fn validate_config(&self, _: &str, _: &prost_types::Struct) -> miette::Result<()> {
+        Ok(())
+    }
+
+    async fn evaluate_http_request(
+        &self,
+        _: openshell_supervisor_middleware::HttpRequestView<'_>,
+    ) -> miette::Result<openshell_core::proto::HttpRequestResult> {
+        Ok(openshell_core::proto::HttpRequestResult {
+            decision: openshell_core::proto::Decision::Deny as i32,
+            reason_code: "test_block".into(),
+            ..Default::default()
+        })
+    }
+}
+
+fn rest_fixture(block_middleware: bool) -> Fixture {
+    let middleware = if block_middleware {
+        "network_middlewares:\n  request:\n    middleware: test/block-request\n    on_error: fail_closed\n    endpoints:\n      include: [rest.example.test]\n"
+    } else {
+        ""
+    };
+    let fixture = fixture(
+        &format!(
+            r"{middleware}
+network_policies:
+  rest_api:
+    name: rest_api
+    endpoints:
+      - host: rest.example.test
+        port: 8000
+        path: /item
+        protocol: rest
+        enforcement: enforce
+        rules:
+          - allow: {{ method: POST, path: /item }}
+    binaries:
+      - {{ path: /usr/bin/python3 }}
+"
+        ),
+        "rest.example.test",
+        "rest_api",
+    );
+    if block_middleware {
+        fixture.middleware_engine.set_middleware_runner_for_tests(
+            openshell_supervisor_middleware::ChainRunner::new(Arc::new(BlockingRequestMiddleware)),
+        );
+    }
+    fixture
+}
+
+#[tokio::test]
+async fn inspected_allow_creates_only_the_stages_that_run() {
+    for sampled in [true, false] {
+        let evidence = capture_request_spans(sampled, async {
+            let dispatch = tracing::dispatcher::get_default(Clone::clone);
+            Box::pin(run_allowed_with_dispatch(
+                rest_fixture(false),
+                request("rest.example.test", "/item", "", "{}"),
+                b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                Some(dispatch),
+            ))
+            .await
+        })
+        .await;
+        evidence.assert_no_deny_span(sampled);
+        assert!(
+            evidence
+                .output
+                .forwarded
+                .starts_with(b"POST /item HTTP/1.1\r\n")
+        );
+        if sampled {
+            let names: Vec<_> = evidence
+                .spans
+                .iter()
+                .map(|span| span.name.as_ref())
+                .collect();
+            assert!(names.contains(&"openshell.policy.evaluate"), "{names:?}");
+            assert!(names.contains(&"openshell.upstream.exchange"), "{names:?}");
+            assert!(names.contains(&"openshell.http.response"), "{names:?}");
+            assert!(
+                !names.contains(&"openshell.middleware.request"),
+                "{names:?}"
+            );
+            assert!(
+                !names.contains(&"openshell.middleware.response"),
+                "{names:?}"
+            );
+            assert!(
+                !names.contains(&"openshell.credential.prepare"),
+                "{names:?}"
+            );
+        }
+        let records: Vec<_> = evidence
+            .events
+            .iter()
+            .filter(|event| event["class_uid"] == 4002)
+            .collect();
+        assert_eq!(records.len(), 1, "{:?}", evidence.events);
+        assert_eq!(
+            records[0]["metadata"]["correlation_uid"],
+            request_id(&evidence.output.response)
+        );
+        assert_eq!(records[0]["action"], "Allowed");
+    }
+}
+
+#[tokio::test]
+async fn request_middleware_block_never_creates_a_denial_only_span() {
+    for sampled in [true, false] {
+        let evidence = capture_request_spans(sampled, async {
+            let dispatch = tracing::dispatcher::get_default(Clone::clone);
+            Box::pin(run_denied_with_dispatch(
+                rest_fixture(true),
+                request("rest.example.test", "/item", "", "{}"),
+                Some(dispatch),
+            ))
+            .await
+        })
+        .await;
+        evidence.assert_no_deny_span(sampled);
+        assert!(evidence.output.forwarded.is_empty());
+        assert!(
+            evidence
+                .output
+                .response
+                .starts_with(b"HTTP/1.1 403 Forbidden\r\n")
+        );
+        if sampled {
+            assert_eq!(
+                evidence
+                    .spans
+                    .iter()
+                    .filter(|span| span.name == "openshell.middleware.request")
+                    .count(),
+                1
+            );
+            assert!(
+                evidence
+                    .spans
+                    .iter()
+                    .all(|span| span.name != "openshell.upstream.exchange")
+            );
+        }
+        let records: Vec<_> = evidence
+            .events
+            .iter()
+            .filter(|event| event["class_uid"] == 4002)
+            .collect();
+        assert_eq!(records.len(), 1, "{:?}", evidence.events);
+        assert_eq!(
+            records[0]["metadata"]["correlation_uid"],
+            request_id(&evidence.output.response)
+        );
+        assert_eq!(records[0]["action"], "Denied");
+        assert_eq!(records[0]["http_response"]["code"], 403);
+    }
 }
 
 #[tokio::test]

@@ -15,6 +15,7 @@ mod trace_tests;
 use openshell_sandbox_backend::test_support as rpc_test;
 
 use crate::identity::{BinaryIdentityCache, SuppliedIdentityError};
+use crate::l7::correlation::RequestStage;
 use crate::l7::tls::ProxyTlsState;
 use crate::opa::{NetworkAction, OpaEngine, PolicyGenerationGuard};
 use crate::policy_dns::{
@@ -6424,16 +6425,22 @@ async fn handle_forward_proxy(
         let mut evaluation_error = None;
         let (allowed, reason) = hard_deny_reason.map_or_else(
             || {
-                crate::l7::relay::evaluate_l7_request(&tunnel_engine, &l7_ctx, &request_info)
-                    .unwrap_or_else(|e| {
-                        evaluation_error = Some(build_forward_l7_evaluation_error(
-                            &host_lc,
-                            port,
-                            l7_config.config.enforcement,
-                            &e.to_string(),
-                        ));
-                        (false, format!("L7 evaluation error: {e}"))
-                    })
+                let stage = correlation.stage(RequestStage::PolicyEvaluate);
+                let evaluation = stage.in_scope(|| {
+                    crate::l7::relay::evaluate_l7_request(&tunnel_engine, &l7_ctx, &request_info)
+                });
+                if evaluation.is_err() {
+                    egress::mark_error(&stage);
+                }
+                evaluation.unwrap_or_else(|e| {
+                    evaluation_error = Some(build_forward_l7_evaluation_error(
+                        &host_lc,
+                        port,
+                        l7_config.config.enforcement,
+                        &e.to_string(),
+                    ));
+                    (false, format!("L7 evaluation error: {e}"))
+                })
             },
             |reason| (false, reason),
         );
@@ -6595,15 +6602,24 @@ async fn handle_forward_proxy(
         .as_ref()
         .expect("destination plan hydrated");
 
-    let connector = match validate_destination(DestinationRequest {
+    let resolve_span = if inspected {
+        correlation.stage(RequestStage::UpstreamResolve)
+    } else {
+        egress::resolve_span(&connect_span)
+    };
+    let resolved = validate_destination(DestinationRequest {
         host: &raw_host,
         port,
         sandbox_entrypoint_pid,
         plan: destination_plan,
     })
-    .instrument(egress::resolve_span(&connect_span))
-    .await
-    {
+    .instrument(resolve_span.clone())
+    .await;
+    if inspected && resolved.is_err() {
+        egress::mark_error(&resolve_span);
+    }
+    drop(resolve_span);
+    let connector = match resolved {
         Ok(connector) => connector,
         Err(denial) => {
             deny_forward_destination(
@@ -6719,7 +6735,6 @@ async fn handle_forward_proxy(
             l7_reevaluation,
             correlation: request_correlation,
         };
-        // Middleware denials join the connect trace, like other FORWARD denials.
         forward_request_bytes = match pipeline
             .apply(request, client)
             .instrument(connect_span.clone())
@@ -6765,6 +6780,11 @@ async fn handle_forward_proxy(
             forward_request_bytes.clone(),
         )?;
         let middleware_runner = opa_engine.middleware_runner()?;
+        let stage = if chain.is_empty() {
+            tracing::Span::none()
+        } else {
+            correlation.stage(RequestStage::WebsocketPreflight)
+        };
         let preflight = crate::l7::relay::websocket_middleware_preflight(
             &request,
             chain,
@@ -6772,7 +6792,12 @@ async fn handle_forward_proxy(
             &l7_ctx,
             "ws",
         )
+        .instrument(stage.clone())
         .await;
+        if preflight.is_err() {
+            egress::mark_error(&stage);
+        }
+        drop(stage);
         let preflight = match preflight {
             Ok(preflight) => preflight,
             Err(error) => {
@@ -6794,7 +6819,11 @@ async fn handle_forward_proxy(
                 return Ok(());
             }
         };
-        crate::l7::middleware::emit_websocket_preflight_events(&l7_ctx, &preflight);
+        crate::l7::middleware::emit_websocket_preflight_events_correlated(
+            &l7_ctx,
+            &preflight,
+            request_correlation,
+        );
         if preflight.terminal_reason.is_some() {
             correlation.record_enforcement_action("block");
             correlation.record_response_status(403);
@@ -6881,21 +6910,29 @@ async fn handle_forward_proxy(
     // asynchronous admission step. Holding an endpoint-scoped resolver across
     // middleware or token-grant awaits would let a revoked generation reach
     // the upstream.
-    let endpoint_credentials = if forward_l7_reeval.is_some() {
-        ForwardEndpointCredentials {
-            resolver: l7_ctx.secret_resolver.clone(),
-            body_classifier: l7_ctx.body_classifier.clone(),
-            revision: l7_ctx.provider_credential_revision,
+    let credential_stage =
+        if l7_ctx.provider_credentials.is_some() || l7_ctx.secret_resolver.is_some() {
+            correlation.stage(RequestStage::CredentialPrepare)
+        } else {
+            tracing::Span::none()
+        };
+    let endpoint_credentials = credential_stage.in_scope(|| {
+        if forward_l7_reeval.is_some() {
+            ForwardEndpointCredentials {
+                resolver: l7_ctx.secret_resolver.clone(),
+                body_classifier: l7_ctx.body_classifier.clone(),
+                revision: l7_ctx.provider_credential_revision,
+            }
+        } else {
+            endpoint_credentials_for_request(
+                l7_ctx.provider_credentials.as_ref(),
+                l7_ctx.secret_resolver.clone(),
+                &host_lc,
+                port,
+                &path,
+            )
         }
-    } else {
-        endpoint_credentials_for_request(
-            l7_ctx.provider_credentials.as_ref(),
-            l7_ctx.secret_resolver.clone(),
-            &host_lc,
-            port,
-            &path,
-        )
-    };
+    });
     let secret_resolver = endpoint_credentials.resolver;
     let credential_generation = match (
         l7_ctx.provider_credentials.as_ref(),
@@ -6915,13 +6952,20 @@ async fn handle_forward_proxy(
     }
 
     // 9. Rewrite request and forward to upstream
-    let rewritten = match rewrite_forward_request(
-        &forward_request_bytes,
-        forward_request_bytes.len(),
-        &upstream_target,
-        &canonical_authority,
-        secret_resolver.as_deref(),
-    ) {
+    let rewrite = credential_stage.in_scope(|| {
+        rewrite_forward_request(
+            &forward_request_bytes,
+            forward_request_bytes.len(),
+            &upstream_target,
+            &canonical_authority,
+            secret_resolver.as_deref(),
+        )
+    });
+    if rewrite.is_err() {
+        egress::mark_error(&credential_stage);
+    }
+    drop(credential_stage);
+    let rewritten = match rewrite {
         Ok(bytes) => bytes,
         Err(e) => {
             warn!(
@@ -7073,7 +7117,11 @@ async fn handle_forward_proxy(
     // would need absolute-form requests rather than a CONNECT tunnel. Dial
     // only after every local authorization and transformation step so a
     // rejected WebSocket preflight cannot contact the destination.
-    let dial_span = egress::dial_span(&connect_span);
+    let dial_span = if inspected {
+        correlation.stage(RequestStage::UpstreamDial)
+    } else {
+        egress::dial_span(&connect_span)
+    };
     let dial_result = connector.connect().instrument(dial_span.clone()).await;
     let mut upstream = match dial_result {
         Ok(s) => s,
@@ -7274,6 +7322,7 @@ async fn handle_forward_proxy(
             websocket_permessage_deflate,
             websocket_subprotocol,
         } => {
+            correlation.finish_http_trace();
             // Protocols whose rules apply to individual HTTP requests never
             // upgrade (see `upgrade_refusal_for_protocol`). No current path
             // forwards upgrade headers for them: the request-side refusal
@@ -7646,6 +7695,7 @@ fn is_benign_relay_error(err: &miette::Report) -> bool {
 )]
 mod tests {
     mod ipv4_mapped;
+    mod request_trace;
 
     #[test]
     fn proxy_authorization_rejects_missing_wrong_cross_and_duplicate_credentials() {
