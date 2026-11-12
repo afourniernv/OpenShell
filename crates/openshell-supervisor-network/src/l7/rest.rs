@@ -39,6 +39,7 @@ use openshell_core::secrets::{
 };
 use openshell_ocsf::ctx::ctx as ocsf_ctx;
 use sha1::{Digest, Sha1};
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::fmt::{self, Write as _};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -326,8 +327,8 @@ async fn parse_http_request_with_receipt_protection<C: AsyncRead + Unpin>(
         )?;
     }
 
-    if protect_receipt {
-        buf = strip_platform_request_id_from_head(&buf);
+    if protect_receipt && let Cow::Owned(sanitized) = strip_platform_request_id_from_head(&buf) {
+        buf = sanitized;
     }
 
     Ok(Some(L7Request {
@@ -352,7 +353,9 @@ pub(crate) fn request_from_buffered_http(
 ) -> Result<L7Request> {
     let mut request =
         request_from_buffered_http_unprotected(action, target, query_target, raw_header)?;
-    request.raw_header = strip_platform_request_id_from_head(&request.raw_header);
+    if let Cow::Owned(sanitized) = strip_platform_request_id_from_head(&request.raw_header) {
+        request.raw_header = sanitized;
+    }
     Ok(request)
 }
 
@@ -1316,7 +1319,7 @@ where
             upstream.write_all(&body.body).await.into_diagnostic()?;
         }
     } else if options.deny_uninspected_credentials {
-        if let Err(error) = relay_request_body_with_marker_guard_correlated(
+        if let Err(error) = relay_request_body_with_marker_guard(
             req,
             client,
             upstream,
@@ -1443,7 +1446,7 @@ impl<U: AsyncWrite + Unpin> AsyncWrite for ObservedUpstream<'_, U> {
         let span = this.request_span.get_or_insert_with(|| {
             this.correlation
                 .map_or_else(tracing::Span::none, |correlation| {
-                    correlation.stage(RequestStage::UpstreamExchange)
+                    correlation.stage(RequestStage::UpstreamSend)
                 })
         });
         let result = span.in_scope(|| std::pin::Pin::new(&mut *this.upstream).poll_write(cx, buf));
@@ -1509,32 +1512,7 @@ async fn write_guarded_chunk<W: AsyncWrite + Unpin>(
     write_body_bytes(writer, b"\r\n", options).await
 }
 
-#[cfg(test)]
 async fn relay_request_body_with_marker_guard<C, U>(
-    req: &L7Request,
-    client: &mut C,
-    upstream: &mut U,
-    headers: &[u8],
-    already_read: &[u8],
-    options: RelayRequestOptions<'_>,
-) -> Result<()>
-where
-    C: AsyncRead + Unpin,
-    U: AsyncWrite + Unpin,
-{
-    relay_request_body_with_marker_guard_correlated(
-        req,
-        client,
-        upstream,
-        headers,
-        already_read,
-        options,
-        false,
-    )
-    .await
-}
-
-async fn relay_request_body_with_marker_guard_correlated<C, U>(
     req: &L7Request,
     client: &mut C,
     upstream: &mut U,
@@ -1583,7 +1561,7 @@ where
             write_body_bytes(upstream, &scanner.finish()?, options).await?;
         }
         BodyLength::Chunked => {
-            relay_chunked_with_marker_guard_protected(
+            relay_chunked_with_marker_guard(
                 client,
                 upstream,
                 already_read,
@@ -1596,21 +1574,7 @@ where
     Ok(())
 }
 
-#[cfg(test)]
 async fn relay_chunked_with_marker_guard<C, U>(
-    client: &mut C,
-    upstream: &mut U,
-    already_read: &[u8],
-    options: RelayRequestOptions<'_>,
-) -> Result<()>
-where
-    C: AsyncRead + Unpin,
-    U: AsyncWrite + Unpin,
-{
-    relay_chunked_with_marker_guard_protected(client, upstream, already_read, options, false).await
-}
-
-async fn relay_chunked_with_marker_guard_protected<C, U>(
     client: &mut C,
     upstream: &mut U,
     already_read: &[u8],
@@ -2475,14 +2439,14 @@ fn strip_header(headers: &[u8], strip_name: &str) -> Result<Vec<u8>> {
     Ok(out.into_bytes())
 }
 
-fn strip_platform_request_id_from_head(headers: &[u8]) -> Vec<u8> {
+fn strip_platform_request_id_from_head(headers: &[u8]) -> Cow<'_, [u8]> {
     let header_end = headers
         .windows(4)
         .position(|window| window == b"\r\n\r\n")
         .map_or(headers.len(), |position| position + 4);
     let (header_block, buffered_suffix) = headers.split_at(header_end);
     let protected = openshell_core::token_grant_failure::REQUEST_ID_HEADER.as_bytes();
-    let mut out = Vec::with_capacity(headers.len());
+    let mut out: Option<Vec<u8>> = None;
     let mut position = 0usize;
 
     while position < header_block.len() {
@@ -2492,48 +2456,61 @@ fn strip_platform_request_id_from_head(headers: &[u8]) -> Vec<u8> {
             .map_or(header_block.len(), |end| position + end);
         let line = &header_block[position..line_end];
         if line.is_empty() {
-            out.extend_from_slice(b"\r\n");
+            if position + 2 < header_block.len() {
+                out.get_or_insert_with(|| header_block[..position].to_vec());
+            }
+            if let Some(out) = &mut out {
+                out.extend_from_slice(b"\r\n");
+            }
             break;
         }
-        let Some(colon) = line.iter().position(|byte| *byte == b':') else {
-            out.extend_from_slice(line);
-            out.extend_from_slice(b"\r\n");
-            position = line_end.saturating_add(2);
-            continue;
-        };
-        let name = trim_ascii_ows(&line[..colon]);
-        if name.eq_ignore_ascii_case(protected) {
-            position = line_end.saturating_add(2);
-            continue;
-        }
-        if name.eq_ignore_ascii_case(b"trailer") {
-            let values: Vec<_> = line[colon + 1..]
-                .split(|byte| *byte == b',')
-                .filter(|value| !trim_ascii_ows(value).eq_ignore_ascii_case(protected))
-                .collect();
-            if values.len() != line[colon + 1..].split(|byte| *byte == b',').count() {
-                if values.iter().all(|value| trim_ascii_ows(value).is_empty()) {
-                    position = line_end.saturating_add(2);
-                    continue;
-                }
-                out.extend_from_slice(&line[..=colon]);
-                for (index, value) in values.iter().enumerate() {
-                    if index > 0 {
-                        out.push(b',');
+        if let Some(colon) = line.iter().position(|byte| *byte == b':') {
+            let name = trim_ascii_ows(&line[..colon]);
+            let receipt = name.eq_ignore_ascii_case(protected);
+            let trailer = name.eq_ignore_ascii_case(b"trailer")
+                && line[colon + 1..]
+                    .split(|byte| *byte == b',')
+                    .any(|value| trim_ascii_ows(value).eq_ignore_ascii_case(protected));
+            if receipt || trailer {
+                let out = out.get_or_insert_with(|| {
+                    let mut out = Vec::with_capacity(headers.len());
+                    out.extend_from_slice(&header_block[..position]);
+                    out
+                });
+                if trailer {
+                    let mut values = line[colon + 1..]
+                        .split(|byte| *byte == b',')
+                        .filter(|value| !trim_ascii_ows(value).eq_ignore_ascii_case(protected));
+                    let mut retained = values.clone();
+                    if retained.any(|value| !trim_ascii_ows(value).is_empty()) {
+                        out.extend_from_slice(&line[..=colon]);
+                        if let Some(first) = values.next() {
+                            out.extend_from_slice(first);
+                        }
+                        for value in values {
+                            out.push(b',');
+                            out.extend_from_slice(value);
+                        }
+                        out.extend_from_slice(b"\r\n");
                     }
-                    out.extend_from_slice(value);
                 }
-                out.extend_from_slice(b"\r\n");
                 position = line_end.saturating_add(2);
                 continue;
             }
         }
-        out.extend_from_slice(line);
-        out.extend_from_slice(b"\r\n");
+        if line_end + 2 > header_block.len() {
+            out.get_or_insert_with(|| header_block[..position].to_vec());
+        }
+        if let Some(out) = &mut out {
+            out.extend_from_slice(line);
+            out.extend_from_slice(b"\r\n");
+        }
         position = line_end.saturating_add(2);
     }
-    out.extend_from_slice(buffered_suffix);
-    out
+    out.map_or(Cow::Borrowed(headers), |mut out| {
+        out.extend_from_slice(buffered_suffix);
+        Cow::Owned(out)
+    })
 }
 
 fn trim_ascii_ows(mut value: &[u8]) -> &[u8] {
@@ -3195,18 +3172,15 @@ pub(crate) async fn send_json_response_with_allow<C: AsyncWrite + Unpin>(
 
 pub(crate) async fn send_json_response_with_allow_and_request_id<C: AsyncWrite + Unpin>(
     policy_name: &str,
-    mut body: serde_json::Value,
+    body: serde_json::Value,
     client: &mut C,
     status: &str,
     allowed_methods: Option<&'static str>,
     request_id: &str,
 ) -> Result<()> {
-    if let serde_json::Value::Object(fields) = &mut body {
-        fields.insert("request_id".to_string(), serde_json::json!(request_id));
-    }
     send_json_response_internal(
         policy_name,
-        body,
+        body_with_request_id(body, Some(request_id)),
         client,
         status,
         allowed_methods,
@@ -3217,15 +3191,20 @@ pub(crate) async fn send_json_response_with_allow_and_request_id<C: AsyncWrite +
 
 pub(crate) async fn send_json_response_with_request_id<C: AsyncWrite + Unpin>(
     policy_name: &str,
-    mut body: serde_json::Value,
+    body: serde_json::Value,
     client: &mut C,
     status: &str,
     request_id: &str,
 ) -> Result<()> {
-    if let serde_json::Value::Object(fields) = &mut body {
-        fields.insert("request_id".to_string(), serde_json::json!(request_id));
-    }
-    send_json_response_internal(policy_name, body, client, status, None, Some(request_id)).await
+    send_json_response_with_allow_and_request_id(
+        policy_name,
+        body,
+        client,
+        status,
+        None,
+        request_id,
+    )
+    .await
 }
 
 async fn send_json_response_internal<C: AsyncWrite + Unpin>(
@@ -3580,21 +3559,6 @@ where
 /// `already_read` are overflow bytes buffered while parsing the headers. They
 /// are validated here before being written so ambiguous framing cannot reach
 /// the peer.
-#[cfg(test)]
-async fn relay_chunked<R, W>(
-    reader: &mut R,
-    writer: &mut W,
-    already_read: &[u8],
-    generation_guard: Option<&PolicyGenerationGuard>,
-) -> Result<()>
-where
-    R: AsyncRead + Unpin,
-    W: AsyncWrite + Unpin,
-{
-    relay_chunked_with_receipt_protection(reader, writer, already_read, generation_guard, false)
-        .await
-}
-
 async fn relay_chunked_with_receipt_protection<R, W>(
     reader: &mut R,
     writer: &mut W,
@@ -4483,9 +4447,10 @@ mod tests {
         let mut reader = CountingReader::new(wire);
         let mut writer = tokio::io::sink();
 
-        let error = relay_chunked(&mut reader, &mut writer, &[], None)
-            .await
-            .expect_err("an incomplete chunk must fail");
+        let error =
+            relay_chunked_with_receipt_protection(&mut reader, &mut writer, &[], None, false)
+                .await
+                .expect_err("an incomplete chunk must fail");
 
         assert!(error.to_string().contains("ended mid-chunk"));
         assert_eq!(
@@ -4502,9 +4467,10 @@ mod tests {
         let mut reader = CountingReader::new(wire);
         let mut writer = tokio::io::sink();
 
-        let error = relay_chunked(&mut reader, &mut writer, &[], None)
-            .await
-            .expect_err("an oversized chunk-size line must fail");
+        let error =
+            relay_chunked_with_receipt_protection(&mut reader, &mut writer, &[], None, false)
+                .await
+                .expect_err("an oversized chunk-size line must fail");
 
         assert!(error.to_string().contains("Chunk-size line exceeds"));
     }
@@ -4521,9 +4487,10 @@ mod tests {
         let mut reader = CountingReader::new(wire);
         let mut writer = tokio::io::sink();
 
-        let error = relay_chunked(&mut reader, &mut writer, &[], None)
-            .await
-            .expect_err("an oversized trailer block must fail");
+        let error =
+            relay_chunked_with_receipt_protection(&mut reader, &mut writer, &[], None, false)
+                .await
+                .expect_err("an oversized trailer block must fail");
 
         assert!(error.to_string().contains("Chunk trailers exceed"));
     }
@@ -4538,9 +4505,10 @@ mod tests {
         let mut reader = CountingReader::new(wire);
         let mut writer = tokio::io::sink();
 
-        let error = relay_chunked(&mut reader, &mut writer, &[], None)
-            .await
-            .expect_err("too many trailer fields must fail");
+        let error =
+            relay_chunked_with_receipt_protection(&mut reader, &mut writer, &[], None, false)
+                .await
+                .expect_err("too many trailer fields must fail");
 
         assert!(
             error
@@ -4566,9 +4534,15 @@ mod tests {
                 let mut reader = CountingReader::new(input);
                 let mut writer = CountingWriter::default();
 
-                let error = relay_chunked(&mut reader, &mut writer, already_read, None)
-                    .await
-                    .expect_err("ambiguous chunked framing must fail closed");
+                let error = relay_chunked_with_receipt_protection(
+                    &mut reader,
+                    &mut writer,
+                    already_read,
+                    None,
+                    false,
+                )
+                .await
+                .expect_err("ambiguous chunked framing must fail closed");
 
                 assert!(
                     error.to_string().contains("chunk"),
@@ -5350,9 +5324,15 @@ mod tests {
         let mut relay_reader = tokio::io::BufReader::with_capacity(4096, relay_reader);
         let (mut relay_writer, mut upstream_reader) = tokio::io::duplex(4096);
 
-        relay_chunked(&mut relay_reader, &mut relay_writer, &[], None)
-            .await
-            .expect("chunked body should relay");
+        relay_chunked_with_receipt_protection(
+            &mut relay_reader,
+            &mut relay_writer,
+            &[],
+            None,
+            false,
+        )
+        .await
+        .expect("chunked body should relay");
 
         let mut remaining = vec![0; pipelined_request.len()];
         relay_reader.read_exact(&mut remaining).await.unwrap();
@@ -5378,9 +5358,15 @@ mod tests {
         let mut relay_reader = tokio::io::BufReader::with_capacity(4096, relay_reader);
         let (mut relay_writer, mut upstream_reader) = tokio::io::duplex(4096);
 
-        relay_chunked(&mut relay_reader, &mut relay_writer, already_read, None)
-            .await
-            .expect("chunked body with trailers should relay");
+        relay_chunked_with_receipt_protection(
+            &mut relay_reader,
+            &mut relay_writer,
+            already_read,
+            None,
+            false,
+        )
+        .await
+        .expect("chunked body with trailers should relay");
 
         let mut remaining = vec![0; pipelined_request.len()];
         relay_reader.read_exact(&mut remaining).await.unwrap();
@@ -5413,7 +5399,7 @@ mod tests {
             b"3\r\nabc\r\n0\r\nx-openshell-request-id: forged\r\nX-Checksum: ok\r\n\r\n".as_slice();
         let mut writer = Vec::new();
 
-        relay_chunked_with_marker_guard_protected(
+        relay_chunked_with_marker_guard(
             &mut reader,
             &mut writer,
             &[],
@@ -5423,12 +5409,7 @@ mod tests {
         .await
         .expect("guarded chunked body should relay");
 
-        assert!(
-            !String::from_utf8_lossy(&writer)
-                .to_ascii_lowercase()
-                .contains("x-openshell-request-id")
-        );
-        assert!(String::from_utf8_lossy(&writer).contains("X-Checksum: ok\r\n"));
+        assert_eq!(writer, b"3\r\nabc\r\n0\r\nX-Checksum: ok\r\n\r\n");
     }
 
     #[tokio::test]
@@ -5445,7 +5426,7 @@ mod tests {
         let mut reader =
             tokio::io::BufReader::with_capacity(RELAY_BUF_SIZE, CountingReader::new(wire));
         let mut writer = CountingWriter::default();
-        relay_chunked(&mut reader, &mut writer, &[], None)
+        relay_chunked_with_receipt_protection(&mut reader, &mut writer, &[], None, false)
             .await
             .expect("valid tiny chunks must not be rejected by an aggregate framing limit");
 
@@ -5473,7 +5454,14 @@ mod tests {
         let relay = tokio::spawn(async move {
             let mut relay_reader = tokio::io::BufReader::with_capacity(4096, relay_reader);
             let mut relay_writer = relay_writer;
-            relay_chunked(&mut relay_reader, &mut relay_writer, &[], None).await
+            relay_chunked_with_receipt_protection(
+                &mut relay_reader,
+                &mut relay_writer,
+                &[],
+                None,
+                false,
+            )
+            .await
         });
 
         let first_chunk = b"5\r\nhello\r\n";
@@ -10686,6 +10674,7 @@ mod tests {
                             )),
                             ..Default::default()
                         },
+                        false,
                     )
                     .await
                     .unwrap();
@@ -10831,6 +10820,7 @@ mod tests {
             &mut upstream_writer,
             wire,
             RelayRequestOptions::default(),
+            false,
         )
         .await
         .expect_err("encoded placeholder must fail closed");
@@ -10851,6 +10841,7 @@ mod tests {
             &mut output,
             wire,
             RelayRequestOptions::default(),
+            false,
         )
         .await
         .expect_err("ambiguous trailer framing must fail closed");

@@ -7,7 +7,7 @@
 //! Parses each request within the tunnel, evaluates it against OPA policy,
 //! and either forwards or denies the request.
 
-use crate::l7::correlation::{RequestCorrelation, RequestStage};
+use crate::l7::correlation::{HttpOutcome, RequestCorrelation, RequestStage};
 use crate::l7::middleware::{
     MiddlewareApplyResult, UninspectableTrafficGate,
     apply_middleware_chain_with_request_id_correlated, emit_middleware_uninspectable,
@@ -287,9 +287,7 @@ where
     let activity = build_request_authority_mismatch_event(ctx, method);
     let finding = build_request_authority_mismatch_finding(ctx);
     if let Some(correlation) = correlation {
-        correlation.record_enforcement_action("block");
-        correlation.record_response_status(403);
-        correlation.record_final_http_outcome("denied");
+        correlation.record_rejection(403, HttpOutcome::Denied, None);
         correlation.emit(activity);
         correlation.emit(finding);
         crate::l7::rest::send_json_response_with_request_id(
@@ -374,9 +372,7 @@ where
                     summary.as_deref(),
                 );
                 if let Some(correlation) = correlation {
-                    correlation.record_enforcement_action("block");
-                    correlation.record_response_status(400);
-                    correlation.record_final_http_outcome("denied");
+                    correlation.record_rejection(400, HttpOutcome::Denied, None);
                     correlation.emit(event);
                 } else {
                     egress_emit!(event);
@@ -478,15 +474,14 @@ where
         summary.as_deref(),
     );
     if let Some(correlation) = correlation {
-        correlation.record_enforcement_action("block");
-        correlation.record_response_status(match error {
+        let status = match error {
             crate::l7::mcp::McpProtocolVersionError::InvalidHeader
             | crate::l7::mcp::McpProtocolVersionError::UnsupportedHeaderValue
             | crate::l7::mcp::McpProtocolVersionError::InvalidRequestMetadata => 400,
             crate::l7::mcp::McpProtocolVersionError::MethodNotAllowed => 405,
             crate::l7::mcp::McpProtocolVersionError::NotAllowed(_) => 403,
-        });
-        correlation.record_final_http_outcome("denied");
+        };
+        correlation.record_rejection(status, HttpOutcome::Denied, None);
         correlation.emit(event);
     } else {
         egress_emit!(event);
@@ -750,17 +745,12 @@ where
         events.push(build_credential_endpoint_mismatch_finding(ctx));
     }
     if let Some(correlation) = correlation {
-        correlation.record_enforcement_action("block");
-        correlation.record_response_status(if endpoint_mismatch || placement_mismatch {
-            403
+        let (response_code, outcome) = if endpoint_mismatch || placement_mismatch {
+            (403, HttpOutcome::Denied)
         } else {
-            500
-        });
-        correlation.record_final_http_outcome(if endpoint_mismatch || placement_mismatch {
-            "denied"
-        } else {
-            "platform_error"
-        });
+            (500, HttpOutcome::PlatformError)
+        };
+        correlation.record_rejection(response_code, outcome, None);
         for event in events {
             correlation.emit(event);
         }
@@ -791,9 +781,7 @@ pub(crate) async fn reject_body_credential<C: AsyncWrite + Unpin>(
         "message": "A credential placeholder in the request body cannot be forwarded. Remove the reference from conversation history or restore provider access; body credential rewriting is disabled."
     }});
     if let Some(correlation) = correlation {
-        correlation.record_enforcement_action("block");
-        correlation.record_response_status(403);
-        correlation.record_final_http_outcome("denied");
+        correlation.record_rejection(403, HttpOutcome::Denied, None);
         crate::l7::rest::send_json_response_with_request_id(
             &ctx.policy_name,
             body,
@@ -857,9 +845,7 @@ where
         Ok(prepared) => prepared,
         Err(error) => {
             if let Some(correlation) = correlation {
-                correlation.record_enforcement_action("block");
-                correlation.record_response_status(502);
-                correlation.record_final_http_outcome("platform_error");
+                correlation.record_rejection(502, HttpOutcome::PlatformError, None);
             }
             if let Some(refusal) =
                 error.downcast_ref::<crate::l7::token_grant_injection::TokenGrantInjectionError>()
@@ -1027,8 +1013,8 @@ where
                     observer.observe_credential_failure(false);
                 }
                 if let Some(correlation) = correlation {
-                    correlation.record_enforcement_action("block");
-                    correlation.record_final_http_outcome("platform_error");
+                    correlation.record_enforcement_block();
+                    correlation.record_outcome(HttpOutcome::PlatformError);
                     let mut event = build_credential_resolution_event(ctx, &request.action, false);
                     if let openshell_ocsf::OcsfEvent::HttpActivity(http) = &mut event {
                         http.http_response = None;
@@ -1268,9 +1254,7 @@ where
         observer.observe(EndpointResult::PolicyDenied);
     }
     if let Some(correlation) = correlation {
-        correlation.record_enforcement_action("block");
-        correlation.record_response_status(403);
-        correlation.record_final_http_outcome("denied");
+        correlation.record_rejection(403, HttpOutcome::Denied, None);
     }
     emit_parse_rejection_correlated(
         ctx,
@@ -1449,9 +1433,7 @@ where
         };
         let Some(config) = select_l7_config_for_path(configs, &route_target) else {
             let reason = "no L7 endpoint path matched request";
-            correlation.record_enforcement_action("block");
-            correlation.record_response_status(403);
-            correlation.record_final_http_outcome("denied");
+            correlation.record_rejection(403, HttpOutcome::Denied, None);
             emit_l7_request_log_correlated(
                 ctx,
                 &req.action,
@@ -1506,15 +1488,9 @@ where
                 engine_type_for_protocol(config.protocol),
                 Some(&correlation),
             );
-            {
-                correlation.record_enforcement_action("block");
-                correlation.record_response_status(403);
-                correlation.record_final_http_outcome("denied");
-            }
-            let deny_context = crate::l7::rest::DenyResponseContext::from_l7_context(ctx);
-            let deny_context = Some(&correlation).map_or(deny_context, |correlation| {
-                deny_context.with_request_id(correlation.request_id())
-            });
+            correlation.record_rejection(403, HttpOutcome::Denied, None);
+            let deny_context = crate::l7::rest::DenyResponseContext::from_l7_context(ctx)
+                .with_request_id(correlation.request_id());
             crate::l7::rest::RestProvider::default()
                 .deny_with_redacted_target(
                     &req,
@@ -1561,8 +1537,8 @@ where
                         let detail =
                             parse_rejection_detail(&e.to_string(), ParseRejectionMode::L7Endpoint);
                         {
-                            correlation.record_enforcement_action("block");
-                            correlation.record_final_http_outcome("denied");
+                            correlation.record_enforcement_block();
+                            correlation.record_outcome(HttpOutcome::Denied);
                         }
                         emit_parse_rejection_correlated(
                             ctx,
@@ -1606,8 +1582,8 @@ where
                                 ParseRejectionMode::L7Endpoint,
                             );
                             {
-                                correlation.record_enforcement_action("block");
-                                correlation.record_final_http_outcome("denied");
+                                correlation.record_enforcement_block();
+                                correlation.record_outcome(HttpOutcome::Denied);
                             }
                             emit_parse_rejection_correlated(
                                 ctx,
@@ -1667,11 +1643,7 @@ where
         let websocket_request = crate::l7::rest::request_is_websocket_upgrade(&req.raw_header);
         if config.protocol == L7Protocol::Websocket && !websocket_request {
             let reason = "websocket endpoint requires a valid WebSocket upgrade request";
-            {
-                correlation.record_enforcement_action("block");
-                correlation.record_response_status(403);
-                correlation.record_final_http_outcome("denied");
-            }
+            correlation.record_rejection(403, HttpOutcome::Denied, None);
             emit_l7_request_log_correlated(
                 ctx,
                 &request_info.action,
@@ -1682,10 +1654,8 @@ where
                 None,
                 Some(&correlation),
             );
-            let deny_context = crate::l7::rest::DenyResponseContext::from_l7_context(ctx);
-            let deny_context = Some(&correlation).map_or(deny_context, |correlation| {
-                deny_context.with_request_id(correlation.request_id())
-            });
+            let deny_context = crate::l7::rest::DenyResponseContext::from_l7_context(ctx)
+                .with_request_id(correlation.request_id());
             crate::l7::rest::RestProvider::default()
                 .deny_with_redacted_target(
                     &req,
@@ -1720,13 +1690,9 @@ where
             (false, EnforcementMode::Enforce) => "deny",
         };
         {
-            correlation.record_enforcement_action(if allowed {
-                "allow"
-            } else if config.enforcement == EnforcementMode::Audit && !force_deny {
-                "audit"
-            } else {
-                "block"
-            });
+            if !allowed && (config.enforcement != EnforcementMode::Audit || force_deny) {
+                correlation.record_enforcement_block();
+            }
         }
         let engine_type = engine_type_for_protocol(config.protocol);
         let protocol_summary =
@@ -1771,15 +1737,15 @@ where
                     if let Some(observer) = observer.as_ref() {
                         observer.observe(EndpointResult::PolicyDenied);
                     }
-                    {
-                        correlation.record_enforcement_action("block");
-                        correlation.record_response_status(403);
-                        correlation.record_final_http_outcome(if denial.is_some() {
-                            "denied"
+                    correlation.record_rejection(
+                        403,
+                        if denial.is_some() {
+                            HttpOutcome::Denied
                         } else {
-                            "platform_error"
-                        });
-                    }
+                            HttpOutcome::PlatformError
+                        },
+                        None,
+                    );
                     let denied_request = crate::l7::provider::L7Request {
                         action: request_info.action.clone(),
                         target: redacted_target.clone(),
@@ -1799,11 +1765,7 @@ where
                     return Ok(());
                 }
                 MiddlewareApplyResult::AdmissionExhausted => {
-                    {
-                        correlation.record_enforcement_action("block");
-                        correlation.record_response_status(503);
-                        correlation.record_final_http_outcome("platform_error");
-                    }
+                    correlation.record_rejection(503, HttpOutcome::PlatformError, None);
                     let unavailable_request = crate::l7::provider::L7Request {
                         action: request_info.action.clone(),
                         target: redacted_target.clone(),
@@ -1841,11 +1803,7 @@ where
                     Ok(preflight) => preflight,
                     Err(error) => {
                         warn!(error = %error, "WebSocket middleware preflight failed");
-                        {
-                            correlation.record_enforcement_action("block");
-                            correlation.record_response_status(502);
-                            correlation.record_final_http_outcome("platform_error");
-                        }
+                        correlation.record_rejection(502, HttpOutcome::PlatformError, None);
                         write_bad_gateway_response(client, Some(correlation.request_id())).await?;
                         return Ok(());
                     }
@@ -1856,15 +1814,15 @@ where
                     Some(&correlation),
                 );
                 if preflight.terminal_reason.is_some() {
-                    {
-                        correlation.record_enforcement_action("block");
-                        correlation.record_response_status(403);
-                        correlation.record_final_http_outcome(if preflight.denial.is_some() {
-                            "denied"
+                    correlation.record_rejection(
+                        403,
+                        if preflight.denial.is_some() {
+                            HttpOutcome::Denied
                         } else {
-                            "platform_error"
-                        });
-                    }
+                            HttpOutcome::PlatformError
+                        },
+                        None,
+                    );
                     crate::l7::middleware::send_middleware_rejection_response(
                         &req,
                         client,
@@ -1987,12 +1945,10 @@ where
             }
             {
                 correlation.record_response_status(403);
-                correlation.record_final_http_outcome("denied");
+                correlation.record_outcome(HttpOutcome::Denied);
             }
-            let deny_context = crate::l7::rest::DenyResponseContext::from_l7_context(ctx);
-            let deny_context = Some(&correlation).map_or(deny_context, |correlation| {
-                deny_context.with_request_id(correlation.request_id())
-            });
+            let deny_context = crate::l7::rest::DenyResponseContext::from_l7_context(ctx)
+                .with_request_id(correlation.request_id());
             crate::l7::rest::RestProvider::default()
                 .deny_with_redacted_target(
                     &req,
@@ -2491,9 +2447,7 @@ where
         let websocket_request = crate::l7::rest::request_is_websocket_upgrade(&req.raw_header);
         if config.protocol == L7Protocol::Websocket && !websocket_request {
             let reason = "websocket endpoint requires a valid WebSocket upgrade request";
-            correlation.record_enforcement_action("block");
-            correlation.record_response_status(403);
-            correlation.record_final_http_outcome("denied");
+            correlation.record_rejection(403, HttpOutcome::Denied, None);
             emit_l7_request_log_correlated(
                 ctx,
                 &request_info.action,
@@ -2548,13 +2502,9 @@ where
             (false, EnforcementMode::Audit, _) => "audit",
             (false, EnforcementMode::Enforce, _) => "deny",
         };
-        correlation.record_enforcement_action(if allowed {
-            "allow"
-        } else if config.enforcement == EnforcementMode::Audit {
-            "audit"
-        } else {
-            "block"
-        });
+        if !allowed && config.enforcement != EnforcementMode::Audit {
+            correlation.record_enforcement_block();
+        }
 
         // Log every L7 decision as an OCSF HTTP Activity event.
         // Uses redacted_target (path only, no query params) to avoid logging secrets.
@@ -2614,13 +2564,15 @@ where
             let req = match middleware_result? {
                 MiddlewareApplyResult::Allowed(request) => request,
                 MiddlewareApplyResult::Denied { denial, .. } => {
-                    correlation.record_enforcement_action("block");
-                    correlation.record_response_status(403);
-                    correlation.record_final_http_outcome(if denial.is_some() {
-                        "denied"
-                    } else {
-                        "platform_error"
-                    });
+                    correlation.record_rejection(
+                        403,
+                        if denial.is_some() {
+                            HttpOutcome::Denied
+                        } else {
+                            HttpOutcome::PlatformError
+                        },
+                        None,
+                    );
                     let denied_request = crate::l7::provider::L7Request {
                         action: request_info.action.clone(),
                         target: redacted_target.clone(),
@@ -2640,9 +2592,7 @@ where
                     return Ok(());
                 }
                 MiddlewareApplyResult::AdmissionExhausted => {
-                    correlation.record_enforcement_action("block");
-                    correlation.record_response_status(503);
-                    correlation.record_final_http_outcome("platform_error");
+                    correlation.record_rejection(503, HttpOutcome::PlatformError, None);
                     let unavailable_request = crate::l7::provider::L7Request {
                         action: request_info.action.clone(),
                         target: redacted_target.clone(),
@@ -2680,9 +2630,7 @@ where
                     Ok(preflight) => preflight,
                     Err(error) => {
                         warn!(error = %error, "WebSocket middleware preflight failed");
-                        correlation.record_enforcement_action("block");
-                        correlation.record_response_status(502);
-                        correlation.record_final_http_outcome("platform_error");
+                        correlation.record_rejection(502, HttpOutcome::PlatformError, None);
                         write_bad_gateway_response(client, Some(correlation.request_id())).await?;
                         return Ok(());
                     }
@@ -2693,13 +2641,15 @@ where
                     Some(&correlation),
                 );
                 if preflight.terminal_reason.is_some() {
-                    correlation.record_enforcement_action("block");
-                    correlation.record_response_status(403);
-                    correlation.record_final_http_outcome(if preflight.denial.is_some() {
-                        "denied"
-                    } else {
-                        "platform_error"
-                    });
+                    correlation.record_rejection(
+                        403,
+                        if preflight.denial.is_some() {
+                            HttpOutcome::Denied
+                        } else {
+                            HttpOutcome::PlatformError
+                        },
+                        None,
+                    );
                     crate::l7::middleware::send_middleware_rejection_response(
                         &req,
                         client,
@@ -2809,7 +2759,7 @@ where
         } else {
             // Enforce mode: deny with 403 and close connection (use redacted target)
             correlation.record_response_status(403);
-            correlation.record_final_http_outcome("denied");
+            correlation.record_outcome(HttpOutcome::Denied);
             provider
                 .deny_with_redacted_target(
                     &req,
@@ -3046,13 +2996,9 @@ where
             (false, EnforcementMode::Audit) => "audit",
             (false, EnforcementMode::Enforce) => "deny",
         };
-        correlation.record_enforcement_action(if allowed {
-            "allow"
-        } else if config.enforcement == EnforcementMode::Audit && !force_deny {
-            "audit"
-        } else {
-            "block"
-        });
+        if !allowed && (config.enforcement != EnforcementMode::Audit || force_deny) {
+            correlation.record_enforcement_block();
+        }
 
         {
             let (action_id, disposition_id, severity) = match decision_str {
@@ -3116,13 +3062,15 @@ where
                     if let Some(observer) = observer.as_ref() {
                         observer.observe(EndpointResult::PolicyDenied);
                     }
-                    correlation.record_enforcement_action("block");
-                    correlation.record_response_status(403);
-                    correlation.record_final_http_outcome(if denial.is_some() {
-                        "denied"
-                    } else {
-                        "platform_error"
-                    });
+                    correlation.record_rejection(
+                        403,
+                        if denial.is_some() {
+                            HttpOutcome::Denied
+                        } else {
+                            HttpOutcome::PlatformError
+                        },
+                        None,
+                    );
                     let denied_request = crate::l7::provider::L7Request {
                         action: request_info.action.clone(),
                         target: redacted_target.clone(),
@@ -3142,9 +3090,7 @@ where
                     return Ok(());
                 }
                 MiddlewareApplyResult::AdmissionExhausted => {
-                    correlation.record_enforcement_action("block");
-                    correlation.record_response_status(503);
-                    correlation.record_final_http_outcome("platform_error");
+                    correlation.record_rejection(503, HttpOutcome::PlatformError, None);
                     let unavailable_request = crate::l7::provider::L7Request {
                         action: request_info.action.clone(),
                         target: redacted_target.clone(),
@@ -3203,7 +3149,7 @@ where
                 observer.observe(EndpointResult::PolicyDenied);
             }
             correlation.record_response_status(403);
-            correlation.record_final_http_outcome("denied");
+            correlation.record_outcome(HttpOutcome::Denied);
             crate::l7::rest::RestProvider::default()
                 .deny_with_redacted_target(
                     &req,
@@ -3311,8 +3257,8 @@ where
                 } else {
                     let detail =
                         parse_rejection_detail(&e.to_string(), ParseRejectionMode::L7Endpoint);
-                    correlation.record_enforcement_action("block");
-                    correlation.record_final_http_outcome("denied");
+                    correlation.record_enforcement_block();
+                    correlation.record_outcome(HttpOutcome::Denied);
                     emit_parse_rejection_correlated(ctx, &detail, "l7-graphql", Some(&correlation));
                 }
                 return Ok(());
@@ -3372,13 +3318,9 @@ where
             (false, EnforcementMode::Audit) => "audit",
             (false, EnforcementMode::Enforce) => "deny",
         };
-        correlation.record_enforcement_action(if allowed {
-            "allow"
-        } else if config.enforcement == EnforcementMode::Audit && !force_deny {
-            "audit"
-        } else {
-            "block"
-        });
+        if !allowed && (config.enforcement != EnforcementMode::Audit || force_deny) {
+            correlation.record_enforcement_block();
+        }
 
         {
             let (action_id, disposition_id, severity) = match decision_str {
@@ -3439,13 +3381,15 @@ where
             {
                 MiddlewareApplyResult::Allowed(request) => request,
                 MiddlewareApplyResult::Denied { denial, .. } => {
-                    correlation.record_enforcement_action("block");
-                    correlation.record_response_status(403);
-                    correlation.record_final_http_outcome(if denial.is_some() {
-                        "denied"
-                    } else {
-                        "platform_error"
-                    });
+                    correlation.record_rejection(
+                        403,
+                        if denial.is_some() {
+                            HttpOutcome::Denied
+                        } else {
+                            HttpOutcome::PlatformError
+                        },
+                        None,
+                    );
                     let denied_request = crate::l7::provider::L7Request {
                         action: request_info.action.clone(),
                         target: redacted_target.clone(),
@@ -3465,9 +3409,7 @@ where
                     return Ok(());
                 }
                 MiddlewareApplyResult::AdmissionExhausted => {
-                    correlation.record_enforcement_action("block");
-                    correlation.record_response_status(503);
-                    correlation.record_final_http_outcome("platform_error");
+                    correlation.record_rejection(503, HttpOutcome::PlatformError, None);
                     let unavailable_request = crate::l7::provider::L7Request {
                         action: request_info.action.clone(),
                         target: redacted_target.clone(),
@@ -3535,7 +3477,7 @@ where
             }
         } else {
             correlation.record_response_status(403);
-            correlation.record_final_http_outcome("denied");
+            correlation.record_outcome(HttpOutcome::Denied);
             crate::l7::rest::RestProvider::default()
                 .deny_with_redacted_target(
                     &req,
@@ -3931,7 +3873,7 @@ fn emit_transformed_body_decision(
     {
         http.base.unmapped = Some(serde_json::json!({"transformed_body_policy": "audit"}));
     }
-    crate::l7::middleware::emit_request_events(correlation, [event]);
+    crate::l7::correlation::emit_request_events(correlation, [event]);
 }
 
 fn jsonrpc_policy_input(info: &crate::l7::jsonrpc::JsonRpcRequestInfo) -> serde_json::Value {
@@ -4216,13 +4158,15 @@ where
             let request = match result {
                 MiddlewareApplyResult::Allowed(request) => request,
                 MiddlewareApplyResult::Denied { denial, .. } => {
-                    correlation.record_enforcement_action("block");
-                    correlation.record_final_http_outcome(if denial.is_some() {
-                        "denied"
-                    } else {
-                        "platform_error"
-                    });
-                    correlation.record_response_status(403);
+                    correlation.record_rejection(
+                        403,
+                        if denial.is_some() {
+                            HttpOutcome::Denied
+                        } else {
+                            HttpOutcome::PlatformError
+                        },
+                        None,
+                    );
                     let denied_request = crate::l7::provider::L7Request {
                         action: "HTTP".into(),
                         target: redacted_target.clone(),
@@ -4242,9 +4186,7 @@ where
                     return Ok(());
                 }
                 MiddlewareApplyResult::AdmissionExhausted => {
-                    correlation.record_enforcement_action("block");
-                    correlation.record_final_http_outcome("platform_error");
-                    correlation.record_response_status(503);
+                    correlation.record_rejection(503, HttpOutcome::PlatformError, None);
                     let unavailable_request = crate::l7::provider::L7Request {
                         action: "HTTP".into(),
                         target: redacted_target.clone(),
@@ -4285,9 +4227,7 @@ where
             None => Ok(req),
         };
         let Ok(req_with_auth) = injected else {
-            correlation.record_enforcement_action("block");
-            correlation.record_final_http_outcome("platform_error");
-            correlation.record_response_status(502);
+            correlation.record_rejection(502, HttpOutcome::PlatformError, None);
             // The refusal event names the credential and request ID.
             // The sandbox-level grant record does not require an MCP endpoint identity.
             write_bad_gateway_response(client, Some(&request_id)).await?;

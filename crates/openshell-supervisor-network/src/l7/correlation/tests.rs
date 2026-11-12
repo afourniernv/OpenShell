@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
+use crate::test_support::request_tracing::RequestTracing;
 use openshell_ocsf::{ActivityId, NetworkActivityBuilder, Process};
 use tokio::io::AsyncWriteExt as _;
 
@@ -64,28 +65,13 @@ fn http_events(capture: &openshell_ocsf::test_support::OcsfCapture) -> Vec<serde
 
 #[test]
 fn audit_receipt_and_denial_are_independent_of_sampling_or_exporter() {
-    use opentelemetry::trace::TracerProvider as _;
-    use opentelemetry_sdk::trace::{InMemorySpanExporter, Sampler, SdkTracerProvider};
-    use tracing_subscriber::layer::SubscriberExt as _;
+    use opentelemetry_sdk::trace::Sampler;
 
     crate::telemetry::tests::init_trace_extractor();
     for sampler in [Some(Sampler::AlwaysOn), Some(Sampler::AlwaysOff), None] {
         let sampled = matches!(sampler, Some(Sampler::AlwaysOn));
-        let exporter = InMemorySpanExporter::default();
-        let provider = sampler.map(|sampler| {
-            SdkTracerProvider::builder()
-                .with_sampler(sampler)
-                .with_simple_exporter(exporter.clone())
-                .build()
-        });
-        let layer = provider.as_ref().map(|provider| {
-            tracing_opentelemetry::layer().with_tracer(provider.tracer("request-audit-test"))
-        });
-        let capture = openshell_ocsf::test_support::OcsfCapture::default();
-        let subscriber = tracing_subscriber::registry()
-            .with(capture.clone())
-            .with(layer);
-        tracing::subscriber::with_default(subscriber, || {
+        let capture = RequestTracing::new(sampler);
+        tracing::subscriber::with_default(capture.subscriber(), || {
             let correlation = RequestCorrelation::with_request_id(
                 &request(),
                 &context(),
@@ -93,10 +79,10 @@ fn audit_receipt_and_denial_are_independent_of_sampling_or_exporter() {
             );
             correlation.emit(allowed());
             correlation.emit(denied());
-            correlation.record_final_http_outcome("denied");
+            correlation.record_outcome(HttpOutcome::Denied);
             correlation.response_selected(403);
         });
-        let events = http_events(&capture);
+        let events = http_events(&capture.events);
         assert_eq!(events.len(), 1);
         let event = &events[0];
         assert_eq!(
@@ -108,51 +94,37 @@ fn audit_receipt_and_denial_are_independent_of_sampling_or_exporter() {
         assert_eq!(event["http_response"]["code"], 403);
         assert_eq!(event["http_request"]["url"]["path"], "/data");
         assert_eq!(event["trace"]["uid"].is_string(), sampled);
-        if let Some(provider) = provider {
-            provider.force_flush().unwrap();
-            let spans = exporter.get_finished_spans().unwrap();
-            assert_eq!(spans.len(), usize::from(sampled));
-            if sampled {
-                assert_eq!(spans[0].name, "openshell.http.request");
-                assert_eq!(
-                    event["trace"]["uid"],
-                    spans[0].span_context.trace_id().to_string()
-                );
-            }
-            provider.shutdown().unwrap();
+        let spans = capture.spans();
+        assert_eq!(spans.len(), usize::from(sampled));
+        if sampled {
+            assert_eq!(spans[0].name, "openshell.http.request");
+            assert_eq!(
+                event["trace"]["uid"],
+                spans[0].span_context.trace_id().to_string()
+            );
         }
+        capture.shutdown();
     }
 }
 
 #[test]
 fn finished_http_trace_is_not_retained_by_an_upgraded_session() {
-    use opentelemetry::trace::TracerProvider as _;
-    use opentelemetry_sdk::trace::{InMemorySpanExporter, SdkTracerProvider};
-    use tracing_subscriber::layer::SubscriberExt as _;
+    use opentelemetry_sdk::trace::Sampler;
 
-    let exporter = InMemorySpanExporter::default();
-    let provider = SdkTracerProvider::builder()
-        .with_simple_exporter(exporter.clone())
-        .build();
-    let subscriber = tracing_subscriber::registry()
-        .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("request-upgrade-test")));
-    tracing::subscriber::with_default(subscriber, || {
+    let capture = RequestTracing::new(Some(Sampler::AlwaysOn));
+    tracing::subscriber::with_default(capture.subscriber(), || {
         let correlation = RequestCorrelation::new(&request(), &context());
         correlation.emit(allowed());
         correlation.response_selected(101);
         correlation.finish_http_trace();
-        assert_eq!(exporter.get_finished_spans().unwrap().len(), 1);
+        assert_eq!(capture.spans().len(), 1);
         assert!(correlation.trace_span().is_disabled());
-        assert!(
-            correlation
-                .stage(RequestStage::UpstreamExchange)
-                .is_disabled()
-        );
+        assert!(correlation.stage(RequestStage::UpstreamSend).is_disabled());
         correlation.finish_http_trace();
         drop(correlation);
-        assert_eq!(exporter.get_finished_spans().unwrap().len(), 1);
+        assert_eq!(capture.spans().len(), 1);
     });
-    provider.shutdown().unwrap();
+    capture.shutdown();
 }
 
 #[test]
@@ -180,7 +152,7 @@ fn a_provider_without_an_exporter_still_emits_the_request_id_join() {
             42
         );
         correlation.emit(allowed());
-        correlation.record_final_http_outcome("allowed");
+        correlation.record_outcome(HttpOutcome::Allowed);
         correlation.response_selected(200);
     });
     let events = http_events(&capture);
@@ -262,16 +234,18 @@ fn later_credential_denial_preserves_policy_request_context() {
 #[test]
 fn local_refusals_and_upstream_failures_are_distinct() {
     for (outcome, blocked, code, expected_action, expected_disposition) in [
-        ("platform_error", true, 503, "Denied", "Blocked"),
-        ("upstream_error", false, 502, "Allowed", "Allowed"),
-        ("platform_error", false, 502, "Allowed", "Allowed"),
+        (HttpOutcome::PlatformError, true, 503, "Denied", "Blocked"),
+        (HttpOutcome::UpstreamError, false, 502, "Allowed", "Allowed"),
+        (HttpOutcome::PlatformError, false, 502, "Allowed", "Allowed"),
     ] {
         let capture = openshell_ocsf::test_support::OcsfCapture::default();
         let _subscriber = capture.install();
         let correlation = RequestCorrelation::new(&request(), &context());
         correlation.emit(allowed());
-        correlation.record_enforcement_action(if blocked { "block" } else { "allow" });
-        correlation.record_final_http_outcome(outcome);
+        if blocked {
+            correlation.record_enforcement_block();
+        }
+        correlation.record_outcome(outcome);
         correlation.response_selected(code);
         drop(correlation);
         let events = http_events(&capture);
@@ -289,7 +263,7 @@ fn remote_api_error_does_not_become_a_policy_denial() {
     let _subscriber = capture.install();
     let correlation = RequestCorrelation::new(&request(), &context());
     correlation.emit(allowed());
-    correlation.record_final_http_outcome("allowed");
+    correlation.record_outcome(HttpOutcome::Allowed);
     correlation.response_selected(500);
     drop(correlation);
     let events = http_events(&capture);
@@ -317,8 +291,8 @@ fn pre_policy_rejection_retains_reason_without_claiming_policy_admission() {
             .actor_process(Process::new("curl", 42))
             .build(),
     );
-    correlation.record_enforcement_action("block");
-    correlation.record_final_http_outcome("denied");
+    correlation.record_enforcement_block();
+    correlation.record_outcome(HttpOutcome::Denied);
     correlation.response_selected(400);
     drop(correlation);
     assert_eq!(capture.events().len(), 2);
@@ -463,9 +437,11 @@ fn failure_reason_replaces_only_a_prior_success_reason() {
     let _subscriber = capture.install();
     let correlation = RequestCorrelation::new(&request(), &context());
     correlation.emit(allowed());
-    correlation.record_enforcement_action("block");
-    correlation.record_final_http_outcome("platform_error");
-    correlation.record_failure_reason("middleware_admission");
+    correlation.record_rejection(
+        503,
+        HttpOutcome::PlatformError,
+        Some("middleware_admission"),
+    );
     correlation.response_selected(503);
     drop(correlation);
     let events = http_events(&capture);

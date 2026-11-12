@@ -10,6 +10,7 @@ use opentelemetry_sdk::propagation::TraceContextPropagator;
 use tracing::Span;
 use tracing_opentelemetry::OpenTelemetrySpanExt as _;
 
+use super::correlation::HttpOutcome;
 use openshell_ocsf::{ActionId, HttpActivityEvent, StatusId};
 
 const MAX_TRACEPARENT_BYTES: usize = 256;
@@ -28,7 +29,7 @@ pub enum RequestStage {
     CredentialPrepare,
     UpstreamResolve,
     UpstreamDial,
-    UpstreamExchange,
+    UpstreamSend,
     Response,
     ResponseMiddleware,
 }
@@ -42,7 +43,7 @@ impl RequestStage {
             Self::CredentialPrepare => "openshell.credential.prepare",
             Self::UpstreamResolve => "openshell.upstream.resolve",
             Self::UpstreamDial => "openshell.upstream.connect",
-            Self::UpstreamExchange => "openshell.upstream.exchange",
+            Self::UpstreamSend => "openshell.upstream.send",
             Self::Response => "openshell.http.response",
             Self::ResponseMiddleware => "openshell.middleware.response",
         }
@@ -106,14 +107,13 @@ impl RequestTrace {
             .record("http.response.status_code", i64::from(status));
     }
 
-    pub(super) fn record_outcome(&mut self, outcome: &'static str) {
+    pub(super) fn record_outcome(&mut self, outcome: HttpOutcome) {
         let outcome = match outcome {
-            "allowed" if self.outcome == "denied" => "denied",
-            "allowed" => "allowed",
-            "denied" => "denied",
-            "platform_error" | "upstream_error" | "failed" => "failed",
-            "upgraded" => "upgraded",
-            _ => "incomplete",
+            HttpOutcome::Allowed if self.outcome == "denied" => "denied",
+            HttpOutcome::Allowed => "allowed",
+            HttpOutcome::Denied => "denied",
+            HttpOutcome::PlatformError | HttpOutcome::UpstreamError => "failed",
+            HttpOutcome::Upgraded => "upgraded",
         };
         self.outcome = outcome;
         self.span.record("openshell.request.outcome", outcome);
@@ -129,13 +129,13 @@ impl RequestTrace {
         }
         if event.action == Some(ActionId::Denied) {
             if self.outcome != "failed" {
-                self.record_outcome("denied");
+                self.record_outcome(HttpOutcome::Denied);
             }
         } else if self.outcome == "incomplete" {
             self.record_outcome(if event.base.status == Some(StatusId::Failure) {
-                "failed"
+                HttpOutcome::PlatformError
             } else {
-                "allowed"
+                HttpOutcome::Allowed
             });
         }
     }

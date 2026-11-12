@@ -15,7 +15,7 @@ use std::path::PathBuf;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tracing::Instrument as _;
 
-use super::correlation::RequestStage;
+use super::correlation::{RequestStage, emit_request_events};
 
 pub enum MiddlewareApplyResult {
     Allowed(crate::l7::provider::L7Request),
@@ -1147,19 +1147,6 @@ fn emit_middleware_events(
     outcome: &openshell_supervisor_middleware::ChainOutcome,
 ) {
     crate::telemetry::emit_decision(middleware_events(ctx, req, outcome), None);
-}
-
-pub fn emit_request_events(
-    correlation: Option<&super::correlation::RequestCorrelation>,
-    events: impl IntoIterator<Item = openshell_ocsf::OcsfEvent>,
-) {
-    if let Some(correlation) = correlation {
-        for event in events {
-            correlation.emit(event);
-        }
-    } else {
-        crate::telemetry::emit_decision(events, None);
-    }
 }
 
 #[cfg(test)]

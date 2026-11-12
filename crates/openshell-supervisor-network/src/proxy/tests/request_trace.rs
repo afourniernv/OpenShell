@@ -2,27 +2,13 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
-use opentelemetry_sdk::trace::{InMemorySpanExporter, Sampler, SdkTracerProvider};
-use std::sync::Mutex;
+use crate::test_support::request_tracing::RequestTracing;
+use opentelemetry_sdk::trace::Sampler;
 use tracing::instrument::WithSubscriber as _;
 use tracing_subscriber::layer::SubscriberExt as _;
 
 const WORKLOAD_TRACE_ID: &str = "4bf92f3577b34da6a3ce929d0e0e4736";
 const WORKLOAD_SPAN_ID: &str = "00f067aa0ba902b7";
-
-#[derive(Clone, Default)]
-struct CreatedSpans(Arc<Mutex<Vec<&'static str>>>);
-
-impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CreatedSpans {
-    fn on_new_span(
-        &self,
-        attributes: &tracing::span::Attributes<'_>,
-        _id: &tracing::span::Id,
-        _ctx: tracing_subscriber::layer::Context<'_, S>,
-    ) {
-        self.0.lock().unwrap().push(attributes.metadata().name());
-    }
-}
 
 #[derive(Clone, Copy)]
 enum Outcome {
@@ -32,11 +18,7 @@ enum Outcome {
     UpstreamClosed,
 }
 
-async fn forward_case(outcome: Outcome, sampler: Option<Sampler>, flags: &str) {
-    let Some(ip) = non_loopback_test_ipv4() else {
-        eprintln!("skipping: actual FORWARD tracing requires a non-loopback test address");
-        return;
-    };
+async fn forward_case(ip: Ipv4Addr, outcome: Outcome, sampler: Option<Sampler>, flags: &str) {
     let listener = TcpListener::bind((ip, 0)).await.unwrap();
     let port = listener.local_addr().unwrap().port();
     let mode = if matches!(outcome, Outcome::AuditDenied) {
@@ -80,23 +62,10 @@ network_policies:
         ancestors: Vec::new(),
         cmdline_paths: vec![executable_path("/workspace/investigate.py")],
     });
-    let capture = openshell_ocsf::test_support::OcsfCapture::default();
-    let created = CreatedSpans::default();
-    let exporter = InMemorySpanExporter::default();
     let expect_export = matches!(sampler, Some(Sampler::AlwaysOn));
-    let provider = sampler.map(|sampler| {
-        SdkTracerProvider::builder()
-            .with_sampler(sampler)
-            .with_simple_exporter(exporter.clone())
-            .build()
-    });
-    let layer = provider
-        .as_ref()
-        .map(|provider| openshell_otel::layer(provider, "forward-request-test"));
-    let subscriber = tracing_subscriber::registry()
-        .with(capture.clone())
-        .with(layer)
-        .with(created.clone())
+    let capture = RequestTracing::new(sampler);
+    let subscriber = capture
+        .subscriber()
         .with(openshell_otel::supervisor_span_filter("info"));
     let (mut app, proxy) = tokio::io::duplex(8192);
     let mut proxy: ProxyClient = tokio::io::BufReader::new(Box::new(proxy));
@@ -175,10 +144,7 @@ network_policies:
             .await
             .unwrap();
     result.unwrap();
-    if let Some(provider) = &provider {
-        provider.force_flush().unwrap();
-    }
-    let spans = exporter.get_finished_spans().unwrap();
+    let spans = capture.spans();
     let expected = (!matches!(outcome, Outcome::UpstreamClosed)).then_some(
         if matches!(outcome, Outcome::PolicyDenied) {
             403
@@ -188,6 +154,7 @@ network_policies:
     );
     let response = String::from_utf8(response).unwrap();
     let records = capture
+        .events
         .json_events()
         .into_iter()
         .filter(|event| event["class_uid"] == 4002)
@@ -226,19 +193,13 @@ network_policies:
             1
         }
     );
+    let created = capture.created_span_names();
     assert!(
-        !created
-            .0
-            .lock()
-            .unwrap()
-            .contains(&"supervisor.egress.deny"),
+        !created.contains(&"supervisor.egress.deny"),
         "inspected paths must never create a deny-only span"
     );
     assert_eq!(
         created
-            .0
-            .lock()
-            .unwrap()
             .iter()
             .filter(|name| **name == "openshell.http.request")
             .count(),
@@ -317,15 +278,14 @@ network_policies:
         );
         assert!(!format!("{spans:?}").contains("SENTINEL"));
     }
-    if let Some(provider) = provider {
-        provider.shutdown().unwrap();
-    }
+    capture.shutdown();
 }
 
 #[tokio::test]
 async fn inspected_forward_traces_all_outcomes_without_sampling_or_export_dependencies() {
     let _lock = openshell_otel_test_support::tracing_test_lock().await;
-    crate::telemetry::tests::init_trace_extractor();
+    let ip = non_loopback_test_ipv4()
+        .expect("FORWARD trace qualification requires a non-loopback IPv4 address");
     for outcome in [
         Outcome::Allowed,
         Outcome::PolicyDenied,
@@ -334,7 +294,7 @@ async fn inspected_forward_traces_all_outcomes_without_sampling_or_export_depend
     ] {
         for flags in ["00", "01"] {
             for sampler in [Some(Sampler::AlwaysOn), Some(Sampler::AlwaysOff), None] {
-                forward_case(outcome, sampler, flags).await;
+                forward_case(ip, outcome, sampler, flags).await;
             }
         }
     }
@@ -343,11 +303,8 @@ async fn inspected_forward_traces_all_outcomes_without_sampling_or_export_depend
 #[tokio::test]
 async fn inspected_forward_http_trace_ends_before_websocket_session() {
     let _lock = openshell_otel_test_support::tracing_test_lock().await;
-    crate::telemetry::tests::init_trace_extractor();
-    let Some(ip) = non_loopback_test_ipv4() else {
-        eprintln!("skipping: actual FORWARD tracing requires a non-loopback test address");
-        return;
-    };
+    let ip = non_loopback_test_ipv4()
+        .expect("FORWARD trace qualification requires a non-loopback IPv4 address");
     let listener = TcpListener::bind((ip, 0)).await.unwrap();
     let port = listener.local_addr().unwrap().port();
     let engine = Arc::new(
@@ -374,15 +331,9 @@ network_policies:
         )
         .unwrap(),
     );
-    let capture = openshell_ocsf::test_support::OcsfCapture::default();
-    let exporter = InMemorySpanExporter::default();
-    let provider = SdkTracerProvider::builder()
-        .with_sampler(Sampler::AlwaysOn)
-        .with_simple_exporter(exporter.clone())
-        .build();
-    let subscriber = tracing_subscriber::registry()
-        .with(capture.clone())
-        .with(openshell_otel::layer(&provider, "forward-websocket-test"))
+    let capture = RequestTracing::new(Some(Sampler::AlwaysOn));
+    let subscriber = capture
+        .subscriber()
         .with(openshell_otel::supervisor_span_filter("info"));
     let (mut app, proxy) = tokio::io::duplex(8192);
     let target = format!("http://{ip}:{port}/ws");
@@ -452,10 +403,8 @@ network_policies:
         assert!(String::from_utf8_lossy(&response).starts_with("HTTP/1.1 101 "));
         let root = tokio::time::timeout(std::time::Duration::from_secs(2), async {
             loop {
-                provider.force_flush().unwrap();
-                if let Some(root) = exporter
-                    .get_finished_spans()
-                    .unwrap()
+                if let Some(root) = capture
+                    .spans()
                     .into_iter()
                     .find(|span| span.name == "openshell.http.request")
                 {
@@ -488,7 +437,7 @@ network_policies:
         drop(app);
         upstream.await.unwrap();
         handler.await.unwrap().unwrap();
-        let records = capture.json_events();
+        let records = capture.events.json_events();
         assert_eq!(
             records
                 .iter()
@@ -500,5 +449,5 @@ network_policies:
     tokio::time::timeout(std::time::Duration::from_secs(5), scenario)
         .await
         .unwrap();
-    provider.shutdown().unwrap();
+    capture.shutdown();
 }

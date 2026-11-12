@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
+use crate::l7::correlation::HttpOutcome;
+use crate::test_support::request_tracing::RequestTracing;
 use opentelemetry::trace::TracerProvider as _;
 use opentelemetry_sdk::trace::{InMemorySpanExporter, Sampler, SdkTracerProvider, SpanData};
 use tracing_subscriber::layer::SubscriberExt as _;
@@ -17,17 +19,10 @@ fn request(flags: &str) -> Vec<u8> {
 }
 
 fn capture(sampler: Sampler, emit: impl FnOnce()) -> Vec<SpanData> {
-    let exporter = InMemorySpanExporter::default();
-    let provider = SdkTracerProvider::builder()
-        .with_sampler(sampler)
-        .with_simple_exporter(exporter.clone())
-        .build();
-    let subscriber = tracing_subscriber::registry()
-        .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("request-trace-test")));
-    tracing::subscriber::with_default(subscriber, emit);
-    provider.force_flush().unwrap();
-    let spans = exporter.get_finished_spans().unwrap();
-    provider.shutdown().unwrap();
+    let capture = RequestTracing::new(Some(sampler));
+    tracing::subscriber::with_default(capture.subscriber(), emit);
+    let spans = capture.spans();
+    capture.shutdown();
     spans
 }
 
@@ -60,7 +55,7 @@ fn workload_context_is_linked_not_parented_for_both_sampled_flags() {
                 );
                 trace.stage(RequestStage::PolicyEvaluate).in_scope(|| {});
                 trace.record_status(403);
-                trace.record_outcome("denied");
+                trace.record_outcome(HttpOutcome::Denied);
             });
         });
         let root = root(&spans);
@@ -97,7 +92,7 @@ fn explicit_request_root_does_not_adopt_ambient_otel_context() {
     let spans = capture(Sampler::AlwaysOn, || {
         let _guard = Context::new().with_remote_span_context(remote).attach();
         let mut trace = RequestTrace::new("local", "GET", "example.test", 443, &request("00"));
-        trace.record_outcome("allowed");
+        trace.record_outcome(HttpOutcome::Allowed);
     });
     let root = root(&spans);
     assert_eq!(root.parent_span_id, opentelemetry::trace::SpanId::INVALID);
@@ -111,7 +106,7 @@ fn remote_sampled_flag_cannot_override_local_always_off() {
         let spans = capture(Sampler::ParentBased(Box::new(Sampler::AlwaysOff)), || {
             let mut trace = RequestTrace::new("local", "GET", "example.test", 443, &request(flags));
             trace.stage(RequestStage::PolicyEvaluate).in_scope(|| {});
-            trace.record_outcome("denied");
+            trace.record_outcome(HttpOutcome::Denied);
         });
         assert!(spans.is_empty());
     }
@@ -126,14 +121,14 @@ fn every_outcome_has_the_same_root_shape_and_stages_have_fixed_names() {
         RequestStage::CredentialPrepare,
         RequestStage::UpstreamResolve,
         RequestStage::UpstreamDial,
-        RequestStage::UpstreamExchange,
+        RequestStage::UpstreamSend,
         RequestStage::Response,
         RequestStage::ResponseMiddleware,
     ];
     for (outcome, failed) in [
-        ("allowed", false),
-        ("denied", false),
-        ("upstream_error", true),
+        (HttpOutcome::Allowed, false),
+        (HttpOutcome::Denied, false),
+        (HttpOutcome::UpstreamError, true),
     ] {
         let spans = capture(Sampler::AlwaysOn, || {
             let mut trace = RequestTrace::new("local", "GET", "example.test", 443, &request("01"));
@@ -195,7 +190,7 @@ fn custom_method_values_are_not_exported() {
             443,
             &request("01"),
         );
-        trace.record_outcome("allowed");
+        trace.record_outcome(HttpOutcome::Allowed);
     });
     assert_eq!(
         attribute(root(&spans), "http.request.method")
@@ -214,7 +209,7 @@ fn no_exporter_does_not_change_execution() {
             trace.stage(RequestStage::PolicyEvaluate).in_scope(|| 42),
             42
         );
-        trace.record_outcome("allowed");
+        trace.record_outcome(HttpOutcome::Allowed);
     });
 }
 
@@ -241,7 +236,7 @@ fn a_filtered_request_root_does_not_create_orphan_stage_spans() {
             "another layer still enables the root"
         );
         assert!(trace.stage(RequestStage::PolicyEvaluate).is_disabled());
-        trace.record_outcome("allowed");
+        trace.record_outcome(HttpOutcome::Allowed);
     });
     provider.force_flush().unwrap();
     assert!(exporter.get_finished_spans().unwrap().is_empty());

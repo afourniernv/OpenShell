@@ -20,6 +20,27 @@ use crate::l7::relay::L7EvalContext;
 pub use crate::l7::request_trace::RequestStage;
 use crate::l7::request_trace::RequestTrace;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HttpOutcome {
+    Allowed,
+    Denied,
+    PlatformError,
+    UpstreamError,
+    Upgraded,
+}
+
+impl HttpOutcome {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Allowed => "allowed",
+            Self::Denied => "denied",
+            Self::PlatformError => "platform_error",
+            Self::UpstreamError => "upstream_error",
+            Self::Upgraded => "upgraded",
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct RequestCorrelation {
     request_id: String,
@@ -35,10 +56,33 @@ struct RequestState {
     seeded: bool,
     status: Option<u16>,
     upstream_status: Option<u16>,
-    outcome: Option<&'static str>,
+    outcome: Option<HttpOutcome>,
     blocked: bool,
     failure_reason: Option<&'static str>,
     late_failure_emitted: bool,
+}
+
+impl RequestState {
+    fn record_outcome(&mut self, outcome: HttpOutcome) {
+        self.outcome = Some(outcome);
+        if let Some(trace) = &mut self.trace {
+            trace.record_outcome(outcome);
+        }
+    }
+
+    fn record_status(&mut self, status: u16) {
+        self.status = Some(status);
+        if let Some(trace) = &self.trace {
+            trace.record_status(status);
+        }
+    }
+
+    fn record_failure_reason(&mut self, reason: &'static str) {
+        self.failure_reason = Some(reason);
+        if let Some(trace) = &self.trace {
+            trace.record_failure_reason(reason);
+        }
+    }
 }
 
 impl RequestCorrelation {
@@ -128,7 +172,7 @@ impl RequestCorrelation {
         if status == Some(101)
             && let Some(trace) = &mut trace
         {
-            trace.record_outcome("upgraded");
+            trace.record_outcome(HttpOutcome::Upgraded);
         }
         drop(trace);
     }
@@ -141,33 +185,25 @@ impl RequestCorrelation {
         }
     }
 
-    pub(crate) fn record_enforcement_action(&self, action: &str) {
+    pub(crate) fn record_enforcement_block(&self) {
         self.state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .blocked |= action == "block";
+            .blocked = true;
     }
 
-    pub(crate) fn record_final_http_outcome(&self, outcome: &'static str) {
-        let mut state = self
-            .state
+    pub(crate) fn record_outcome(&self, outcome: HttpOutcome) {
+        self.state
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        state.outcome = Some(outcome);
-        if let Some(trace) = &mut state.trace {
-            trace.record_outcome(outcome);
-        }
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .record_outcome(outcome);
     }
 
     pub(crate) fn record_response_status(&self, status: u16) {
-        let mut state = self
-            .state
+        self.state
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        state.status = Some(status);
-        if let Some(trace) = &state.trace {
-            trace.record_status(status);
-        }
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .record_status(status);
     }
 
     pub(crate) fn record_upstream_status(&self, status: u16) {
@@ -177,15 +213,31 @@ impl RequestCorrelation {
             .upstream_status = Some(status);
     }
 
-    pub(crate) fn record_failure_reason(&self, reason: &'static str) {
+    pub(crate) fn record_rejection(
+        &self,
+        status: u16,
+        outcome: HttpOutcome,
+        reason: Option<&'static str>,
+    ) {
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        state.failure_reason = Some(reason);
-        if let Some(trace) = &state.trace {
-            trace.record_failure_reason(reason);
+        state.blocked = true;
+        state.record_outcome(outcome);
+        state.record_status(status);
+        if let Some(reason) = reason {
+            state.record_failure_reason(reason);
         }
+    }
+
+    pub(crate) fn record_failure(&self, outcome: HttpOutcome, reason: &'static str) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.record_outcome(outcome);
+        state.record_failure_reason(reason);
     }
 
     pub(crate) fn emit(&self, event: OcsfEvent) {
@@ -293,7 +345,7 @@ impl RequestCorrelation {
             {
                 unmapped.insert("upstream_response_code".into(), serde_json::json!(upstream));
             }
-            if blocked || outcome == Some("denied") {
+            if blocked || outcome == Some(HttpOutcome::Denied) {
                 if http.action != Some(ActionId::Denied) {
                     http.base.message = Some("HTTP request blocked by supervisor".into());
                 }
@@ -304,16 +356,21 @@ impl RequestCorrelation {
                 if !has_failure_reason {
                     http.base.status_detail = Some(
                         failure_reason
-                            .or(outcome)
+                            .or_else(|| outcome.map(HttpOutcome::as_str))
                             .unwrap_or("supervisor_blocked")
                             .into(),
                     );
                 }
-            } else if matches!(outcome, Some("platform_error" | "upstream_error")) {
+            } else if matches!(
+                outcome,
+                Some(HttpOutcome::PlatformError | HttpOutcome::UpstreamError)
+            ) {
                 http.base.status = Some(StatusId::Failure);
                 raise_severity(http, SeverityId::Low);
                 if !has_failure_reason {
-                    http.base.status_detail = failure_reason.or(outcome).map(str::to_string);
+                    http.base.status_detail = failure_reason
+                        .or_else(|| outcome.map(HttpOutcome::as_str))
+                        .map(str::to_string);
                 }
             }
             if incomplete && outcome.is_none() {
@@ -342,6 +399,19 @@ impl RequestCorrelation {
             })
         };
         crate::telemetry::emit_inspected_decision([event], parent.as_ref());
+    }
+}
+
+pub fn emit_request_events(
+    correlation: Option<&RequestCorrelation>,
+    events: impl IntoIterator<Item = OcsfEvent>,
+) {
+    if let Some(correlation) = correlation {
+        for event in events {
+            correlation.emit(event);
+        }
+    } else {
+        crate::telemetry::emit_decision(events, None);
     }
 }
 

@@ -1038,7 +1038,7 @@ async fn token_grant_refusal_never_creates_a_denial_only_span() {
                 evidence
                     .spans
                     .iter()
-                    .all(|span| span.name != "openshell.upstream.exchange")
+                    .all(|span| span.name != "openshell.upstream.send")
             );
         }
         let records: Vec<_> = evidence

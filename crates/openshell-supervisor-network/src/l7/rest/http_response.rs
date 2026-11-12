@@ -4,7 +4,7 @@
 //! HTTP response relay and pre-return middleware integration.
 
 use super::*;
-use crate::l7::correlation::{RequestCorrelation, RequestStage};
+use crate::l7::correlation::{HttpOutcome, RequestCorrelation, RequestStage};
 
 /// Default wall-clock bound shared by whole-body stages in one response.
 pub const DEFAULT_HTTP_RESPONSE_WHOLE_BODY_TIMEOUT: std::time::Duration =
@@ -94,7 +94,7 @@ where
                 let sanitized = if options.correlation.is_some() {
                     strip_platform_request_id_from_head(&buf[..header_end])
                 } else {
-                    buf[..header_end].to_vec()
+                    Cow::Borrowed(&buf[..header_end])
                 };
                 client.write_all(&sanitized).await.into_diagnostic()?;
                 client.flush().await.into_diagnostic()?;
@@ -118,14 +118,13 @@ where
         buf.extend_from_slice(&tmp[..n]);
     };
 
-    if options.correlation.is_some() {
-        let sanitized = strip_platform_request_id_from_head(&buf[..header_end]);
-        if sanitized.len() != header_end {
-            let overflow = buf.split_off(header_end);
-            buf = sanitized;
-            header_end = buf.len();
-            buf.extend_from_slice(&overflow);
-        }
+    if options.correlation.is_some()
+        && let Cow::Owned(sanitized) = strip_platform_request_id_from_head(&buf[..header_end])
+    {
+        let overflow = buf.split_off(header_end);
+        buf = sanitized;
+        header_end = buf.len();
+        buf.extend_from_slice(&overflow);
     }
 
     // Parse response framing
@@ -307,43 +306,35 @@ where
 
 fn record_allowed_response(correlation: Option<&RequestCorrelation>) {
     if let Some(correlation) = correlation {
-        correlation.record_final_http_outcome("allowed");
+        correlation.record_outcome(HttpOutcome::Allowed);
     }
 }
 
 fn record_denied_response(correlation: Option<&RequestCorrelation>, stage: &'static str) {
     if let Some(correlation) = correlation {
-        correlation.record_response_status(403);
-        correlation.record_enforcement_action("block");
-        correlation.record_final_http_outcome("denied");
-        correlation.record_failure_reason(stage);
+        correlation.record_rejection(403, HttpOutcome::Denied, Some(stage));
     }
 }
 
 fn record_platform_response_error(correlation: Option<&RequestCorrelation>, stage: &'static str) {
     if let Some(correlation) = correlation {
-        correlation.record_response_status(502);
-        correlation.record_enforcement_action("block");
-        correlation.record_final_http_outcome("platform_error");
-        correlation.record_failure_reason(stage);
+        correlation.record_rejection(502, HttpOutcome::PlatformError, Some(stage));
     }
 }
 
 fn record_upstream_response_error(correlation: Option<&RequestCorrelation>, stage: &'static str) {
     if let Some(correlation) = correlation {
-        correlation.record_final_http_outcome("upstream_error");
-        correlation.record_failure_reason(stage);
+        correlation.record_failure(HttpOutcome::UpstreamError, stage);
     }
 }
 
 fn record_committed_response_error(
     correlation: Option<&RequestCorrelation>,
-    outcome: &'static str,
+    outcome: HttpOutcome,
     stage: &'static str,
 ) {
     if let Some(correlation) = correlation {
-        correlation.record_final_http_outcome(outcome);
-        correlation.record_failure_reason(stage);
+        correlation.record_failure(outcome, stage);
     }
 }
 
@@ -428,35 +419,38 @@ fn validate_http_response_status_line(status_line: &[u8]) -> Result<()> {
     Ok(())
 }
 
-fn final_response_head(headers: &[u8], correlation: Option<&RequestCorrelation>) -> Vec<u8> {
+fn final_response_head<'a>(
+    headers: &'a [u8],
+    correlation: Option<&RequestCorrelation>,
+) -> Cow<'a, [u8]> {
     let Some(correlation) = correlation else {
-        return headers.to_vec();
+        return Cow::Borrowed(headers);
     };
-    let stripped = strip_platform_request_id_from_head(headers);
-    let stripped = strip_platform_request_id_from_connection(&stripped);
+    let stripped =
+        strip_platform_request_id_from_connection(strip_platform_request_id_from_head(headers));
     let Some(header_end) = stripped.windows(4).position(|window| window == b"\r\n\r\n") else {
         return stripped;
     };
-    let receipt = format!(
-        "{}: {}\r\n\r\n",
-        openshell_core::token_grant_failure::REQUEST_ID_HEADER,
-        correlation.request_id(),
-    );
-    let mut output = Vec::with_capacity(stripped.len() + receipt.len());
+    let name = openshell_core::token_grant_failure::REQUEST_ID_HEADER;
+    let request_id = correlation.request_id();
+    let mut output = Vec::with_capacity(stripped.len() + name.len() + request_id.len() + 4);
     output.extend_from_slice(&stripped[..header_end + 2]);
-    output.extend_from_slice(receipt.as_bytes());
+    output.extend_from_slice(name.as_bytes());
+    output.extend_from_slice(b": ");
+    output.extend_from_slice(request_id.as_bytes());
+    output.extend_from_slice(b"\r\n\r\n");
     output.extend_from_slice(&stripped[header_end + 4..]);
-    output
+    Cow::Owned(output)
 }
 
-fn strip_platform_request_id_from_connection(headers: &[u8]) -> Vec<u8> {
+fn strip_platform_request_id_from_connection(headers: Cow<'_, [u8]>) -> Cow<'_, [u8]> {
     let header_end = headers
         .windows(4)
         .position(|window| window == b"\r\n\r\n")
         .map_or(headers.len(), |position| position + 4);
     let (header_block, buffered_suffix) = headers.split_at(header_end);
     let protected = openshell_core::token_grant_failure::REQUEST_ID_HEADER.as_bytes();
-    let mut output = Vec::with_capacity(headers.len());
+    let mut output: Option<Vec<u8>> = None;
     let mut position = 0usize;
 
     while position < header_block.len() {
@@ -466,58 +460,57 @@ fn strip_platform_request_id_from_connection(headers: &[u8]) -> Vec<u8> {
             .map_or(header_block.len(), |end| position + end);
         let line = &header_block[position..line_end];
         if line.is_empty() {
-            output.extend_from_slice(b"\r\n");
+            if position + 2 < header_block.len() {
+                output.get_or_insert_with(|| header_block[..position].to_vec());
+            }
+            if let Some(output) = &mut output {
+                output.extend_from_slice(b"\r\n");
+            }
             break;
         }
 
-        let Some(colon) = line.iter().position(|byte| *byte == b':') else {
-            output.extend_from_slice(line);
-            output.extend_from_slice(b"\r\n");
-            position = line_end.saturating_add(2);
-            continue;
-        };
-        let name = trim_ascii_ows(&line[..colon]);
-        if !name.eq_ignore_ascii_case(b"connection") {
-            output.extend_from_slice(line);
-            output.extend_from_slice(b"\r\n");
+        if let Some(colon) = line.iter().position(|byte| *byte == b':')
+            && trim_ascii_ows(&line[..colon]).eq_ignore_ascii_case(b"connection")
+            && line[colon + 1..]
+                .split(|byte| *byte == b',')
+                .any(|value| trim_ascii_ows(value).eq_ignore_ascii_case(protected))
+        {
+            let output = output.get_or_insert_with(|| {
+                let mut output = Vec::with_capacity(headers.len());
+                output.extend_from_slice(&header_block[..position]);
+                output
+            });
+            let mut retained = line[colon + 1..]
+                .split(|byte| *byte == b',')
+                .map(trim_ascii_ows)
+                .filter(|token| !token.is_empty() && !token.eq_ignore_ascii_case(protected));
+            if let Some(first) = retained.next() {
+                output.extend_from_slice(&line[..=colon]);
+                output.push(b' ');
+                output.extend_from_slice(first);
+                for token in retained {
+                    output.extend_from_slice(b", ");
+                    output.extend_from_slice(token);
+                }
+                output.extend_from_slice(b"\r\n");
+            }
             position = line_end.saturating_add(2);
             continue;
         }
-
-        let mut removed_protected = false;
-        let retained: Vec<_> = line[colon + 1..]
-            .split(|byte| *byte == b',')
-            .filter_map(|value| {
-                let token = trim_ascii_ows(value);
-                if token.eq_ignore_ascii_case(protected) {
-                    removed_protected = true;
-                    None
-                } else if token.is_empty() {
-                    None
-                } else {
-                    Some(token)
-                }
-            })
-            .collect();
-        if !removed_protected {
+        if line_end + 2 > header_block.len() {
+            output.get_or_insert_with(|| header_block[..position].to_vec());
+        }
+        if let Some(output) = &mut output {
             output.extend_from_slice(line);
-            output.extend_from_slice(b"\r\n");
-        } else if !retained.is_empty() {
-            output.extend_from_slice(&line[..=colon]);
-            output.push(b' ');
-            for (index, token) in retained.iter().enumerate() {
-                if index > 0 {
-                    output.extend_from_slice(b", ");
-                }
-                output.extend_from_slice(token);
-            }
             output.extend_from_slice(b"\r\n");
         }
         position = line_end.saturating_add(2);
     }
 
-    output.extend_from_slice(buffered_suffix);
-    output
+    if let Some(output) = &mut output {
+        output.extend_from_slice(buffered_suffix);
+    }
+    output.map_or(headers, Cow::Owned)
 }
 
 /// Body framing determines when delivery finishes, not whether another
@@ -728,7 +721,7 @@ where
             ));
         }
     }
-    crate::l7::middleware::emit_request_events(response_correlation, preflight_events);
+    crate::l7::correlation::emit_request_events(response_correlation, preflight_events);
     if !preflight.allowed {
         if let Some(denial) = preflight.denial.as_ref() {
             send_response_middleware_denial(
@@ -754,7 +747,7 @@ where
         }
         return Ok(Some(RelayOutcome::Consumed));
     }
-    crate::l7::middleware::emit_request_events(
+    crate::l7::correlation::emit_request_events(
         response_correlation,
         http_response_decision_events(
             middleware.policy_name,
@@ -811,7 +804,7 @@ where
                     false,
                     true,
                 ));
-                crate::l7::middleware::emit_request_events(response_correlation, events);
+                crate::l7::correlation::emit_request_events(response_correlation, events);
                 send_response_delivery_failure(
                     client,
                     request_method,
@@ -828,7 +821,7 @@ where
             guard.ensure_current()?;
         }
         let mut headers = preflight.headers;
-        crate::l7::middleware::emit_request_events(
+        crate::l7::correlation::emit_request_events(
             response_correlation,
             http_response_diagnostic_events(
                 middleware.policy_name,
@@ -963,18 +956,18 @@ where
                     middleware_stop.is_some(),
                 ));
             }
-            crate::l7::middleware::emit_request_events(response_correlation, events);
+            crate::l7::correlation::emit_request_events(response_correlation, events);
             if committed {
                 if middleware_stop.is_some_and(|stop| stop.failure.denial.is_some()) {
                     record_committed_response_error(
                         response_correlation,
-                        "denied",
+                        HttpOutcome::Denied,
                         "response_middleware_body",
                     );
                 } else {
                     record_committed_response_error(
                         response_correlation,
-                        "platform_error",
+                        HttpOutcome::PlatformError,
                         "response_middleware_body",
                     );
                 }
@@ -1035,18 +1028,18 @@ where
                     true,
                 ));
             }
-            crate::l7::middleware::emit_request_events(response_correlation, events);
+            crate::l7::correlation::emit_request_events(response_correlation, events);
             if committed {
                 if error.denial.is_some() {
                     record_committed_response_error(
                         response_correlation,
-                        "denied",
+                        HttpOutcome::Denied,
                         "response_middleware_finish",
                     );
                 } else {
                     record_committed_response_error(
                         response_correlation,
-                        "platform_error",
+                        HttpOutcome::PlatformError,
                         "response_middleware_finish",
                     );
                 }
@@ -1083,7 +1076,7 @@ where
     if let Some(guard) = middleware.generation_guard {
         guard.ensure_current()?;
     }
-    crate::l7::middleware::emit_request_events(
+    crate::l7::correlation::emit_request_events(
         response_correlation,
         http_response_diagnostic_events(
             middleware.policy_name,
@@ -1292,7 +1285,7 @@ fn emit_http_response_diagnostics(
     status_code: u16,
     diagnostics: &openshell_supervisor_middleware::HttpResponseDiagnostics,
 ) {
-    crate::l7::middleware::emit_request_events(
+    crate::l7::correlation::emit_request_events(
         correlation,
         http_response_diagnostic_events(
             policy_name,
@@ -1474,7 +1467,7 @@ fn emit_http_response_middleware_failure(
     status_code: u16,
     committed: bool,
 ) {
-    crate::l7::middleware::emit_request_events(
+    crate::l7::correlation::emit_request_events(
         correlation,
         [http_response_middleware_failure_event(
             policy_name,
@@ -2534,9 +2527,12 @@ pub(super) fn response_is_event_stream(headers: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use super::{final_response_head, strip_platform_request_id_from_connection};
+    use crate::l7::rest::strip_platform_request_id_from_head;
     use openshell_supervisor_middleware::{
         HttpResponseInvocation, HttpResponseInvocationOutcome as Outcome, NamespacedFinding,
     };
+    use std::borrow::Cow;
 
     fn invocation(outcome: Outcome, failed: bool) -> HttpResponseInvocation {
         HttpResponseInvocation {
@@ -2943,6 +2939,45 @@ mod tests {
 
     fn test_correlation(request_id: &str) -> crate::l7::correlation::RequestCorrelation {
         test_correlation_for_method(request_id, "GET")
+    }
+
+    #[test]
+    fn untouched_receipt_heads_remain_borrowed() {
+        let head = b"HTTP/1.1 200\r\nX-Opaque: \xff\xfe\r\nX-Duplicate: first\r\nX-Duplicate: second\r\nConnection: keep-alive\r\nTrailer: X-Checksum\r\n\r\nbody";
+        let uncorrelated = final_response_head(head, None);
+        assert!(matches!(uncorrelated, Cow::Borrowed(_)));
+        assert_eq!(uncorrelated.as_ref(), head);
+
+        let stripped = strip_platform_request_id_from_head(head);
+        assert!(matches!(stripped, Cow::Borrowed(_)));
+        let stripped = strip_platform_request_id_from_connection(stripped);
+        assert!(matches!(stripped, Cow::Borrowed(_)));
+        assert_eq!(stripped.as_ref(), head);
+    }
+
+    #[test]
+    fn receipt_head_rewrite_preserves_unrelated_bytes_and_buffered_body() {
+        let correlation = test_correlation("receipt-cow");
+        let head = b"HTTP/1.1 200\r\nX-Opaque: \xff\xfe\r\nX-Duplicate: first\r\nX-Duplicate: second\r\nX-OpenShell-Request-ID: forged\r\nx-openshell-request-id: forged-again\r\nConnection: keep-alive, X-OpenShell-Request-ID, , Upgrade\r\nTrailer: X-OpenShell-Request-ID, X-Checksum\r\n\r\n\x00\xffbody";
+
+        let rewritten = final_response_head(head, Some(&correlation));
+        assert!(matches!(rewritten, Cow::Owned(_)));
+        assert_eq!(
+            rewritten.as_ref(),
+            b"HTTP/1.1 200\r\nX-Opaque: \xff\xfe\r\nX-Duplicate: first\r\nX-Duplicate: second\r\nConnection: keep-alive, Upgrade\r\nTrailer: X-Checksum\r\nx-openshell-request-id: receipt-cow\r\n\r\n\x00\xffbody"
+        );
+    }
+
+    #[test]
+    fn clean_correlated_head_adds_only_the_receipt() {
+        let correlation = test_correlation("receipt-clean");
+        let head = b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nbody";
+
+        let rewritten = final_response_head(head, Some(&correlation));
+        assert_eq!(
+            rewritten.as_ref(),
+            b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nx-openshell-request-id: receipt-clean\r\n\r\nbody"
+        );
     }
 
     fn request_id_header_count(response: &[u8]) -> usize {

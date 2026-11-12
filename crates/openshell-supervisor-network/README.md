@@ -73,3 +73,6 @@ and children around stages that actually run, with valid workload W3C context
 only as an untrusted link. Their records never create an extra denial-only span,
 even if the request span is disabled or unsampled. Other egress paths retain the
 legacy bounded deny-span behavior. End HTTP tracing before an upgraded session.
+The `openshell.upstream.send` stage measures request writes and flush; response
+handling is measured separately. Receipt filtering preserves raw HTTP bytes
+and borrows unchanged header blocks.

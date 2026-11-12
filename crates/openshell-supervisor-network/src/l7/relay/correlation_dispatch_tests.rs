@@ -6,51 +6,31 @@
 use super::L7EvalContext;
 use crate::l7::L7EndpointConfig;
 use crate::opa::{NetworkInput, OpaEngine, TunnelPolicyEngine};
-use opentelemetry_sdk::trace::{InMemorySpanExporter, Sampler, SdkTracerProvider, SpanData};
+use crate::test_support::request_tracing::RequestTracing;
+use opentelemetry_sdk::trace::{Sampler, SpanData};
 use std::future::Future;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tracing::instrument::WithSubscriber as _;
 use tracing_subscriber::layer::SubscriberExt as _;
 
 const POLICY: &str = include_str!("../../../data/sandbox-policy.rego");
 
-#[derive(Clone, Default)]
-struct CreatedSpans(Arc<Mutex<Vec<String>>>);
-
-impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CreatedSpans {
-    fn on_new_span(
-        &self,
-        attributes: &tracing::span::Attributes<'_>,
-        _id: &tracing::Id,
-        _context: tracing_subscriber::layer::Context<'_, S>,
-    ) {
-        self.0
-            .lock()
-            .unwrap()
-            .push(attributes.metadata().name().into());
-    }
-}
-
 pub struct TracedOperation<T> {
     pub(crate) output: T,
     pub(crate) events: Vec<serde_json::Value>,
     pub(crate) spans: Vec<SpanData>,
-    created: Vec<String>,
+    created: Vec<&'static str>,
 }
 
 impl<T> TracedOperation<T> {
     pub(crate) fn assert_no_deny_span(&self, sampled: bool) {
-        assert!(
-            self.created
-                .iter()
-                .all(|name| name != "supervisor.egress.deny")
-        );
+        assert!(!self.created.contains(&"supervisor.egress.deny"));
         assert_eq!(
             self.created
                 .iter()
-                .filter(|name| *name == "openshell.http.request")
+                .filter(|name| **name == "openshell.http.request")
                 .count(),
             1
         );
@@ -61,13 +41,47 @@ impl<T> TracedOperation<T> {
             .collect();
         assert_eq!(roots.len(), usize::from(sampled));
         if let Some(root) = roots.first() {
-            assert!(
-                self.spans
-                    .iter()
-                    .all(|span| span.name == "openshell.http.request"
-                        || (span.parent_span_id == root.span_context.span_id()
-                            && span.span_context.trace_id() == root.span_context.trace_id()))
-            );
+            let root_id = root.span_context.span_id();
+            assert_eq!(root.parent_span_id, opentelemetry::trace::SpanId::INVALID);
+            let by_id = self
+                .spans
+                .iter()
+                .map(|span| (span.span_context.span_id(), span))
+                .collect::<std::collections::HashMap<_, _>>();
+            for span in &self.spans {
+                assert_eq!(span.span_context.trace_id(), root.span_context.trace_id());
+                if span.span_context.span_id() == root_id {
+                    continue;
+                }
+                let mut parent = span.parent_span_id;
+                for _ in 0..self.spans.len() {
+                    if parent == root_id {
+                        break;
+                    }
+                    parent = by_id
+                        .get(&parent)
+                        .expect("span parent is captured")
+                        .parent_span_id;
+                }
+                assert_eq!(
+                    parent, root_id,
+                    "span parent graph reaches the request root"
+                );
+                if matches!(
+                    span.name.as_ref(),
+                    "openshell.policy.evaluate"
+                        | "openshell.middleware.request"
+                        | "openshell.middleware.websocket.preflight"
+                        | "openshell.credential.prepare"
+                        | "openshell.upstream.resolve"
+                        | "openshell.upstream.connect"
+                        | "openshell.upstream.send"
+                        | "openshell.http.response"
+                        | "openshell.middleware.response"
+                ) {
+                    assert_eq!(span.parent_span_id, root_id, "request stage parent");
+                }
+            }
             for event in self
                 .events
                 .iter()
@@ -89,33 +103,47 @@ pub async fn capture_request_spans<T>(
     sampled: bool,
     operation: impl Future<Output = T>,
 ) -> TracedOperation<T> {
-    let _lock = openshell_otel_test_support::tracing_test_lock().await;
-    crate::telemetry::tests::init_trace_extractor();
-    let exporter = InMemorySpanExporter::default();
-    let provider = SdkTracerProvider::builder()
-        .with_sampler(if sampled {
+    capture_request(
+        Some(if sampled {
             Sampler::AlwaysOn
         } else {
             Sampler::AlwaysOff
-        })
-        .with_simple_exporter(exporter.clone())
-        .build();
-    let events = openshell_ocsf::test_support::OcsfCapture::default();
-    let created = CreatedSpans::default();
-    let subscriber = tracing_subscriber::registry()
-        .with(events.clone())
-        .with(created.clone())
-        .with(openshell_otel::layer(&provider, "request-dispatch-test"));
-    let output = Box::pin(operation.with_subscriber(subscriber)).await;
-    provider.force_flush().unwrap();
-    let spans = exporter.get_finished_spans().unwrap();
-    provider.shutdown().unwrap();
+        }),
+        operation,
+    )
+    .await
+}
+
+async fn capture_request<T>(
+    sampler: Option<Sampler>,
+    operation: impl Future<Output = T>,
+) -> TracedOperation<T> {
+    let _lock = openshell_otel_test_support::tracing_test_lock().await;
+    let capture = RequestTracing::new(sampler);
+    let output = Box::pin(operation.with_subscriber(capture.subscriber())).await;
+    let spans = capture.spans();
+    capture.shutdown();
     TracedOperation {
         output,
-        events: events.json_events(),
+        events: capture.events.json_events(),
         spans,
-        created: created.0.lock().unwrap().clone(),
+        created: capture.created_span_names(),
     }
+}
+
+#[tokio::test]
+async fn request_trace_capture_accepts_rpc_grandchildren() {
+    let evidence = capture_request_spans(true, async {
+        let request = tracing::info_span!(parent: None, "openshell.http.request");
+        request.in_scope(|| {
+            tracing::info_span!("openshell.middleware.request").in_scope(|| {
+                tracing::info_span!("middleware.rpc").in_scope(|| {});
+            });
+        });
+    })
+    .await;
+    assert_eq!(evidence.spans.len(), 3);
+    evidence.assert_no_deny_span(true);
 }
 
 struct Fixture {
@@ -128,7 +156,6 @@ struct Fixture {
 struct Exchange {
     response: Vec<u8>,
     forwarded: Vec<u8>,
-    ocsf_events: Vec<serde_json::Value>,
 }
 
 fn fixture(data: &str, host: &str, policy_name: &str) -> Fixture {
@@ -219,26 +246,23 @@ async fn run_allowed(
     fixture: Fixture,
     request: Vec<u8>,
     upstream_response: &'static [u8],
-) -> Exchange {
-    Box::pin(run_allowed_with_dispatch(
-        fixture,
-        request,
-        upstream_response,
+) -> TracedOperation<Exchange> {
+    capture_request(
         None,
-    ))
+        Box::pin(run_exchange(fixture, request, Some(upstream_response))),
+    )
     .await
 }
 
-async fn run_allowed_with_dispatch(
+async fn run_denied(fixture: Fixture, request: Vec<u8>) -> TracedOperation<Exchange> {
+    capture_request(None, Box::pin(run_exchange(fixture, request, None))).await
+}
+
+async fn run_exchange(
     fixture: Fixture,
     request: Vec<u8>,
-    upstream_response: &'static [u8],
-    dispatch: Option<tracing::Dispatch>,
+    upstream_response: Option<&'static [u8]>,
 ) -> Exchange {
-    let ocsf = openshell_ocsf::test_support::OcsfCapture::default();
-    let subscriber = dispatch.unwrap_or_else(|| {
-        tracing::Dispatch::new(tracing_subscriber::registry().with(ocsf.clone()))
-    });
     let (mut app, mut relay_client) = tokio::io::duplex(32 * 1024);
     let (mut relay_upstream, mut upstream) = tokio::io::duplex(32 * 1024);
     let Fixture {
@@ -251,31 +275,44 @@ async fn run_allowed_with_dispatch(
     let exchange = async {
         tracing::callsite::rebuild_interest_cache();
         tokio::join!(
-            crate::proxy::relay_inspected_http_stream_for_test(
-                &mut relay_client,
-                &mut relay_upstream,
-                vec![config],
-                tunnel_engine,
-                &middleware_engine,
-                &ctx,
-            ),
+            async {
+                let result = crate::proxy::relay_inspected_http_stream_for_test(
+                    &mut relay_client,
+                    &mut relay_upstream,
+                    vec![config],
+                    tunnel_engine,
+                    &middleware_engine,
+                    &ctx,
+                )
+                .await;
+                drop(relay_upstream);
+                result
+            },
             async {
                 app.write_all(&request).await.expect("send request");
                 app.flush().await.expect("flush request");
                 read_http_message(&mut app).await
             },
             async {
-                let forwarded = read_http_message(&mut upstream).await;
-                upstream
-                    .write_all(upstream_response)
-                    .await
-                    .expect("send upstream response");
-                upstream.flush().await.expect("flush upstream response");
-                forwarded
+                if let Some(response) = upstream_response {
+                    let forwarded = read_http_message(&mut upstream).await;
+                    upstream
+                        .write_all(response)
+                        .await
+                        .expect("send upstream response");
+                    upstream.flush().await.expect("flush upstream response");
+                    forwarded
+                } else {
+                    let mut forwarded = Vec::new();
+                    upstream
+                        .read_to_end(&mut forwarded)
+                        .await
+                        .expect("relay closes upstream");
+                    forwarded
+                }
             },
         )
-    }
-    .with_subscriber(subscriber);
+    };
     let (relay, response, forwarded) =
         tokio::time::timeout(std::time::Duration::from_secs(5), Box::pin(exchange))
             .await
@@ -284,95 +321,27 @@ async fn run_allowed_with_dispatch(
     Exchange {
         response,
         forwarded,
-        ocsf_events: ocsf.json_events(),
-    }
-}
-
-async fn run_denied(fixture: Fixture, request: Vec<u8>) -> Exchange {
-    Box::pin(run_denied_with_dispatch(fixture, request, None)).await
-}
-
-async fn run_denied_with_dispatch(
-    fixture: Fixture,
-    request: Vec<u8>,
-    dispatch: Option<tracing::Dispatch>,
-) -> Exchange {
-    let ocsf = openshell_ocsf::test_support::OcsfCapture::default();
-    let subscriber = dispatch.unwrap_or_else(|| {
-        tracing::Dispatch::new(tracing_subscriber::registry().with(ocsf.clone()))
-    });
-    let (mut app, mut relay_client) = tokio::io::duplex(32 * 1024);
-    let (mut relay_upstream, mut upstream) = tokio::io::duplex(32 * 1024);
-    let Fixture {
-        config,
-        tunnel_engine,
-        middleware_engine,
-        ctx,
-    } = fixture;
-
-    let exchange = async {
-        tracing::callsite::rebuild_interest_cache();
-        tokio::join!(
-            crate::proxy::relay_inspected_http_stream_for_test(
-                &mut relay_client,
-                &mut relay_upstream,
-                vec![config],
-                tunnel_engine,
-                &middleware_engine,
-                &ctx,
-            ),
-            async {
-                app.write_all(&request).await.expect("send request");
-                app.flush().await.expect("flush request");
-                read_http_message(&mut app).await
-            },
-            async {
-                let mut forwarded = Vec::new();
-                let _ = tokio::time::timeout(
-                    std::time::Duration::from_millis(100),
-                    upstream.read_to_end(&mut forwarded),
-                )
-                .await;
-                forwarded
-            },
-        )
-    }
-    .with_subscriber(subscriber);
-    let (relay, response, forwarded) =
-        tokio::time::timeout(std::time::Duration::from_secs(5), Box::pin(exchange))
-            .await
-            .expect("single-config denial completes");
-    relay.expect("relay succeeds");
-    Exchange {
-        response,
-        forwarded,
-        ocsf_events: ocsf.json_events(),
     }
 }
 
 fn assert_primary_record<'a>(
-    exchange: &'a Exchange,
+    exchange: &'a TracedOperation<Exchange>,
     engine_type: &str,
     status: u16,
     action: &str,
     path: &str,
 ) -> &'a serde_json::Value {
-    let receipt = request_id(&exchange.response);
+    let receipt = request_id(&exchange.output.response);
     assert!(
         uuid::Uuid::parse_str(receipt).is_ok(),
         "canonical receipt: {receipt}"
     );
     let primary: Vec<_> = exchange
-        .ocsf_events
+        .events
         .iter()
         .filter(|event| event["class_uid"] == 4002)
         .collect();
-    assert_eq!(
-        primary.len(),
-        1,
-        "one HTTP Activity: {:?}",
-        exchange.ocsf_events
-    );
+    assert_eq!(primary.len(), 1, "one HTTP Activity: {:?}", exchange.events);
     let event = primary[0];
     assert_eq!(event["metadata"]["correlation_uid"], receipt);
     assert_eq!(event["firewall_rule"]["type"], engine_type);
@@ -500,16 +469,14 @@ network_policies:
 #[tokio::test]
 async fn inspected_allow_creates_only_the_stages_that_run() {
     for sampled in [true, false] {
-        let evidence = capture_request_spans(sampled, async {
-            let dispatch = tracing::dispatcher::get_default(Clone::clone);
-            Box::pin(run_allowed_with_dispatch(
+        let evidence = capture_request_spans(
+            sampled,
+            Box::pin(run_exchange(
                 rest_fixture(false),
                 request("rest.example.test", "/item", "", "{}"),
-                b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-                Some(dispatch),
-            ))
-            .await
-        })
+                Some(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"),
+            )),
+        )
         .await;
         evidence.assert_no_deny_span(sampled);
         assert!(
@@ -525,7 +492,7 @@ async fn inspected_allow_creates_only_the_stages_that_run() {
                 .map(|span| span.name.as_ref())
                 .collect();
             assert!(names.contains(&"openshell.policy.evaluate"), "{names:?}");
-            assert!(names.contains(&"openshell.upstream.exchange"), "{names:?}");
+            assert!(names.contains(&"openshell.upstream.send"), "{names:?}");
             assert!(names.contains(&"openshell.http.response"), "{names:?}");
             assert!(
                 !names.contains(&"openshell.middleware.request"),
@@ -557,15 +524,14 @@ async fn inspected_allow_creates_only_the_stages_that_run() {
 #[tokio::test]
 async fn request_middleware_block_never_creates_a_denial_only_span() {
     for sampled in [true, false] {
-        let evidence = capture_request_spans(sampled, async {
-            let dispatch = tracing::dispatcher::get_default(Clone::clone);
-            Box::pin(run_denied_with_dispatch(
+        let evidence = capture_request_spans(
+            sampled,
+            Box::pin(run_exchange(
                 rest_fixture(true),
                 request("rest.example.test", "/item", "", "{}"),
-                Some(dispatch),
-            ))
-            .await
-        })
+                None,
+            )),
+        )
         .await;
         evidence.assert_no_deny_span(sampled);
         assert!(evidence.output.forwarded.is_empty());
@@ -588,7 +554,7 @@ async fn request_middleware_block_never_creates_a_denial_only_span() {
                 evidence
                     .spans
                     .iter()
-                    .all(|span| span.name != "openshell.upstream.exchange")
+                    .all(|span| span.name != "openshell.upstream.send")
             );
         }
         let records: Vec<_> = evidence
@@ -715,8 +681,13 @@ async fn production_single_mcp_allow_correlates_record_and_response_receipt() {
     ))
     .await;
 
-    assert!(exchange.forwarded.starts_with(b"POST /mcp HTTP/1.1\r\n"));
-    assert!(exchange.response.starts_with(b"HTTP/1.1 200 OK\r\n"));
+    assert!(
+        exchange
+            .output
+            .forwarded
+            .starts_with(b"POST /mcp HTTP/1.1\r\n")
+    );
+    assert!(exchange.output.response.starts_with(b"HTTP/1.1 200 OK\r\n"));
     assert_primary_record(&exchange, "l7-mcp", 200, "Allowed", "/mcp");
 }
 
@@ -734,14 +705,16 @@ async fn production_single_mcp_invalid_version_correlates_denial_and_receipt() {
     ))
     .await;
 
-    assert!(exchange.forwarded.is_empty());
+    assert!(exchange.output.forwarded.is_empty());
     assert!(
         exchange
+            .output
             .response
             .starts_with(b"HTTP/1.1 400 Bad Request\r\n")
     );
     assert!(
-        String::from_utf8_lossy(&exchange.response).contains("unsupported_mcp_protocol_version")
+        String::from_utf8_lossy(&exchange.output.response)
+            .contains("unsupported_mcp_protocol_version")
     );
     assert_primary_record(&exchange, "l7-mcp", 400, "Denied", "/mcp");
 }
@@ -760,8 +733,13 @@ async fn production_single_mcp_policy_deny_correlates_record_and_receipt() {
     ))
     .await;
 
-    assert!(exchange.forwarded.is_empty());
-    assert!(exchange.response.starts_with(b"HTTP/1.1 403 Forbidden\r\n"));
+    assert!(exchange.output.forwarded.is_empty());
+    assert!(
+        exchange
+            .output
+            .response
+            .starts_with(b"HTTP/1.1 403 Forbidden\r\n")
+    );
     let event = assert_primary_record(&exchange, "l7-mcp", 403, "Denied", "/mcp");
     assert!(
         event["message"]
@@ -803,9 +781,10 @@ network_policies:
 
     assert!(
         exchange
+            .output
             .forwarded
             .starts_with(b"POST /graphql HTTP/1.1\r\n")
     );
-    assert!(exchange.response.starts_with(b"HTTP/1.1 200 OK\r\n"));
+    assert!(exchange.output.response.starts_with(b"HTTP/1.1 200 OK\r\n"));
     assert_primary_record(&exchange, "l7-graphql", 200, "Allowed", "/graphql");
 }

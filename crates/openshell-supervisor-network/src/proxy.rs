@@ -15,7 +15,7 @@ mod trace_tests;
 use openshell_sandbox_backend::test_support as rpc_test;
 
 use crate::identity::{BinaryIdentityCache, SuppliedIdentityError};
-use crate::l7::correlation::RequestStage;
+use crate::l7::correlation::{HttpOutcome, RequestStage};
 use crate::l7::tls::ProxyTlsState;
 use crate::opa::{NetworkAction, OpaEngine, PolicyGenerationGuard};
 use crate::policy_dns::{
@@ -2480,9 +2480,7 @@ where
         denial, peer_addr, method, host, port, path, binary, pid, ancestors, cmdline, policy,
     );
     if let Some(correlation) = correlation {
-        correlation.record_enforcement_action("block");
-        correlation.record_final_http_outcome("denied");
-        correlation.record_response_status(403);
+        correlation.record_rejection(403, HttpOutcome::Denied, None);
         correlation.emit(event);
     } else {
         crate::telemetry::emit_decision([event], Some(connect_span));
@@ -5981,27 +5979,26 @@ async fn handle_forward_proxy(
         request_correlation.map(crate::l7::correlation::RequestCorrelation::request_id);
     let mut audited_client = correlation.observe_response(client);
     let client = &mut audited_client;
-    correlation.record_enforcement_action("allow");
-    let mut primary = build_forward_allow_ocsf_event(
-        workload_addr,
-        method,
-        &host_lc,
-        port,
-        &telemetry_path,
-        &binary_str,
-        &pid_str,
-        &ancestors_str,
-        &cmdline_str,
-        policy_str,
-    );
-    if l7_inspected && let openshell_ocsf::OcsfEvent::HttpActivity(event) = &mut primary {
-        event.action = None;
-        event.disposition = None;
-        event.base.status = None;
-        event.firewall_rule = None;
-        event.base.message = Some("FORWARD request awaiting inspection".into());
-    }
     if inspected {
+        let mut primary = build_forward_allow_ocsf_event(
+            workload_addr,
+            method,
+            &host_lc,
+            port,
+            &telemetry_path,
+            &binary_str,
+            &pid_str,
+            &ancestors_str,
+            &cmdline_str,
+            policy_str,
+        );
+        if l7_inspected && let openshell_ocsf::OcsfEvent::HttpActivity(event) = &mut primary {
+            event.action = None;
+            event.disposition = None;
+            event.base.status = None;
+            event.firewall_rule = None;
+            event.base.message = Some("FORWARD request awaiting inspection".into());
+        }
         correlation.emit(primary);
     }
     forward_request_bytes = correlation_request.raw_header;
@@ -6031,9 +6028,7 @@ async fn handle_forward_proxy(
                 ),
             );
             emit_activity_simple(activity_tx, true, "policy_stale");
-            correlation.record_enforcement_action("block");
-            correlation.record_final_http_outcome("denied");
-            correlation.record_response_status(403);
+            correlation.record_rejection(403, HttpOutcome::Denied, None);
             respond(
                 client,
                 &build_json_error_response_with_request_id(
@@ -6060,9 +6055,7 @@ async fn handle_forward_proxy(
                 );
                 emit_l7_tunnel_close_after_policy_change(&host_lc, port, e);
                 emit_activity_simple(activity_tx, true, "policy_stale");
-                correlation.record_enforcement_action("block");
-                correlation.record_final_http_outcome("denied");
-                correlation.record_response_status(403);
+                correlation.record_rejection(403, HttpOutcome::Denied, None);
                 respond(
                     client,
                     &build_json_error_response_with_request_id(
@@ -6081,7 +6074,7 @@ async fn handle_forward_proxy(
         };
 
         let Ok(redacted_path) = secrets::redact_target_for_policy(&path) else {
-            correlation.record_final_http_outcome("platform_error");
+            correlation.record_outcome(HttpOutcome::PlatformError);
             correlation.record_response_status(400);
             respond(
                 client,
@@ -6098,9 +6091,7 @@ async fn handle_forward_proxy(
         };
         let Some(l7_config) = select_l7_config_for_path(&route.configs, &redacted_path) else {
             let reason = "no L7 endpoint path matched request";
-            correlation.record_enforcement_action("block");
-            correlation.record_final_http_outcome("denied");
-            correlation.record_response_status(403);
+            correlation.record_rejection(403, HttpOutcome::Denied, None);
             correlation.emit(
                 HttpActivityBuilder::new(openshell_ocsf::ctx::ctx())
                     .activity(ActivityId::for_http_method(method))
@@ -6159,9 +6150,7 @@ async fn handle_forward_proxy(
         if !l7_config.config.allow_encoded_slash
             && crate::l7::path::canonical_path_has_encoded_slash(&path)
         {
-            correlation.record_enforcement_action("block");
-            correlation.record_final_http_outcome("denied");
-            correlation.record_response_status(400);
+            correlation.record_rejection(400, HttpOutcome::Denied, None);
             correlation.emit(build_forward_inspection_rejection_ocsf_event(
                 method,
                 "invalid_request_target",
@@ -6199,9 +6188,7 @@ async fn handle_forward_proxy(
             &forward_request_bytes,
             l7_config.config.protocol,
         ) {
-            correlation.record_enforcement_action("block");
-            correlation.record_final_http_outcome("denied");
-            correlation.record_response_status(403);
+            correlation.record_rejection(403, HttpOutcome::Denied, None);
             if let Some(observer) = endpoint_observer.as_ref() {
                 observer.observe(EndpointResult::PolicyDenied);
             }
@@ -6286,9 +6273,7 @@ async fn handle_forward_proxy(
             {
                 Ok(info) => info,
                 Err(e) => {
-                    correlation.record_enforcement_action("block");
-                    correlation.record_final_http_outcome("denied");
-                    correlation.record_response_status(400);
+                    correlation.record_rejection(400, HttpOutcome::Denied, None);
                     correlation.emit(build_forward_inspection_rejection_ocsf_event(
                         method,
                         "invalid_graphql_request",
@@ -6346,9 +6331,7 @@ async fn handle_forward_proxy(
                 {
                     Ok(body) => body,
                     Err(e) => {
-                        correlation.record_enforcement_action("block");
-                        correlation.record_final_http_outcome("denied");
-                        correlation.record_response_status(400);
+                        correlation.record_rejection(400, HttpOutcome::Denied, None);
                         correlation.emit(build_forward_inspection_rejection_ocsf_event(
                             method,
                             "invalid_jsonrpc_request",
@@ -6440,13 +6423,11 @@ async fn handle_forward_proxy(
             (false, crate::l7::EnforcementMode::Audit) => "audit",
             (false, crate::l7::EnforcementMode::Enforce) => "deny",
         };
-        correlation.record_enforcement_action(if allowed {
-            "allow"
-        } else if l7_config.config.enforcement == crate::l7::EnforcementMode::Audit && !force_deny {
-            "audit"
-        } else {
-            "block"
-        });
+        if !allowed
+            && (l7_config.config.enforcement != crate::l7::EnforcementMode::Audit || force_deny)
+        {
+            correlation.record_enforcement_block();
+        }
 
         {
             let (action_id, disposition_id, severity) = match decision_str {
@@ -6517,7 +6498,7 @@ async fn handle_forward_proxy(
             || (!allowed && l7_config.config.enforcement == crate::l7::EnforcementMode::Enforce);
 
         if effectively_denied {
-            correlation.record_final_http_outcome("denied");
+            correlation.record_outcome(HttpOutcome::Denied);
             correlation.record_response_status(403);
             emit_activity_simple(activity_tx, true, "l7_policy");
             emit_denial_simple(
@@ -6646,9 +6627,7 @@ async fn handle_forward_proxy(
         );
         emit_l7_tunnel_close_after_policy_change(&host_lc, port, e);
         emit_activity_simple(activity_tx, true, "policy_stale");
-        correlation.record_enforcement_action("block");
-        correlation.record_final_http_outcome("denied");
-        correlation.record_response_status(403);
+        correlation.record_rejection(403, HttpOutcome::Denied, None);
         respond(
             client,
             &build_json_error_response_with_request_id(
@@ -6675,9 +6654,7 @@ async fn handle_forward_proxy(
                 generation,
             ),
         );
-        correlation.record_enforcement_action("block");
-        correlation.record_final_http_outcome("denied");
-        correlation.record_response_status(403);
+        correlation.record_rejection(403, HttpOutcome::Denied, None);
         respond(
             client,
             &build_json_error_response_with_request_id(
@@ -6732,13 +6709,15 @@ async fn handle_forward_proxy(
             crate::l7::middleware::MiddlewareApplyResult::Allowed(request) => request.raw_header,
             crate::l7::middleware::MiddlewareApplyResult::Denied { denial, .. } => {
                 emit_activity_simple(activity_tx, true, "middleware");
-                correlation.record_enforcement_action("block");
-                correlation.record_response_status(403);
-                correlation.record_final_http_outcome(if denial.is_some() {
-                    "denied"
-                } else {
-                    "platform_error"
-                });
+                correlation.record_rejection(
+                    403,
+                    if denial.is_some() {
+                        HttpOutcome::Denied
+                    } else {
+                        HttpOutcome::PlatformError
+                    },
+                    None,
+                );
                 let response = denial.as_ref().map_or_else(
                     || build_middleware_failure_response(&l7_ctx.policy_name, receipt_id),
                     |denial| {
@@ -6750,9 +6729,7 @@ async fn handle_forward_proxy(
             }
             crate::l7::middleware::MiddlewareApplyResult::AdmissionExhausted => {
                 emit_activity_simple(activity_tx, true, "middleware");
-                correlation.record_enforcement_action("block");
-                correlation.record_response_status(503);
-                correlation.record_final_http_outcome("platform_error");
+                correlation.record_rejection(503, HttpOutcome::PlatformError, None);
                 let response =
                     build_middleware_unavailable_response(&l7_ctx.policy_name, receipt_id);
                 respond(client, &response).await?;
@@ -6791,9 +6768,7 @@ async fn handle_forward_proxy(
             Ok(preflight) => preflight,
             Err(error) => {
                 warn!(error = %error, "Plaintext WebSocket middleware preflight failed");
-                correlation.record_enforcement_action("block");
-                correlation.record_response_status(502);
-                correlation.record_final_http_outcome("platform_error");
+                correlation.record_rejection(502, HttpOutcome::PlatformError, None);
                 respond(
                     client,
                     &build_json_error_response_with_request_id(
@@ -6814,13 +6789,15 @@ async fn handle_forward_proxy(
             request_correlation,
         );
         if preflight.terminal_reason.is_some() {
-            correlation.record_enforcement_action("block");
-            correlation.record_response_status(403);
-            correlation.record_final_http_outcome(if preflight.denial.is_some() {
-                "denied"
-            } else {
-                "platform_error"
-            });
+            correlation.record_rejection(
+                403,
+                if preflight.denial.is_some() {
+                    HttpOutcome::Denied
+                } else {
+                    HttpOutcome::PlatformError
+                },
+                None,
+            );
             let response = preflight.denial.as_ref().map_or_else(
                 || build_middleware_failure_response(&l7_ctx.policy_name, receipt_id),
                 |denial| build_middleware_deny_response(&l7_ctx.policy_name, denial, receipt_id),
@@ -6858,9 +6835,7 @@ async fn handle_forward_proxy(
         Err(e) => {
             let refusal =
                 e.downcast_ref::<crate::l7::token_grant_injection::TokenGrantInjectionError>();
-            correlation.record_enforcement_action("block");
-            correlation.record_response_status(502);
-            correlation.record_final_http_outcome("platform_error");
+            correlation.record_rejection(502, HttpOutcome::PlatformError, None);
             if refusal.is_none() {
                 warn!(
                     dst_host = %host_lc,
@@ -6935,8 +6910,8 @@ async fn handle_forward_proxy(
     };
     if let Some(guard) = credential_generation {
         guard.ensure_current().inspect_err(|_| {
-            correlation.record_enforcement_action("block");
-            correlation.record_final_http_outcome("platform_error");
+            correlation.record_enforcement_block();
+            correlation.record_outcome(HttpOutcome::PlatformError);
         })?;
     }
 
@@ -6980,9 +6955,7 @@ async fn handle_forward_proxy(
                 .await?;
                 client.shutdown().await.into_diagnostic()?;
             } else if e.is_endpoint_mismatch() {
-                correlation.record_enforcement_action("block");
-                correlation.record_response_status(403);
-                correlation.record_final_http_outcome("denied");
+                correlation.record_rejection(403, HttpOutcome::Denied, None);
                 if let Some(observer) = endpoint_observer.as_ref() {
                     observer.observe_credential_failure(true);
                 }
@@ -7017,9 +6990,7 @@ async fn handle_forward_proxy(
                 })
                 .await;
             } else {
-                correlation.record_enforcement_action("block");
-                correlation.record_response_status(500);
-                correlation.record_final_http_outcome("platform_error");
+                correlation.record_rejection(500, HttpOutcome::PlatformError, None);
                 respond(
                     client,
                     &build_json_error_response_with_request_id(
@@ -7085,9 +7056,7 @@ async fn handle_forward_proxy(
                 .end(openshell_core::proto::MiddlewareSessionEndReason::PolicyReload)
                 .await;
         }
-        correlation.record_enforcement_action("block");
-        correlation.record_final_http_outcome("denied");
-        correlation.record_response_status(403);
+        correlation.record_rejection(403, HttpOutcome::Denied, None);
         respond(
             client,
             &build_json_error_response_with_request_id(
@@ -7141,7 +7110,7 @@ async fn handle_forward_proxy(
                     .await;
             }
             correlation.record_response_status(502);
-            correlation.record_final_http_outcome("upstream_error");
+            correlation.record_outcome(HttpOutcome::UpstreamError);
             respond(
                 client,
                 &build_json_error_response_with_request_id(
@@ -7174,9 +7143,7 @@ async fn handle_forward_proxy(
                 .end(openshell_core::proto::MiddlewareSessionEndReason::PolicyReload)
                 .await;
         }
-        correlation.record_enforcement_action("block");
-        correlation.record_final_http_outcome("denied");
-        correlation.record_response_status(403);
+        correlation.record_rejection(403, HttpOutcome::Denied, None);
         respond(
             client,
             &build_json_error_response_with_request_id(

@@ -400,7 +400,7 @@ fn report_refused_grant(
             .map_or_else(|| "none".to_string(), |status| status.to_string()),
         "Token grant failed"
     );
-    crate::l7::middleware::emit_request_events(
+    crate::l7::correlation::emit_request_events(
         correlation,
         [HttpActivityBuilder::new(ocsf_ctx())
             .activity(ActivityId::Fail)
@@ -460,7 +460,7 @@ async fn inject_selected(
             inject_header(&raw_header, &name, &value).map_err(TokenGrantInjectionError::new)?;
     }
     for (provider_key, _) in credentials {
-        crate::l7::middleware::emit_request_events(
+        crate::l7::correlation::emit_request_events(
             correlation,
             [HttpActivityBuilder::new(ocsf_ctx())
                 .activity(ActivityId::Other)
