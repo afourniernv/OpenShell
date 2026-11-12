@@ -160,13 +160,10 @@ use openshell_core::proto::{
 };
 use std::collections::{HashMap, VecDeque};
 use std::pin::Pin;
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering},
-};
+use std::sync::Arc;
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tokio::sync::mpsc;
+use tokio::sync::{Notify, mpsc};
 use tokio_stream::wrappers::ReceiverStream;
 
 struct StreamingResponseMiddleware {
@@ -286,11 +283,11 @@ struct ReloadOnBodyReader {
 struct SegmentsThenPendingReader {
     segments: VecDeque<Vec<u8>>,
     segment_position: usize,
-    pending_polled: Arc<AtomicBool>,
+    pending_polled: Arc<Notify>,
 }
 
 impl SegmentsThenPendingReader {
-    fn new(segments: impl IntoIterator<Item = Vec<u8>>, pending_polled: Arc<AtomicBool>) -> Self {
+    fn new(segments: impl IntoIterator<Item = Vec<u8>>, pending_polled: Arc<Notify>) -> Self {
         Self {
             segments: segments.into_iter().collect(),
             segment_position: 0,
@@ -317,19 +314,26 @@ impl AsyncRead for SegmentsThenPendingReader {
             self.segment_position += count;
             return Poll::Ready(Ok(()));
         }
-        self.pending_polled.store(true, Ordering::Release);
+        self.pending_polled.notify_one();
         Poll::Pending
     }
 }
 
-async fn wait_for_pending_read(pending_polled: &AtomicBool) {
-    tokio::time::timeout(std::time::Duration::from_millis(100), async {
-        while !pending_polled.load(Ordering::Acquire) {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("response relay reached the pending read");
+async fn wait_for_pending_read(pending_polled: &Notify) {
+    tokio::time::timeout(std::time::Duration::from_secs(5), pending_polled.notified())
+        .await
+        .expect("response relay reached the pending read");
+}
+
+async fn cancel_after_pending_read(
+    operation: impl Future<Output = miette::Result<RelayOutcome>>,
+    pending_polled: &Notify,
+) {
+    let mut operation = Box::pin(operation);
+    tokio::select! {
+        result = &mut operation => panic!("response finished before cancellation: {result:?}"),
+        () = wait_for_pending_read(pending_polled) => {}
+    }
 }
 
 impl ReloadOnBodyReader {
@@ -982,25 +986,25 @@ fn response_audit_event_for(
     capture: &openshell_ocsf::test_support::OcsfCapture,
     request_id: &str,
 ) -> serde_json::Value {
-    let mut events = capture
+    let (mut terminal, mut primary): (Vec<_>, Vec<_>) = capture
         .json_events()
         .into_iter()
         .filter(|event| {
-            event["class_uid"] == 4002 && event["metadata"]["correlation_uid"] == request_id
+            event["class_uid"] == 4002
+                && event["metadata"]["correlation_uid"] == request_id
+                && event["firewall_rule"]["type"] != "supervisor-middleware"
         })
-        .collect::<Vec<_>>();
-    let terminal = events
-        .iter()
-        .position(|event| event["firewall_rule"]["type"] == "response-correlation");
-    if let Some(index) = terminal {
-        return events.remove(index);
+        .partition(|event| event["firewall_rule"]["type"] == "response-correlation");
+    assert_eq!(primary.len(), 1, "one primary record for the request");
+    if terminal.is_empty() {
+        return primary.pop().unwrap();
     }
     assert_eq!(
-        events.len(),
+        terminal.len(),
         1,
-        "one primary record when no post-header exception exists"
+        "one post-header exception for the request"
     );
-    events.pop().expect("primary event")
+    terminal.pop().unwrap()
 }
 
 fn request_id_header_count(response: &[u8]) -> usize {
@@ -1047,11 +1051,11 @@ async fn cancellation_before_final_head_emits_one_incomplete_terminal_event() {
     let _subscriber = tracing::subscriber::set_default(subscriber);
     tracing::callsite::rebuild_interest_cache();
     let correlation = test_correlation("response-cancel-before-head");
-    let (mut upstream, _upstream_peer) = tokio::io::duplex(64);
+    let pending_polled = Arc::new(Notify::new());
+    let mut upstream = SegmentsThenPendingReader::new([], Arc::clone(&pending_polled));
     let mut client = Vec::new();
 
-    tokio::time::timeout(
-        std::time::Duration::from_millis(10),
+    cancel_after_pending_read(
         relay_response(
             "GET",
             &mut upstream,
@@ -1062,9 +1066,9 @@ async fn cancellation_before_final_head_emits_one_incomplete_terminal_event() {
             },
             None,
         ),
+        &pending_polled,
     )
-    .await
-    .expect_err("relay remains pending before final head");
+    .await;
     drop(correlation);
 
     let event = response_audit_event_for(&capture, "response-cancel-before-head");
@@ -1188,7 +1192,6 @@ async fn invalid_websocket_handshake_is_a_correlated_upstream_protocol_failure()
 
 #[tokio::test]
 async fn whole_body_cancellation_before_selection_has_no_effective_status() {
-    use tokio::io::AsyncWriteExt as _;
     use tracing_subscriber::layer::SubscriberExt as _;
 
     let capture = openshell_ocsf::test_support::OcsfCapture::default();
@@ -1210,15 +1213,14 @@ async fn whole_body_cancellation_before_selection_has_no_effective_status() {
         on_error: openshell_supervisor_middleware::OnError::FailClosed,
     }];
     let middleware = test_response_middleware(&runner, &chain, "response-whole-body-cancel");
-    let (mut upstream, mut upstream_peer) = tokio::io::duplex(256);
-    upstream_peer
-        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 8\r\n\r\nbody")
-        .await
-        .expect("seed partial response");
+    let pending_polled = Arc::new(Notify::new());
+    let mut upstream = SegmentsThenPendingReader::new(
+        [b"HTTP/1.1 200 OK\r\nContent-Length: 8\r\n\r\nbody".to_vec()],
+        Arc::clone(&pending_polled),
+    );
     let mut client = Vec::new();
 
-    tokio::time::timeout(
-        std::time::Duration::from_millis(20),
+    cancel_after_pending_read(
         relay_response(
             "GET",
             &mut upstream,
@@ -1229,9 +1231,9 @@ async fn whole_body_cancellation_before_selection_has_no_effective_status() {
             },
             Some(middleware),
         ),
+        &pending_polled,
     )
-    .await
-    .expect_err("whole-body response remains pending");
+    .await;
     assert!(client.is_empty());
     drop(correlation);
 
@@ -1315,7 +1317,6 @@ async fn whole_body_fail_open_timeout_selects_upstream_response_on_commit() {
 
 #[tokio::test]
 async fn accepted_early_hints_are_separate_from_cancelled_final_delivery() {
-    use tokio::io::AsyncWriteExt as _;
     use tracing_subscriber::layer::SubscriberExt as _;
 
     let capture = openshell_ocsf::test_support::OcsfCapture::default();
@@ -1323,15 +1324,14 @@ async fn accepted_early_hints_are_separate_from_cancelled_final_delivery() {
     let _subscriber = tracing::subscriber::set_default(subscriber);
     tracing::callsite::rebuild_interest_cache();
     let correlation = test_correlation("response-early-hints-cancel");
-    let (mut upstream, mut upstream_peer) = tokio::io::duplex(256);
-    upstream_peer
-        .write_all(b"HTTP/1.1 103 Early Hints\r\nLink: </style.css>\r\n\r\n")
-        .await
-        .expect("seed early hints");
+    let pending_polled = Arc::new(Notify::new());
+    let mut upstream = SegmentsThenPendingReader::new(
+        [b"HTTP/1.1 103 Early Hints\r\nLink: </style.css>\r\n\r\n".to_vec()],
+        Arc::clone(&pending_polled),
+    );
     let mut client = Vec::new();
 
-    tokio::time::timeout(
-        std::time::Duration::from_millis(10),
+    cancel_after_pending_read(
         relay_response(
             "GET",
             &mut upstream,
@@ -1342,9 +1342,9 @@ async fn accepted_early_hints_are_separate_from_cancelled_final_delivery() {
             },
             None,
         ),
+        &pending_polled,
     )
-    .await
-    .expect_err("relay remains pending after early hints");
+    .await;
     assert!(client.starts_with(b"HTTP/1.1 103 Early Hints\r\n"));
     drop(correlation);
 
@@ -1458,7 +1458,7 @@ async fn idle_before_final_response_head_wakes_on_policy_reload() {
     let chain = Vec::new();
     let mut middleware = test_response_middleware(&runner, &chain, request_id);
     middleware.generation_guard = Some(&generation_guard);
-    let pending_polled = Arc::new(AtomicBool::new(false));
+    let pending_polled = Arc::new(Notify::new());
     let mut upstream =
         SegmentsThenPendingReader::new(Vec::<Vec<u8>>::new(), Arc::clone(&pending_polled));
     let mut client = Vec::new();
@@ -1483,7 +1483,7 @@ async fn idle_before_final_response_head_wakes_on_policy_reload() {
             "network_policies: {}\n",
         )
         .expect("reload test policy");
-    let error = tokio::time::timeout(std::time::Duration::from_millis(100), &mut relay)
+    let error = tokio::time::timeout(std::time::Duration::from_secs(5), &mut relay)
         .await
         .expect("policy reload wakes the response-head read")
         .expect_err("policy reload stops the response");
@@ -1559,7 +1559,7 @@ async fn framed_response_reads_wake_on_policy_reload_without_stale_body_bytes() 
         let chain = Vec::new();
         let mut middleware = test_response_middleware(&runner, &chain, &request_id);
         middleware.generation_guard = Some(&generation_guard);
-        let pending_polled = Arc::new(AtomicBool::new(false));
+        let pending_polled = Arc::new(Notify::new());
         let mut upstream = SegmentsThenPendingReader::new(segments, Arc::clone(&pending_polled));
         let mut client = Vec::new();
         let mut relay = Box::pin(relay_response(
@@ -1585,7 +1585,7 @@ async fn framed_response_reads_wake_on_policy_reload_without_stale_body_bytes() 
                 "network_policies: {}\n",
             )
             .expect("reload test policy");
-        let error = tokio::time::timeout(std::time::Duration::from_millis(100), &mut relay)
+        let error = tokio::time::timeout(std::time::Duration::from_secs(5), &mut relay)
             .await
             .expect("policy reload wakes the framed response read")
             .expect_err("policy reload stops the response");

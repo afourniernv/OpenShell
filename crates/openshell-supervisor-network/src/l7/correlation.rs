@@ -583,31 +583,21 @@ impl RequestCorrelation {
 
     pub(crate) fn record_response_status(&self, status: u16) {
         self.span.record("http.response.status_code", status);
-        self.state
+        let mut state = self
+            .state
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .status = Some(status);
-        self.state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .response
-            .effective_status = Some(status);
-    }
-
-    pub(crate) fn record_upstream_status(&self, status: u16) {
-        self.state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .upstream_status = Some(status);
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.status = Some(status);
+        state.response.effective_status = Some(status);
     }
 
     pub(crate) fn record_upstream_response_status(&self, status: u16) {
-        self.record_upstream_status(status);
         let span = {
             let mut state = self
                 .state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.upstream_status = Some(status);
             state.response.upstream_status = Some(status);
             state.upstream_span.clone()
         };
@@ -1351,32 +1341,29 @@ impl RequestCorrelation {
             }
         };
 
+        let span = self.delivery_span();
         if let Some(status) = snapshot.upstream_status {
-            self.delivery_span()
-                .record("openshell.upstream.http.response.status_code", status);
+            span.record("openshell.upstream.http.response.status_code", status);
         }
         if let Some(status) = snapshot.effective_status {
-            self.delivery_span()
-                .record("http.response.status_code", status);
+            span.record("http.response.status_code", status);
         }
-        self.delivery_span().record(
+        span.record(
             "openshell.response.selection_cause",
             snapshot.selection_cause.as_str(),
         );
-        self.delivery_span()
-            .record("openshell.response.delivery_outcome", delivery.as_str());
-        self.delivery_span().record(
+        span.record("openshell.response.delivery_outcome", delivery.as_str());
+        span.record(
             "openshell.response.delivery_started",
             snapshot.delivery_started,
         );
-        self.delivery_span().record(
+        span.record(
             "openshell.response.partial_delivery",
             snapshot.partial_delivery,
         );
-        self.delivery_span()
-            .record("openshell.http.outcome", snapshot.http_outcome);
+        span.record("openshell.http.outcome", snapshot.http_outcome);
         if let Some(stage) = snapshot.error_stage {
-            self.delivery_span().record("openshell.error.stage", stage);
+            span.record("openshell.error.stage", stage);
         }
 
         self.record_final_http_outcome(snapshot.http_outcome);
@@ -1384,7 +1371,7 @@ impl RequestCorrelation {
             || snapshot.http_outcome != "allowed"
         {
             openshell_otel::mark_error(&self.span);
-            openshell_otel::mark_error(&self.delivery_span());
+            openshell_otel::mark_error(&span);
         }
         let committed = self
             .state
@@ -1398,8 +1385,7 @@ impl RequestCorrelation {
         {
             let mut event = response_terminal_event(&self.event_context, snapshot);
             self.enrich_event(&mut event);
-            self.delivery_span()
-                .in_scope(|| crate::telemetry::emit_correlated(event));
+            span.in_scope(|| crate::telemetry::emit_correlated(event));
         }
     }
 

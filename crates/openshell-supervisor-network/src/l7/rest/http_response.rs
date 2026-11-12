@@ -1816,25 +1816,18 @@ async fn write_correlated_interim_bytes<C: AsyncWrite + Unpin>(
     bytes: &[u8],
     correlation: Option<&RequestCorrelation>,
 ) -> Result<()> {
-    let mut written = 0usize;
-    while written < bytes.len() {
-        let count = client
-            .write(&bytes[written..])
-            .await
-            .map_err(RelayError::interim_write)?;
-        if count == 0 {
-            return Err(RelayError::interim_write(std::io::Error::new(
-                std::io::ErrorKind::WriteZero,
-                "failed to write interim HTTP response bytes",
-            ))
-            .into());
-        }
-        if let Some(correlation) = correlation {
-            correlation.record_interim_response_delivery(count);
-        }
-        written += count;
-    }
-    Ok(())
+    write_observed_response_bytes(
+        client,
+        bytes,
+        RelayError::interim_write,
+        "failed to write interim HTTP response bytes",
+        |count, _| {
+            if let Some(correlation) = correlation {
+                correlation.record_interim_response_delivery(count);
+            }
+        },
+    )
+    .await
 }
 
 async fn write_correlated_response_bytes<C: AsyncWrite + Unpin>(
@@ -1843,29 +1836,23 @@ async fn write_correlated_response_bytes<C: AsyncWrite + Unpin>(
     correlation: Option<&RequestCorrelation>,
     middleware_selected: bool,
 ) -> Result<()> {
-    let mut written = 0usize;
-    while written < bytes.len() {
-        let count = client
-            .write(&bytes[written..])
-            .await
-            .map_err(RelayError::write)?;
-        if count == 0 {
-            return Err(RelayError::write(std::io::Error::new(
-                std::io::ErrorKind::WriteZero,
-                "failed to write HTTP response bytes",
-            ))
-            .into());
-        }
-        if written == 0 {
+    write_observed_response_bytes(
+        client,
+        bytes,
+        RelayError::write,
+        "failed to write HTTP response bytes",
+        |_, first| {
+            if !first {
+                return;
+            }
             if middleware_selected {
                 record_response_middleware_delivery_started(correlation);
             } else {
                 record_response_delivery_started(correlation);
             }
-        }
-        written += count;
-    }
-    Ok(())
+        },
+    )
+    .await
 }
 
 async fn write_correlated_response_commit<C: AsyncWrite + Unpin>(
@@ -1874,23 +1861,39 @@ async fn write_correlated_response_commit<C: AsyncWrite + Unpin>(
     correlation: Option<&RequestCorrelation>,
     committed: &mut bool,
 ) -> Result<()> {
+    write_observed_response_bytes(
+        client,
+        bytes,
+        RelayError::write,
+        "failed to write HTTP response bytes",
+        |_, _| {
+            if !*committed {
+                *committed = true;
+                record_response_middleware_delivery_started(correlation);
+            }
+        },
+    )
+    .await
+}
+
+async fn write_observed_response_bytes<C: AsyncWrite + Unpin>(
+    client: &mut C,
+    bytes: &[u8],
+    write_error: fn(std::io::Error) -> RelayError,
+    zero_message: &'static str,
+    mut accepted: impl FnMut(usize, bool),
+) -> Result<()> {
     let mut written = 0usize;
     while written < bytes.len() {
-        let count = client
-            .write(&bytes[written..])
-            .await
-            .map_err(RelayError::write)?;
+        let count = client.write(&bytes[written..]).await.map_err(write_error)?;
         if count == 0 {
-            return Err(RelayError::write(std::io::Error::new(
+            return Err(write_error(std::io::Error::new(
                 std::io::ErrorKind::WriteZero,
-                "failed to write HTTP response bytes",
+                zero_message,
             ))
             .into());
         }
-        if !*committed {
-            *committed = true;
-            record_response_middleware_delivery_started(correlation);
-        }
+        accepted(count, written == 0);
         written += count;
     }
     Ok(())
