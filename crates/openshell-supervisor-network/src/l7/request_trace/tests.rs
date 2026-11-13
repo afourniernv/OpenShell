@@ -142,6 +142,7 @@ fn every_outcome_has_the_same_root_shape_and_stages_have_fixed_names() {
         RequestStage::UpstreamSend,
         RequestStage::Response,
         RequestStage::ResponseMiddleware,
+        RequestStage::McpInspect,
     ];
     for (outcome, failed) in [
         (HttpOutcome::Allowed, false),

@@ -101,3 +101,9 @@ Credential preparation enriches operation-owned child spans with the mechanism,
 placement and bounded outcome, never secret material. The primary audit record
 includes notable credential outcomes; successful preparation does not create an
 extra routine record or establish that the target received the request.
+
+MCP and JSON-RPC inspection spans cover each actual parse or reinspection,
+including transport-selected schemas and middleware-transformed bodies. They
+record bounded classifications, counts and revisions, never arguments, tool
+names or raw errors. Dedicated body inspection starts after the request UUID and
+configuration identities are assigned.

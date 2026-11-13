@@ -32,6 +32,7 @@ pub enum RequestStage {
     UpstreamSend,
     Response,
     ResponseMiddleware,
+    McpInspect,
 }
 
 impl RequestStage {
@@ -46,6 +47,7 @@ impl RequestStage {
             Self::UpstreamSend => "openshell.upstream.send",
             Self::Response => "openshell.http.response",
             Self::ResponseMiddleware => "openshell.middleware.response",
+            Self::McpInspect => "openshell.mcp.inspect",
         }
     }
 }
@@ -126,6 +128,25 @@ impl RequestTrace {
                 openshell.credential.static_placeholder.outcome = tracing::field::Empty,
                 openshell.credential.token_grant.outcome = tracing::field::Empty,
                 openshell.credential.sigv4.outcome = tracing::field::Empty,
+            );
+        }
+        if matches!(stage, RequestStage::McpInspect) {
+            return tracing::info_span!(
+                parent: &self.span,
+                "openshell.http.stage",
+                otel.name = stage.name(),
+                otel.status_code = tracing::field::Empty,
+                openshell.l7.protocol = tracing::field::Empty,
+                openshell.jsonrpc.effective.message_kind = tracing::field::Empty,
+                openshell.jsonrpc.effective.inspection_outcome = "incomplete",
+                openshell.jsonrpc.effective.call_count = tracing::field::Empty,
+                openshell.jsonrpc.effective.notification_count = tracing::field::Empty,
+                openshell.jsonrpc.effective.counts_truncated = tracing::field::Empty,
+                openshell.jsonrpc.effective.has_response = tracing::field::Empty,
+                openshell.mcp.selected_protocol_revision = tracing::field::Empty,
+                openshell.mcp.effective.protocol_revision = tracing::field::Empty,
+                openshell.mcp.effective.method_classification = tracing::field::Empty,
+                openshell.mcp.tools_call_observed = tracing::field::Empty,
             );
         }
         tracing::info_span!(

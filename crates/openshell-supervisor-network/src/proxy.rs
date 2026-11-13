@@ -6376,48 +6376,41 @@ async fn handle_forward_proxy(
                 raw_header: forward_request_bytes,
                 body_length,
             };
-            let info = if crate::l7::jsonrpc::jsonrpc_receive_stream_request(&jsonrpc_request) {
-                crate::l7::jsonrpc::JsonRpcRequestInfo::receive_stream()
-            } else {
-                let body = match crate::l7::http::read_body_for_inspection(
-                    client,
-                    &mut jsonrpc_request,
-                    l7_config.config.json_rpc_max_body_bytes,
-                )
-                .await
-                {
-                    Ok(body) => body,
-                    Err(e) => {
-                        correlation.record_rejection(400, HttpOutcome::Denied, None);
-                        correlation.emit(build_forward_inspection_rejection_ocsf_event(
-                            method,
+            let info = match crate::l7::relay::inspect_jsonrpc_request_correlated(
+                &l7_config.config,
+                client,
+                &mut jsonrpc_request,
+                request_correlation,
+            )
+            .await
+            {
+                Ok(info) => info,
+                Err(e) => {
+                    correlation.record_rejection(400, HttpOutcome::Denied, None);
+                    correlation.emit(build_forward_inspection_rejection_ocsf_event(
+                        method,
+                        "invalid_jsonrpc_request",
+                    ));
+                    let event = build_forward_rejection_event(
+                        &host_lc,
+                        port,
+                        format!("FORWARD_JSONRPC_L7 request rejected: {e}"),
+                    );
+                    correlation.emit(event);
+                    emit_activity_simple(activity_tx, true, "l7_parse_rejection");
+                    respond(
+                        client,
+                        &build_json_error_response_with_request_id(
+                            400,
+                            "Bad Request",
                             "invalid_jsonrpc_request",
-                        ));
-                        let event = build_forward_rejection_event(
-                            &host_lc,
-                            port,
-                            format!("FORWARD_JSONRPC_L7 request rejected: {e}"),
-                        );
-                        correlation.emit(event);
-                        emit_activity_simple(activity_tx, true, "l7_parse_rejection");
-                        respond(
-                            client,
-                            &build_json_error_response_with_request_id(
-                                400,
-                                "Bad Request",
-                                "invalid_jsonrpc_request",
-                                &format!("JSON-RPC request rejected before policy evaluation: {e}"),
-                                receipt_id,
-                            ),
-                        )
-                        .await?;
-                        return Ok(());
-                    }
-                };
-                crate::l7::jsonrpc::parse_jsonrpc_body_with_options(
-                    &body,
-                    crate::l7::jsonrpc::JsonRpcInspectionOptions::for_config(&l7_config.config),
-                )
+                            &format!("JSON-RPC request rejected before policy evaluation: {e}"),
+                            receipt_id,
+                        ),
+                    )
+                    .await?;
+                    return Ok(());
+                }
             };
             // Policy evaluation must use the selected revision's inspection,
             // including method classification, just as the CONNECT relays do.

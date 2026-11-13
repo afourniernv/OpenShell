@@ -23,6 +23,7 @@ use crate::l7::request_trace::RequestTrace;
 
 mod resources;
 use resources::RequestResources;
+mod jsonrpc;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HttpOutcome {
@@ -67,6 +68,7 @@ struct RequestState {
     middleware: [Option<MiddlewareState>; 2],
     credential: CredentialState,
     resources: RequestResources,
+    jsonrpc: jsonrpc::JsonRpcObservations,
 }
 
 pub struct CredentialPreparation<'a> {

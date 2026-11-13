@@ -83,6 +83,11 @@ and selected request and response middleware phases appear as children. Valid W3
 Malformed or duplicate headers are ignored. Caller sampling flags do not control
 local enforcement telemetry. OpenShell does not adopt `tracestate`.
 
+MCP and JSON-RPC add `openshell.mcp.inspect` children for actual inspection passes.
+These record bounded message counts, classification, protocol revision and
+inspection result, not tool names, arguments or payloads. A request may have
+several passes when transport selection or middleware requires reinspection.
+
 OpenShell assigns its own request ID, includes it in the span and related OCSF
 records, and returns it as `X-OpenShell-Request-ID`. This header is a correlation
 handle, not authorization or proof of delivery. Match it to trusted OpenShell
