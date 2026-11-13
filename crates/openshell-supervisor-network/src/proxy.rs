@@ -6958,11 +6958,9 @@ async fn handle_forward_proxy(
         } else {
             tracing::Span::none()
         };
-    let preparation = crate::l7::correlation::CredentialPreparation::new(
-        request_correlation,
-        credential_stage.clone(),
-    );
-    let endpoint_credentials = credential_stage.in_scope(|| {
+    let preparation =
+        crate::l7::correlation::CredentialPreparation::new(request_correlation, credential_stage);
+    let endpoint_credentials = preparation.span().in_scope(|| {
         if forward_l7_reeval.is_some() {
             ForwardEndpointCredentials {
                 resolver: l7_ctx.secret_resolver.clone(),
@@ -6999,7 +6997,7 @@ async fn handle_forward_proxy(
     }
 
     // 9. Rewrite request and forward to upstream
-    let rewrite = credential_stage.in_scope(|| {
+    let rewrite = preparation.span().in_scope(|| {
         rewrite_forward_request_correlated(
             &forward_request_bytes,
             forward_request_bytes.len(),
@@ -7025,10 +7023,9 @@ async fn handle_forward_proxy(
         );
     }
     if rewrite.is_err() {
-        egress::mark_error(&credential_stage);
+        egress::mark_error(preparation.span());
     }
     drop(preparation);
-    drop(credential_stage);
     let rewritten = match rewrite {
         Ok((bytes, _)) => bytes,
         Err(e) => {
