@@ -10,6 +10,10 @@ use std::task::{Context, Poll};
 use tracing::instrument::WithSubscriber as _;
 
 fn correlation() -> RequestCorrelation {
+    correlation_for_method("GET")
+}
+
+fn correlation_for_method(method: &str) -> RequestCorrelation {
     let context = L7EvalContext {
         host: "api.example.test".into(),
         port: 443,
@@ -17,10 +21,11 @@ fn correlation() -> RequestCorrelation {
         ..Default::default()
     };
     let request = L7Request {
-        action: "GET".into(),
+        action: method.into(),
         target: "/report".into(),
         query_params: HashMap::new(),
-        raw_header: b"GET /report HTTP/1.1\r\nHost: api.example.test\r\n\r\n".to_vec(),
+        raw_header: format!("{method} /report HTTP/1.1\r\nHost: api.example.test\r\n\r\n")
+            .into_bytes(),
         body_length: BodyLength::None,
     };
     let correlation = RequestCorrelation::new(&request, &context);
@@ -31,7 +36,7 @@ fn correlation() -> RequestCorrelation {
     correlation.emit(
         openshell_ocsf::HttpActivityBuilder::new(ocsf_ctx())
             .http_request(openshell_ocsf::HttpRequest::new(
-                "GET",
+                method,
                 context.ocsf_url("/report"),
             ))
             .dst_endpoint(openshell_ocsf::Endpoint::from_domain(
@@ -189,6 +194,41 @@ async fn primary_headers_and_terminal_delivery_are_independent_of_export() {
             }
             capture.shutdown();
         }
+    }
+}
+
+#[tokio::test]
+async fn terminal_audit_methods_preserve_standard_and_bound_custom_values() {
+    for (method, expected) in [("GET", "GET"), ("POST", "POST"), ("PROPFIND", "OTHER")] {
+        let capture = RequestTracing::new(Some(Sampler::AlwaysOn));
+        async {
+            let correlation = correlation_for_method(method);
+            let mut upstream = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhi".as_slice();
+            let mut output = Vec::new();
+            let mut client = correlation.observe_response(&mut output);
+            relay_response(
+                method,
+                &mut upstream,
+                &mut client,
+                RelayResponseOptions {
+                    correlation: Some(&correlation),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect_err("truncated body produces a terminal record");
+        }
+        .with_subscriber(capture.subscriber())
+        .await;
+        assert_records(&capture, Some(200), 1, "cancelled_or_incomplete");
+        let events = capture.events.json_events();
+        let terminal = events
+            .iter()
+            .find(|event| event["firewall_rule"]["type"] == "response-correlation")
+            .unwrap();
+        assert_eq!(terminal["http_request"]["http_method"], expected);
+        capture.shutdown();
     }
 }
 

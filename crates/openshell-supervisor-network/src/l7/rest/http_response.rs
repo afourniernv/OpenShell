@@ -483,7 +483,7 @@ fn classify_response_failure(error: &miette::Report) -> ResponseFailure {
                 HttpOutcome::UpstreamError,
                 "upstream_response_protocol",
             ),
-            RelayError::PolicyReloaded(_) => (
+            RelayError::PolicyReloaded => (
                 ResponseCause::PolicyReloaded,
                 HttpOutcome::PlatformError,
                 "response_policy_reload",

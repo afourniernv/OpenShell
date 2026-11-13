@@ -115,8 +115,8 @@ enum RelayError {
     Truncated(&'static str),
     #[error("{0}")]
     Protocol(String),
-    #[error("{0}")]
-    PolicyReloaded(String),
+    #[error("policy generation changed")]
+    PolicyReloaded,
 }
 
 impl miette::Diagnostic for RelayError {}
@@ -133,7 +133,7 @@ async fn guarded_relay_read<T>(
         result = &mut read => result,
         () = guard.wait_until_stale() => {
             if guard.is_stale() {
-                Err(RelayError::PolicyReloaded("policy generation changed".into()).into())
+                Err(RelayError::PolicyReloaded.into())
             } else { read.await }
         }
     }

@@ -5,8 +5,8 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 
 use openshell_ocsf::{
-    ActionId, DispositionId, Endpoint, HttpActivityBuilder, HttpRequest, HttpResponse, OcsfEvent,
-    SeverityId, StatusId,
+    ActionId, DispositionId, Endpoint, HttpActivityBuilder, HttpMethod, HttpRequest, HttpResponse,
+    OcsfEvent, SeverityId, StatusId,
 };
 use tokio::io::AsyncWrite;
 
@@ -82,7 +82,7 @@ struct Completion {
 
 #[derive(Debug)]
 struct AuditContext {
-    method: &'static str,
+    method: HttpMethod,
     destination: Option<Endpoint>,
     policy: String,
 }
@@ -201,20 +201,14 @@ impl<'a> ResponseDelivery<'a> {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             let context = state.primary.as_ref().and_then(|event| match event {
                 OcsfEvent::HttpActivity(http) => Some(AuditContext {
-                    method: http.http_request.as_ref().map_or("OTHER", |request| {
-                        match request.http_method.as_str() {
-                            "GET" => "GET",
-                            "HEAD" => "HEAD",
-                            "POST" => "POST",
-                            "PUT" => "PUT",
-                            "DELETE" => "DELETE",
-                            "CONNECT" => "CONNECT",
-                            "OPTIONS" => "OPTIONS",
-                            "TRACE" => "TRACE",
-                            "PATCH" => "PATCH",
-                            _ => "OTHER",
-                        }
-                    }),
+                    method: match http
+                        .http_request
+                        .as_ref()
+                        .map(|request| &request.http_method)
+                    {
+                        Some(HttpMethod::Other(_)) | None => HttpMethod::Other("OTHER".into()),
+                        Some(method) => method.clone(),
+                    },
                     destination: http.dst_endpoint.clone(),
                     policy: http
                         .firewall_rule
@@ -341,7 +335,9 @@ impl<'a> ResponseDelivery<'a> {
             && let Some(context) = context
         {
             let mut event = HttpActivityBuilder::new(openshell_ocsf::ctx::ctx())
-                .activity(openshell_ocsf::ActivityId::for_http_method(context.method))
+                .activity(openshell_ocsf::ActivityId::for_http_method(
+                    context.method.as_str(),
+                ))
                 .action(ActionId::Observed)
                 .disposition(DispositionId::Logged)
                 .severity(
@@ -359,7 +355,7 @@ impl<'a> ResponseDelivery<'a> {
                     },
                 )
                 .http_request(HttpRequest {
-                    http_method: context.method.parse().expect("bounded HTTP method"),
+                    http_method: context.method,
                     url: None,
                 })
                 .firewall_rule(&context.policy, "response-correlation")

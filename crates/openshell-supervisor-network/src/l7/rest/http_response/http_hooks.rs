@@ -72,7 +72,7 @@ impl BodyRelayError {
             Self::Upstream(error)
                 if matches!(
                     error.downcast_ref::<RelayError>(),
-                    Some(RelayError::PolicyReloaded(_))
+                    Some(RelayError::PolicyReloaded)
                 ) =>
             {
                 MiddlewareSessionEndReason::PolicyReload
@@ -89,7 +89,7 @@ impl BodyRelayError {
             Self::Upstream(error)
                 if matches!(
                     error.downcast_ref::<RelayError>(),
-                    Some(RelayError::PolicyReloaded(_))
+                    Some(RelayError::PolicyReloaded)
                 ) =>
             {
                 (HttpOutcome::PlatformError, "policy_generation_changed")
@@ -566,7 +566,7 @@ fn record_relay_error(correlation: Option<&RequestCorrelation>, error: &BodyRela
             BodyRelayError::Upstream(error) => match error.downcast_ref::<RelayError>() {
                 Some(RelayError::Truncated(_)) => ResponseCause::UpstreamTruncated,
                 Some(RelayError::Read(_)) => ResponseCause::UpstreamIoError,
-                Some(RelayError::PolicyReloaded(_)) => ResponseCause::PolicyReloaded,
+                Some(RelayError::PolicyReloaded) => ResponseCause::PolicyReloaded,
                 _ => ResponseCause::UpstreamProtocolError,
             },
             BodyRelayError::PolicyReload(_) => ResponseCause::PolicyReloaded,
