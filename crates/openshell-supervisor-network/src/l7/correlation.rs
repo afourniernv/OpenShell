@@ -826,6 +826,16 @@ impl RequestCorrelation {
                 .state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if is_middleware_invocation(&incoming) {
+                if incoming.action == Some(ActionId::Denied)
+                    && let Some(OcsfEvent::HttpActivity(primary)) = &mut state.primary
+                {
+                    merge_middleware_denial(primary, &incoming);
+                }
+                drop(state);
+                self.emit_correlated(OcsfEvent::HttpActivity(incoming));
+                return;
+            }
             if !state.seeded && state.primary.is_some() {
                 state.primary = Some(OcsfEvent::HttpActivity(incoming));
                 state.seeded = true;
@@ -922,13 +932,16 @@ impl RequestCorrelation {
             if let Some(code) = status {
                 http.http_response = Some(HttpResponse { code });
             }
-            if let Some(upstream) = upstream_status.filter(|upstream| Some(*upstream) != status)
-                && let serde_json::Value::Object(unmapped) = http
-                    .base
-                    .unmapped
-                    .get_or_insert_with(|| serde_json::json!({}))
+            if let serde_json::Value::Object(unmapped) = http
+                .base
+                .unmapped
+                .get_or_insert_with(|| serde_json::json!({}))
             {
-                unmapped.insert("upstream_response_code".into(), serde_json::json!(upstream));
+                unmapped.insert("http_event_kind".into(), "request".into());
+                if let Some(upstream) = upstream_status.filter(|upstream| Some(*upstream) != status)
+                {
+                    unmapped.insert("upstream_response_code".into(), serde_json::json!(upstream));
+                }
             }
             if blocked || outcome == Some(HttpOutcome::Denied) {
                 if http.action != Some(ActionId::Denied) {
@@ -978,7 +991,9 @@ impl RequestCorrelation {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             state.resources.enrich(&mut event);
             state.trace.as_mut().map(|trace| {
-                if let OcsfEvent::HttpActivity(http) = &event {
+                if let OcsfEvent::HttpActivity(http) = &event
+                    && !is_middleware_invocation(http)
+                {
                     trace.observe_http(http);
                 }
                 trace.span()
@@ -1003,6 +1018,32 @@ pub fn emit_request_events(
 
 fn is_failure(event: &HttpActivityEvent) -> bool {
     event.action == Some(ActionId::Denied) || event.base.status == Some(StatusId::Failure)
+}
+
+fn is_middleware_invocation(event: &HttpActivityEvent) -> bool {
+    event
+        .base
+        .unmapped
+        .as_ref()
+        .and_then(|fields| fields.get("http_event_kind"))
+        .and_then(serde_json::Value::as_str)
+        == Some("middleware_invocation")
+}
+
+fn merge_middleware_denial(primary: &mut HttpActivityEvent, invocation: &HttpActivityEvent) {
+    primary.action = invocation.action;
+    primary.disposition = invocation.disposition;
+    primary.base.status = Some(StatusId::Failure);
+    raise_severity(primary, invocation.base.severity);
+    if invocation.base.message.is_some() {
+        primary.base.message.clone_from(&invocation.base.message);
+    }
+    if invocation.base.status_detail.is_some() {
+        primary
+            .base
+            .status_detail
+            .clone_from(&invocation.base.status_detail);
+    }
 }
 
 fn raise_severity(event: &mut HttpActivityEvent, severity: SeverityId) {
@@ -1169,16 +1210,18 @@ pub fn emit_phase_events(
     };
     for mut event in events {
         if let OcsfEvent::HttpActivity(http) = &event {
-            // Routine invocation records belong to the phase span. A late
-            // failure is separate from the already-written primary record.
-            let emitted = correlation
-                .state
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .primary
-                .is_none();
-            if !emitted || http.base.status != Some(StatusId::Failure) {
+            if !is_middleware_invocation(http) {
+                correlation.emit(event);
                 continue;
+            }
+            if http.action == Some(ActionId::Denied)
+                && let Some(OcsfEvent::HttpActivity(primary)) = &mut correlation
+                    .state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .primary
+            {
+                merge_middleware_denial(primary, http);
             }
         }
         correlation
