@@ -8258,6 +8258,126 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn hook_response_correlation_separates_denial_failure_and_mutation() {
+        use crate::test_support::request_tracing::RequestTracing;
+        use opentelemetry_sdk::trace::Sampler;
+        use tracing::instrument::WithSubscriber as _;
+
+        for (declared, reject, expected) in [
+            (5, false, "allowed"),
+            (5, true, "denied"),
+            (4, false, "platform_error"),
+        ] {
+            for sampler in [None, Some(Sampler::AlwaysOff), Some(Sampler::AlwaysOn)] {
+                let sampled = matches!(sampler, Some(Sampler::AlwaysOn));
+                let capture = RequestTracing::new(sampler);
+                async {
+                    let request = request_from_buffered_http(
+                        "GET",
+                        "/data",
+                        "/data",
+                        b"GET /data HTTP/1.1\r\nHost: example.test\r\n\r\n".to_vec(),
+                    )
+                    .unwrap();
+                    let context = crate::l7::relay::L7EvalContext {
+                        host: "example.test".into(),
+                        port: 443,
+                        ..Default::default()
+                    };
+                    let correlation = RequestCorrelation::with_request_id(
+                        &request,
+                        &context,
+                        "current-response".into(),
+                    );
+                    let (runner, chain) = hook_echo_fixture(HookEchoStage {
+                        declared: Some(declared),
+                        reject,
+                        late_mutations: vec![write_header(
+                            "X-Inspected",
+                            "yes",
+                            ExistingHeaderAction::Overwrite,
+                        )],
+                        ..Default::default()
+                    });
+                    let mut middleware = response_middleware_context(&runner, &chain, "GET");
+                    middleware.request_context.request_id = correlation.request_id().into();
+                    let mut upstream =
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello".as_slice();
+                    let mut delivered = Vec::new();
+                    let result = relay_response(
+                        "GET",
+                        &mut upstream,
+                        &mut delivered,
+                        RelayResponseOptions {
+                            correlation: Some(&correlation),
+                            ..Default::default()
+                        },
+                        Some(middleware),
+                    )
+                    .await;
+                    assert_eq!(
+                        result.is_ok(),
+                        expected == "allowed",
+                        "{expected}: {result:?}"
+                    );
+                    assert!(
+                        String::from_utf8_lossy(&delivered)
+                            .contains("x-openshell-request-id: current-response\r\n")
+                    );
+                }
+                .with_subscriber(capture.subscriber())
+                .await;
+                let events = capture.events.json_events();
+                let primary: Vec<_> = events
+                    .iter()
+                    .filter(|event| event["class_uid"] == 4002)
+                    .collect();
+                assert!(!primary.is_empty());
+                assert!(
+                    primary
+                        .iter()
+                        .all(|event| event["metadata"]["correlation_uid"] == "current-response")
+                );
+                assert!(
+                    !capture
+                        .created_span_names()
+                        .contains(&"supervisor.egress.deny")
+                );
+                let spans = capture.spans();
+                if sampled {
+                    let root = spans
+                        .iter()
+                        .find(|span| span.name == "openshell.http.request")
+                        .unwrap();
+                    let phases: Vec<_> = spans
+                        .iter()
+                        .filter(|span| span.name == "openshell.middleware.response")
+                        .collect();
+                    assert_eq!(phases.len(), 1);
+                    assert_eq!(phases[0].parent_span_id, root.span_context.span_id());
+                    for (key, value) in [
+                        ("openshell.middleware.outcome", expected),
+                        ("openshell.middleware.mutated", "true"),
+                    ] {
+                        assert!(
+                            phases[0]
+                                .attributes
+                                .iter()
+                                .any(|field| field.key.as_str() == key
+                                    && field.value.as_str() == value),
+                            "{:?}",
+                            phases[0]
+                        );
+                    }
+                } else {
+                    assert!(spans.is_empty());
+                }
+                capture.shutdown();
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn hook_response_preflight_carries_forwarded_request_headers() {
         let captured = Arc::new(std::sync::Mutex::new(None));
         let (runner, chain) = hook_echo_fixture(HookEchoStage {
@@ -9083,6 +9203,7 @@ mod tests {
                 sequence: Some(1),
                 input_size: 19,
                 output_size: None,
+                transformed: false,
                 failed: true,
                 stage_disabled: true,
                 reason_code: Some("stable_reason".into()),
@@ -9136,6 +9257,7 @@ mod tests {
                 sequence: Some(1),
                 input_size: 19,
                 output_size: None,
+                transformed: false,
                 failed: true,
                 stage_disabled: true,
                 reason_code: None,

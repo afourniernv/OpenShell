@@ -75,6 +75,29 @@ The CLI forwards `TRACEPARENT` and `TRACESTATE` from its environment on gateway 
 
 The gateway also passes its trace context to compute drivers, so driver spans appear in the same trace as the gateway request that caused them. Built-in drivers export their spans through the gateway's process. Managed external drivers receive the trace endpoint, gateway name, and compute driver from the gateway. Drivers that you run yourself own their telemetry configuration.
 
+### HTTP Enforcement Correlation
+
+Inspected HTTP requests create an `openshell.http.request` span. Policy evaluation
+and selected request and response middleware phases appear as children. Valid W3C
+`traceparent` context is an untrusted link, never the supervisor span's parent.
+Malformed or duplicate headers are ignored. Caller sampling flags do not control
+local enforcement telemetry. OpenShell does not adopt `tracestate`.
+
+OpenShell assigns its own request ID, includes it in the span and related OCSF
+records, and returns it as `X-OpenShell-Request-ID`. This header is a correlation
+handle, not authorization or proof of delivery. Match it to trusted OpenShell
+output for the same sandbox. L4 and uninspected passthrough traffic do not provide
+this receipt guarantee.
+
+The primary HTTP Activity record describes the final response headers accepted
+by the client connection. A successful header write does not establish complete
+body delivery or that the external service committed an operation. Middleware
+phase spans summarize mutations, policy blocks, failures and admission limits;
+remote RPC spans measure transport separately from middleware decisions.
+Correlation attributes exclude credentials, query values, bodies and MCP
+arguments. Truncated legacy diagnostics describe retained evidence; a false
+mutation flag does not guarantee that no later mutation occurred.
+
 ## Next Steps
 
 - Configure [OTLP export](/how-it-works/gateways/configuration#otlp-export), including sampling and the `OTEL_*` variables the gateway honors.

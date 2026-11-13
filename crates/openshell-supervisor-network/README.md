@@ -83,3 +83,10 @@ The request span ends after its owned stages, not when response headers are logg
 The `openshell.upstream.send` stage measures request writes and flush; response
 handling is measured separately. Receipt filtering preserves raw HTTP bytes
 and borrows unchanged header blocks.
+
+Selected middleware phases enrich those existing stage spans with bounded
+outcomes and mutation, failure, admission and partial-delivery observations.
+Legacy and current HTTP hooks share this reporting path. Current streamed
+request phases remain open through body processing or cancellation; response
+phases include finalization. Remote RPC transport status is separate from a
+middleware decision. Findings retain the request UUID even without trace export.

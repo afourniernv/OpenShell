@@ -2,6 +2,15 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Supervisor middleware registration and chain execution.
+//!
+//! # Rust API compatibility
+//!
+//! Typed outcome diagnostics add fields to [`ChainOutcome`], [`HttpResponseInvocation`],
+//! [`HttpResponseMiddlewareFailure`], [`HttpResponseFinish`] and [`HttpResponseDiagnostics`].
+//! Direct Rust consumers must update struct literals and exhaustive destructuring.
+//! `HttpResponseMiddlewareFailure` now has private classification state; obtain it from
+//! runner or session operations. SDK/protobuf contracts and middleware implementation
+//! trait signatures are unchanged.
 
 mod binding_policy;
 mod diagnostics;
@@ -283,6 +292,20 @@ pub enum MiddlewareWorkAdmissionOutcome {
     QueueExhausted,
 }
 
+/// Typed load-shedding signal emitted when the bounded middleware queue is full.
+#[derive(Debug)]
+pub struct MiddlewareAdmissionExhausted;
+
+impl std::fmt::Display for MiddlewareAdmissionExhausted {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("middleware admission queue is full; refusing additional buffered work")
+    }
+}
+
+impl std::error::Error for MiddlewareAdmissionExhausted {}
+
+impl miette::Diagnostic for MiddlewareAdmissionExhausted {}
+
 impl MiddlewareWorkAdmissionOutcome {
     /// Preserve the existing failure behavior for protocols whose outer layer
     /// already translates middleware admission errors into a stable response
@@ -290,9 +313,7 @@ impl MiddlewareWorkAdmissionOutcome {
     pub fn into_admission(self) -> Result<MiddlewareWorkAdmission> {
         match self {
             Self::Admitted(admission) => Ok(admission),
-            Self::QueueExhausted => Err(miette!(
-                "middleware admission queue is full; refusing additional buffered work"
-            )),
+            Self::QueueExhausted => Err(MiddlewareAdmissionExhausted.into()),
         }
     }
 }
@@ -691,6 +712,18 @@ pub struct ChainOutcome {
     /// denied the request. Fail-closed service errors and transformed-body
     /// policy denials are not represented as middleware decisions.
     pub denial: Option<MiddlewareDenial>,
+    /// Typed reason the chain stopped. Consumers must use this instead of
+    /// inferring security semantics from free-form diagnostic text.
+    pub termination: ChainTermination,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChainTermination {
+    Completed,
+    MiddlewareDenied,
+    MiddlewareFailure,
+    TransformedBodyPolicyDenied,
+    TransformedBodyPolicyEvaluationFailed,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2129,6 +2162,7 @@ impl ChainRunner {
                     failed: true,
                 }],
                 denial: None,
+                termination: ChainTermination::MiddlewareFailure,
             });
         }
         let HttpRequestInput {
@@ -2192,6 +2226,7 @@ impl ChainRunner {
                             metadata,
                             applied,
                             denial: None,
+                            termination: ChainTermination::MiddlewareFailure,
                         });
                     }
                 }
@@ -2209,6 +2244,7 @@ impl ChainRunner {
                             metadata,
                             applied,
                             denial: None,
+                            termination: ChainTermination::MiddlewareFailure,
                         });
                     }
                 }
@@ -2235,6 +2271,7 @@ impl ChainRunner {
                             metadata,
                             applied,
                             denial: None,
+                            termination: ChainTermination::MiddlewareFailure,
                         });
                     }
                 }
@@ -2256,6 +2293,7 @@ impl ChainRunner {
                             metadata,
                             applied,
                             denial: None,
+                            termination: ChainTermination::MiddlewareFailure,
                         });
                     }
                 }
@@ -2286,6 +2324,7 @@ impl ChainRunner {
                                 metadata,
                                 applied,
                                 denial: None,
+                                termination: ChainTermination::MiddlewareFailure,
                             });
                         }
                     }
@@ -2305,6 +2344,7 @@ impl ChainRunner {
                             metadata,
                             applied,
                             denial: None,
+                            termination: ChainTermination::MiddlewareFailure,
                         });
                     }
                 }
@@ -2329,6 +2369,7 @@ impl ChainRunner {
                                 metadata,
                                 applied,
                                 denial: None,
+                                termination: ChainTermination::MiddlewareFailure,
                             });
                         }
                     }
@@ -2373,6 +2414,7 @@ impl ChainRunner {
                     metadata,
                     applied,
                     denial: Some(denial),
+                    termination: ChainTermination::MiddlewareDenied,
                 });
             }
 
@@ -2389,6 +2431,7 @@ impl ChainRunner {
                             metadata,
                             applied,
                             denial: None,
+                            termination: ChainTermination::MiddlewareFailure,
                         });
                     }
                 }
@@ -2423,6 +2466,7 @@ impl ChainRunner {
                                     metadata,
                                     applied,
                                     denial: None,
+                                    termination: ChainTermination::MiddlewareFailure,
                                 });
                             }
                         }
@@ -2468,12 +2512,15 @@ impl ChainRunner {
             if body_transformed
                 && let TransformedBodyPolicy::Reevaluate(validate) = transformed_body_policy
             {
-                let denied = match validate(&body) {
-                    Ok(reason) => reason,
-                    Err(error) => Some(format!(
-                        "transformed_body_policy_evaluation_failed: {}",
-                        safe_reason(&error.to_string())
-                    )),
+                let (denied, termination) = match validate(&body) {
+                    Ok(reason) => (reason, ChainTermination::TransformedBodyPolicyDenied),
+                    Err(error) => (
+                        Some(format!(
+                            "transformed_body_policy_evaluation_failed: {}",
+                            safe_reason(&error.to_string())
+                        )),
+                        ChainTermination::TransformedBodyPolicyEvaluationFailed,
+                    ),
                 };
                 if let Some(reason) = denied {
                     return Ok(ChainOutcome {
@@ -2485,6 +2532,7 @@ impl ChainRunner {
                         metadata,
                         applied,
                         denial: None,
+                        termination,
                     });
                 }
             }
@@ -2499,6 +2547,7 @@ impl ChainRunner {
             metadata,
             applied,
             denial: None,
+            termination: ChainTermination::Completed,
         })
     }
 }
@@ -6591,10 +6640,15 @@ mod tests {
             overflow,
             MiddlewareWorkAdmissionOutcome::QueueExhausted
         ));
-        runner
+        let error = runner
             .reserve_middleware_work_admission()
             .await
             .expect_err("WebSocket callers retain their existing failure path");
+        assert!(
+            error
+                .downcast_ref::<MiddlewareAdmissionExhausted>()
+                .is_some()
+        );
 
         drop(active);
         for waiter in waiters {

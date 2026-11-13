@@ -27,6 +27,7 @@ use futures::StreamExt as _;
 use futures::stream::FuturesUnordered;
 use tokio::sync::{Mutex, mpsc, oneshot, watch};
 use tokio::time::Instant;
+use tracing::Instrument as _;
 
 use openshell_core::proto::{
     Decision, HeaderMutation, HttpBegin, HttpBodyLimits, HttpBodyMode, HttpBodyModeUnavailable,
@@ -627,14 +628,17 @@ impl Drop for StageStream {
         };
         let mut results = std::mem::replace(&mut self.results, Box::pin(futures::stream::empty()));
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-            runtime.spawn(async move {
-                end_exchange(
-                    sender,
-                    &mut results,
-                    MiddlewareSessionEndReason::Cancellation,
-                )
-                .await;
-            });
+            runtime.spawn(
+                async move {
+                    end_exchange(
+                        sender,
+                        &mut results,
+                        MiddlewareSessionEndReason::Cancellation,
+                    )
+                    .await;
+                }
+                .in_current_span(),
+            );
         }
     }
 }

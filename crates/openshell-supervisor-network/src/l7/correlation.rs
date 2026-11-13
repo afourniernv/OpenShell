@@ -60,6 +60,85 @@ struct RequestState {
     blocked: bool,
     failure_reason: Option<&'static str>,
     late_failure_emitted: bool,
+    middleware: [Option<MiddlewareState>; 2],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MiddlewarePhase {
+    Request,
+    Response,
+}
+
+impl MiddlewarePhase {
+    const fn index(self) -> usize {
+        match self {
+            Self::Request => 0,
+            Self::Response => 1,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MiddlewareOutcome {
+    Allowed,
+    Denied,
+    PlatformError,
+}
+
+impl MiddlewareOutcome {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Allowed => "allowed",
+            Self::Denied => "denied",
+            Self::PlatformError => "platform_error",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[allow(clippy::struct_excessive_bools)]
+pub struct MiddlewareObservation {
+    pub mutated: bool,
+    pub fail_open: bool,
+    pub fail_closed: bool,
+    pub admission_exhausted: bool,
+    pub diagnostics_truncated: bool,
+    pub delivery_started: bool,
+    pub partial_delivery: bool,
+}
+
+#[derive(Debug)]
+struct MiddlewareState {
+    span: Option<tracing::Span>,
+    observation: MiddlewareObservation,
+    completed: bool,
+}
+
+#[must_use]
+pub struct MiddlewarePhaseGuard<'a> {
+    correlation: &'a RequestCorrelation,
+    phase: MiddlewarePhase,
+    active: bool,
+}
+
+impl MiddlewarePhaseGuard<'_> {
+    pub(crate) fn retain_for_stream(mut self) {
+        self.active = false;
+    }
+}
+
+impl Drop for MiddlewarePhaseGuard<'_> {
+    fn drop(&mut self) {
+        if self.active {
+            self.correlation.finish_middleware(self.phase);
+        }
+    }
+}
+
+fn close_span(span: tracing::Span) {
+    if let Some(dispatch) = span.with_subscriber(|(_, dispatch)| dispatch.clone()) {
+        tracing::dispatcher::with_default(&dispatch, || drop(span));
+    }
 }
 
 impl RequestState {
@@ -238,6 +317,185 @@ impl RequestCorrelation {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         state.record_outcome(outcome);
         state.record_failure_reason(reason);
+    }
+
+    pub(crate) fn middleware_span(&self, phase: MiddlewarePhase) -> tracing::Span {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .middleware[phase.index()]
+        .as_ref()
+        .and_then(|middleware| middleware.span.clone())
+        .unwrap_or_else(tracing::Span::none)
+    }
+
+    pub(crate) fn begin_middleware(
+        &self,
+        phase: MiddlewarePhase,
+        span: tracing::Span,
+    ) -> MiddlewarePhaseGuard<'_> {
+        self.register_middleware(phase, span);
+        MiddlewarePhaseGuard {
+            correlation: self,
+            phase,
+            active: true,
+        }
+    }
+
+    pub(crate) fn register_middleware(&self, phase: MiddlewarePhase, span: tracing::Span) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.middleware[phase.index()] = Some(MiddlewareState {
+            span: Some(span),
+            observation: MiddlewareObservation::default(),
+            completed: false,
+        });
+    }
+
+    pub(crate) fn finish_middleware(&self, phase: MiddlewarePhase) {
+        let span = {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.middleware[phase.index()].as_mut().and_then(|phase| {
+                if !phase.completed
+                    && let Some(span) = &phase.span
+                {
+                    span.record("otel.status_code", "ERROR");
+                }
+                phase.span.take()
+            })
+        };
+        if let Some(span) = span {
+            close_span(span);
+        }
+    }
+
+    pub(crate) fn observe_middleware(
+        &self,
+        phase: MiddlewarePhase,
+        observation: MiddlewareObservation,
+    ) {
+        let span = self.middleware_span(phase);
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(middleware) = &mut state.middleware[phase.index()] else {
+            return;
+        };
+        if middleware.completed {
+            return;
+        }
+        let merged = &mut middleware.observation;
+        let previous = *merged;
+        merged.mutated |= observation.mutated;
+        merged.fail_open |= observation.fail_open;
+        merged.fail_closed |= observation.fail_closed;
+        merged.admission_exhausted |= observation.admission_exhausted;
+        merged.diagnostics_truncated |= observation.diagnostics_truncated;
+        merged.delivery_started |= observation.delivery_started;
+        merged.partial_delivery |= observation.partial_delivery && merged.delivery_started;
+        // Repeated SDK attribute writes consume the span limit, even for the same key.
+        for (field, before, after) in [
+            (
+                "openshell.middleware.mutated",
+                previous.mutated,
+                merged.mutated,
+            ),
+            (
+                "openshell.middleware.fail_open",
+                previous.fail_open,
+                merged.fail_open,
+            ),
+            (
+                "openshell.middleware.fail_closed",
+                previous.fail_closed,
+                merged.fail_closed,
+            ),
+            (
+                "openshell.middleware.admission_exhausted",
+                previous.admission_exhausted,
+                merged.admission_exhausted,
+            ),
+            (
+                "openshell.middleware.diagnostics_truncated",
+                previous.diagnostics_truncated,
+                merged.diagnostics_truncated,
+            ),
+            (
+                "openshell.response.delivery_started",
+                previous.delivery_started,
+                merged.delivery_started,
+            ),
+            (
+                "openshell.response.partial_delivery",
+                previous.partial_delivery,
+                merged.partial_delivery,
+            ),
+        ] {
+            if before != after {
+                span.record(field, after);
+            }
+        }
+        if let Some(primary) = &mut state.primary {
+            for (key, value) in [
+                ("middleware_fail_open", observation.fail_open),
+                ("middleware_fail_closed", observation.fail_closed),
+                (
+                    "middleware_admission_exhausted",
+                    observation.admission_exhausted,
+                ),
+            ] {
+                if value && let OcsfEvent::HttpActivity(primary) = primary {
+                    primary
+                        .base
+                        .unmapped
+                        .get_or_insert_with(|| serde_json::json!({}))[key] = true.into();
+                }
+            }
+        }
+    }
+
+    pub(crate) fn complete_middleware(&self, phase: MiddlewarePhase, outcome: MiddlewareOutcome) {
+        let span = self.middleware_span(phase);
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(middleware) = &mut state.middleware[phase.index()] {
+            if middleware.completed {
+                return;
+            }
+            middleware.completed = true;
+            span.record("openshell.middleware.outcome", outcome.as_str());
+            if outcome != MiddlewareOutcome::Allowed {
+                span.record("otel.status_code", "ERROR");
+            }
+        }
+    }
+
+    pub(crate) fn record_response_delivery_started(&self) {
+        self.observe_middleware(
+            MiddlewarePhase::Response,
+            MiddlewareObservation {
+                delivery_started: true,
+                ..Default::default()
+            },
+        );
+    }
+
+    pub(crate) fn record_response_partial_delivery(&self) {
+        self.observe_middleware(
+            MiddlewarePhase::Response,
+            MiddlewareObservation {
+                partial_delivery: true,
+                ..Default::default()
+            },
+        );
     }
 
     pub(crate) fn emit(&self, event: OcsfEvent) {
@@ -550,6 +808,56 @@ fn merge_http_outcome(primary: &mut HttpActivityEvent, incoming: HttpActivityEve
     }
 }
 
+pub fn emit_ocsf(correlation: Option<&RequestCorrelation>, event: OcsfEvent) {
+    if let Some(correlation) = correlation {
+        correlation.emit_correlated(event);
+    } else {
+        crate::telemetry::egress_emit!(event);
+    }
+}
+
+pub fn emit_phase_events(
+    correlation: Option<&RequestCorrelation>,
+    phase: MiddlewarePhase,
+    events: impl IntoIterator<Item = OcsfEvent>,
+) {
+    let Some(correlation) = correlation else {
+        crate::telemetry::emit_decision(events, None);
+        return;
+    };
+    let span = correlation.middleware_span(phase);
+    let span = if span.is_disabled() {
+        correlation
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .trace
+            .as_ref()
+            .map_or_else(tracing::Span::none, RequestTrace::span)
+    } else {
+        span
+    };
+    for mut event in events {
+        if let OcsfEvent::HttpActivity(http) = &event {
+            if !is_middleware_invocation(http) {
+                correlation.emit(event);
+                continue;
+            }
+            if http.action == Some(ActionId::Denied)
+                && let Some(OcsfEvent::HttpActivity(primary)) = &mut correlation
+                    .state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .primary
+            {
+                merge_middleware_denial(primary, http);
+            }
+        }
+        event.set_correlation_uid(correlation.request_id.clone());
+        span.in_scope(|| crate::telemetry::emit_inspected_decision([event], Some(&span)));
+    }
+}
+
 /// Observe accepted response bytes without buffering or changing delivery.
 pub struct AuditedClient<'a, C> {
     inner: &'a mut C,
@@ -632,6 +940,8 @@ impl<C: AsyncWrite + Unpin> AsyncWrite for AuditedClient<'_, C> {
 impl Drop for RequestCorrelation {
     fn drop(&mut self) {
         self.emit_primary(true);
+        self.finish_middleware(MiddlewarePhase::Request);
+        self.finish_middleware(MiddlewarePhase::Response);
         self.finish_http_trace();
     }
 }

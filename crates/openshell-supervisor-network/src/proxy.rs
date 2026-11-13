@@ -6797,6 +6797,7 @@ async fn handle_forward_proxy(
             &middleware_runner,
             &l7_ctx,
             "ws",
+            Some(&correlation),
         )
         .instrument(stage.clone())
         .await;

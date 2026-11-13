@@ -173,6 +173,137 @@ fn middleware_invocations_are_retained_without_seeding_or_poisoning_the_request(
 }
 
 #[test]
+fn phase_emission_preserves_every_invocation_before_and_after_headers() {
+    use opentelemetry_sdk::trace::Sampler;
+
+    for sampler in [Some(Sampler::AlwaysOn), Some(Sampler::AlwaysOff), None] {
+        let sampled = matches!(sampler, Some(Sampler::AlwaysOn));
+        for phase in [MiddlewarePhase::Request, MiddlewarePhase::Response] {
+            let phase_name = match phase {
+                MiddlewarePhase::Request => "request",
+                MiddlewarePhase::Response => "response",
+            };
+            for late in [false, true] {
+                let capture = RequestTracing::new(sampler.clone());
+                let mut expected = Vec::new();
+                tracing::subscriber::with_default(capture.subscriber(), || {
+                    let correlation = RequestCorrelation::new(&request(), &context());
+                    correlation.emit(allowed());
+                    if late {
+                        correlation.response_selected(200);
+                    }
+                    let stage = match phase {
+                        MiddlewarePhase::Request => RequestStage::RequestMiddleware,
+                        MiddlewarePhase::Response => RequestStage::ResponseMiddleware,
+                    };
+                    let _phase = correlation.begin_middleware(phase, correlation.stage(stage));
+                    for (name, outcome) in [
+                        ("pass", InvocationOutcome::Pass),
+                        ("redact", InvocationOutcome::Transform),
+                        ("optional", InvocationOutcome::FailOpen),
+                        ("guard", InvocationOutcome::Deny),
+                    ] {
+                        let event = invocation(name, phase_name, outcome);
+                        expected.push(event.to_json().unwrap());
+                        emit_phase_events(Some(&correlation), phase, [event]);
+                    }
+                    correlation.complete_middleware(phase, MiddlewareOutcome::Denied);
+                    if !late {
+                        correlation.response_selected(403);
+                    }
+                });
+                let events = http_events(&capture.events);
+                let primary: Vec<_> = events
+                    .iter()
+                    .filter(|event| event["unmapped"]["http_event_kind"] == "request")
+                    .collect();
+                let companions: Vec<_> = events
+                    .iter()
+                    .filter(|event| event["unmapped"]["http_event_kind"] == "middleware_invocation")
+                    .collect();
+                assert_eq!(primary.len(), 1);
+                assert_eq!(companions.len(), expected.len());
+                assert_eq!(events.len(), primary.len() + companions.len());
+                assert_eq!(
+                    primary[0]["action"],
+                    if late { "Allowed" } else { "Denied" }
+                );
+                assert_eq!(
+                    primary[0]["http_response"]["code"],
+                    if late { 200 } else { 403 }
+                );
+                for (event, expected) in companions.iter().zip(&expected) {
+                    for field in [
+                        "action",
+                        "disposition",
+                        "status",
+                        "message",
+                        "status_detail",
+                        "http_request",
+                        "http_response",
+                        "firewall_rule",
+                    ] {
+                        assert_eq!(event[field], expected[field], "{phase:?}: {field}");
+                    }
+                    for (key, value) in expected["unmapped"].as_object().unwrap() {
+                        assert_eq!(event["unmapped"][key], *value, "{key}");
+                    }
+                    assert_eq!(
+                        event["metadata"]["correlation_uid"],
+                        primary[0]["metadata"]["correlation_uid"]
+                    );
+                    assert_eq!(event["trace"]["uid"].is_string(), sampled);
+                }
+                let spans = capture.spans();
+                assert_eq!(spans.len(), if sampled { 2 } else { 0 });
+                if sampled {
+                    let root = spans
+                        .iter()
+                        .find(|span| span.name == "openshell.http.request")
+                        .unwrap();
+                    let phase_span = spans
+                        .iter()
+                        .find(|span| {
+                            span.name
+                                == match phase {
+                                    MiddlewarePhase::Request => "openshell.middleware.request",
+                                    MiddlewarePhase::Response => "openshell.middleware.response",
+                                }
+                        })
+                        .unwrap();
+                    assert_eq!(phase_span.parent_span_id, root.span_context.span_id());
+                    assert!(phase_span.end_time <= root.end_time);
+                    for (key, expected) in [
+                        (
+                            "openshell.request.outcome",
+                            if late { "allowed" } else { "denied" },
+                        ),
+                        (
+                            "http.response.status_code",
+                            if late { "200" } else { "403" },
+                        ),
+                    ] {
+                        assert!(
+                            root.attributes.iter().any(|field| field.key.as_str() == key
+                                && field.value.as_str() == expected),
+                            "{root:?}"
+                        );
+                    }
+                    assert!(companions.iter().all(|event| event["trace"]["uid"]
+                        == phase_span.span_context.trace_id().to_string()));
+                }
+                assert!(
+                    !capture
+                        .created_span_names()
+                        .contains(&"supervisor.egress.deny")
+                );
+                capture.shutdown();
+            }
+        }
+    }
+}
+
+#[test]
 fn denied_middleware_invocation_only_overlays_the_preheader_denial_summary() {
     for seeded in [false, true] {
         let capture = openshell_ocsf::test_support::OcsfCapture::default();

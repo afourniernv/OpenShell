@@ -182,6 +182,10 @@ where
             return Ok(Some(RelayOutcome::Consumed));
         }
     };
+    observe_response_admission_exhaustion(
+        response_correlation,
+        preflight.session_capacity_exhausted,
+    );
     if let Some(guard) = middleware.generation_guard
         && let Err(error) = guard.ensure_current()
     {
@@ -203,6 +207,12 @@ where
         &preflight.diagnostics,
     );
     if !preflight.allowed {
+        crate::l7::middleware::observe_http_stage_outcome(
+            response_correlation,
+            MiddlewarePhase::Response,
+            &preflight.diagnostics,
+            Some(false),
+        );
         debug!(reason = %preflight.reason, "HTTP response middleware preflight denied delivery");
         if let Some(denial) = preflight.denial.as_ref() {
             send_response_middleware_denial(
@@ -240,6 +250,7 @@ where
 
     let Some(session) = preflight.pipeline.take() else {
         if preflight.headers == original_headers {
+            complete_response_middleware(response_correlation, MiddlewareOutcome::Allowed);
             return Ok(None);
         }
         let outcome = relay_headers_only_response(
@@ -258,6 +269,7 @@ where
             response_correlation,
         )
         .await?;
+        complete_response_middleware(response_correlation, MiddlewareOutcome::Allowed);
         record_allowed_response(response_correlation);
         return Ok(Some(outcome));
     };
@@ -361,6 +373,7 @@ where
                     );
                 })?;
             }
+            complete_response_middleware(response_correlation, MiddlewareOutcome::Allowed);
             record_allowed_response(response_correlation);
             return Ok(Some(
                 if server_wants_close
@@ -374,6 +387,15 @@ where
             ));
         }
         (Err(failure), relayed) => {
+            if writer.committed {
+                record_response_partial_delivery(response_correlation);
+            }
+            crate::l7::middleware::observe_http_stage_outcome(
+                response_correlation,
+                MiddlewarePhase::Response,
+                &failure.diagnostics,
+                Some(false),
+            );
             emit_http_response_stage_events(
                 response_correlation,
                 middleware.policy_name,
@@ -399,6 +421,9 @@ where
         }
     };
     let committed = writer.committed;
+    if committed {
+        record_response_partial_delivery(response_correlation);
+    }
     match failure {
         Err(error @ BodyRelayError::Downstream(_)) => {
             record_relay_error(response_correlation, &error);
@@ -504,6 +529,7 @@ where
 
 fn record_relay_error(correlation: Option<&RequestCorrelation>, error: &BodyRelayError) {
     let (outcome, reason) = error.correlation_failure();
+    complete_response_middleware(correlation, MiddlewareOutcome::PlatformError);
     record_committed_response_error(correlation, outcome, reason);
 }
 
@@ -713,6 +739,17 @@ impl<C: AsyncWrite + Unpin> ResponseWriter<'_, '_, C> {
             late_mutations,
         )
         .map_err(|error| BodyRelayError::Output(miette!("{error}")))?;
+        if headers != self.headers
+            && let Some(correlation) = self.correlation
+        {
+            correlation.observe_middleware(
+                MiddlewarePhase::Response,
+                MiddlewareObservation {
+                    mutated: true,
+                    ..Default::default()
+                },
+            );
+        }
         let framing = match output_body_bytes {
             Some(length) => OutputFraming::ContentLength { remaining: length },
             None if self.chunked => OutputFraming::Chunked,
@@ -785,21 +822,32 @@ impl<C: AsyncWrite + Unpin> ResponseWriter<'_, '_, C> {
         }
     }
 
-    async fn send(&mut self, bytes: &[u8]) -> std::result::Result<(), BodyRelayError> {
+    async fn send(&mut self, mut bytes: &[u8]) -> std::result::Result<(), BodyRelayError> {
         if bytes.is_empty() {
             return Ok(());
         }
-        if let Some(guard) = self.generation_guard {
-            guard
-                .ensure_current()
-                .map_err(BodyRelayError::PolicyReload)?;
+        while !bytes.is_empty() {
+            if let Some(guard) = self.generation_guard {
+                guard
+                    .ensure_current()
+                    .map_err(BodyRelayError::PolicyReload)?;
+            }
+            // A partial write still prevents a second response head.
+            self.committed = true;
+            let written = self
+                .client
+                .write(bytes)
+                .await
+                .map_err(BodyRelayError::Downstream)?;
+            if written == 0 {
+                return Err(BodyRelayError::Downstream(std::io::Error::from(
+                    std::io::ErrorKind::WriteZero,
+                )));
+            }
+            record_response_delivery_started(self.correlation);
+            bytes = &bytes[written..];
         }
-        // A partial write commits the response too.
-        self.committed = true;
-        self.client
-            .write_all(bytes)
-            .await
-            .map_err(BodyRelayError::Downstream)
+        Ok(())
     }
 
     async fn flush(&mut self) -> std::result::Result<(), BodyRelayError> {
@@ -818,8 +866,15 @@ fn emit_http_response_stage_events(
     status_code: u16,
     diagnostics: &HttpStageDiagnostics,
 ) {
-    crate::l7::correlation::emit_request_events(
+    crate::l7::middleware::observe_http_stage_outcome(
         correlation,
+        MiddlewarePhase::Response,
+        diagnostics,
+        None,
+    );
+    emit_phase_events(
+        correlation,
+        MiddlewarePhase::Response,
         http_response_stage_events(policy_name, target, status_code, diagnostics),
     );
 }
@@ -915,6 +970,8 @@ fn http_response_stage_event(
         .http_response(openshell_ocsf::HttpResponse { code: status_code })
         .dst_endpoint(openshell_ocsf::Endpoint::from_domain(&target.host, port))
         .firewall_rule(policy_name, "supervisor-middleware")
+        .unmapped("http_event_kind", "middleware_invocation")
+        .unmapped("middleware_phase", "response")
         .unmapped("middleware_config", invocation.config_name.as_str())
         .unmapped(
             "middleware_implementation",

@@ -94,6 +94,25 @@ impl RequestTrace {
         if self.span.is_disabled() || !self.span.context().span().span_context().is_valid() {
             return Span::none();
         }
+        if matches!(
+            stage,
+            RequestStage::RequestMiddleware | RequestStage::ResponseMiddleware
+        ) {
+            return tracing::info_span!(
+                parent: &self.span,
+                "openshell.http.stage",
+                otel.name = stage.name(),
+                otel.status_code = tracing::field::Empty,
+                openshell.middleware.outcome = "incomplete",
+                openshell.middleware.mutated = false,
+                openshell.middleware.fail_open = false,
+                openshell.middleware.fail_closed = false,
+                openshell.middleware.admission_exhausted = false,
+                openshell.middleware.diagnostics_truncated = false,
+                openshell.response.delivery_started = false,
+                openshell.response.partial_delivery = false,
+            );
+        }
         tracing::info_span!(
             parent: &self.span,
             "openshell.http.stage",

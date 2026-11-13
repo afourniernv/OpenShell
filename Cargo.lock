@@ -5280,6 +5280,7 @@ dependencies = [
  "miette",
  "openshell-core",
  "openshell-extension-core",
+ "openshell-otel",
  "openshell-supervisor-middleware-builtins",
  "prost",
  "prost-types",
@@ -5287,6 +5288,7 @@ dependencies = [
  "tokio-stream",
  "tonic",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
