@@ -205,11 +205,6 @@ path = "tests/websocket_conformance.rs"
 required-features = ["e2e-host-gateway"]
 
 [[test]]
-name = "credential_gating"
-path = "tests/credential_gating.rs"
-required-features = ["e2e-host-gateway"]
-
-[[test]]
 name = "user_namespaces"
 path = "tests/user_namespaces.rs"
 required-features = ["e2e-kubernetes"]
@@ -243,6 +238,11 @@ required-features = ["e2e"]
 name = "sandbox_templates"
 path = "tests/sandbox_templates.rs"
 required-features = ["e2e"]
+
+[[test]]
+name = "supervisor_middleware_http_hooks"
+path = "tests/supervisor_middleware_http_hooks.rs"
+required-features = ["e2e-docker"]
 
 [[test]]
 name = "proxy_egress_pipeline"
@@ -301,6 +301,7 @@ url = "2"
 nix = { version = "0.29", features = ["process", "signal", "term", "user"] }
 
 [dev-dependencies]
+flate2 = "1"
 openshell-ocsf-validate = { path = "../../crates/openshell-ocsf-validate" }
 serial_test = "3"
 

@@ -121,6 +121,14 @@ For Kubernetes mount-path conflicts, move caller PVC mounts away from
 These driver-managed paths remain reserved even for approved resources and
 `sub_path` mounts; changing approval labels does not resolve a path conflict.
 
+For dedicated Kubernetes supervisor placement, inspect the administrator's
+`supervisor_runtime_class_name` in the Kubernetes driver configuration and the
+supervisor Pod's `spec.runtimeClassName`. The setting is independent of the
+workload RuntimeClass and defaults to unset; it does not configure shared
+supervisor Deployments. If startup fails, check that the named RuntimeClass
+exists and its handler is available on eligible nodes. OpenShell does not retry
+with an ordinary supervisor Pod when the configured class is unavailable.
+
 For out-of-tree compute drivers, also check that their versioned admission-policy
 acknowledgement matches the gateway's policy. Configure standalone driver policy
 through its administrator-owned `--admission-config-json` option.
@@ -249,7 +257,7 @@ the image/effective policy or provider configuration. The supervisor remains
 alive while the workload stays unstarted. Inspect `openshell sandbox get` and
 repair the desired configuration with a complete policy replacement or provider
 change; do not treat a healthy container as proof that the workload is ready.
-If the 300-second provisioning repair window expires, the gateway records
+If the provisioning repair window (default 300 seconds) expires, the gateway records
 `ProvisioningTimedOut` and stops workload and supervisor compute. Inspect
 `provisioning` in sandbox JSON and TUI NOTES to distinguish cleanup pending from
 complete. Repairing configuration after expiry does not restart compute: wait
@@ -262,6 +270,14 @@ launching the workload while configuration is repaired. An unavailable boundary
 fails discovery within its control-request deadline. Permanent
 gateway errors and exhausted transient retries terminate startup; inspect those
 errors as connectivity, authorization, or lifecycle failures.
+
+For slow Kubernetes isolation backends, increase `runtime_bootstrap_grace_seconds`
+and the dedicated supervisor's `sandbox_attach_request_timeout_seconds` together.
+Shared supervisor deployments instead need `OPENSHELL_ATTACH_REQUEST_TIMEOUT_SECONDS`
+on each shared host. The default is 300 seconds; allowed values are 1 through
+86400. Restart affected components and explicitly start a timed-out sandbox
+after cleanup; changing settings does not reset a persisted admission deadline.
+See [gateway configuration](https://docs.nvidia.com/openshell/latest/how-it-works/gateways/configuration#slow-sandbox-startup).
 
 ### Step 4: Check Docker-Backed Gateways
 
@@ -529,6 +545,14 @@ kubectl -n openshell logs <gateway-pod> -c openshell-gateway --tail=200
 
 `server.telemetryEnabled` renders `OPENSHELL_TELEMETRY_ENABLED` on the gateway
 pod, and the gateway propagates the effective value to sandbox supervisors.
+
+Gateway pod scheduling accepts top-level `nodeSelector`, `affinity`,
+`tolerations`, `priorityClassName`, and `topologySpreadConstraints` values for
+both StatefulSet and Deployment workloads. The last two default to unset.
+If a gateway pod stays Pending, inspect its scheduling events, confirm the
+named PriorityClass exists (`kubectl get priorityclass`), and check that topology
+spread selectors match the gateway pod labels and that eligible nodes have the
+required topology labels. These values apply only to gateway pods.
 
 #### Additional destination CA ConfigMap
 
@@ -845,8 +869,12 @@ kubectl -n openshell describe hpa openshell
 
 The JSONPath filter keeps only pods whose first container is the gateway
 (`openshell-gateway`). It skips certificate hook Job pods, which older charts
-labeled like gateway pods. The metrics port is `service.metricsPort` (default
-`9090`).
+labeled like gateway pods. Helm enables metrics with `metrics.enabled=true`
+(the default). Set it to `false` to omit the listener and its container and
+Service ports. `service.metricsPort` selects the port (default `9090`) and
+must remain between 1 and 65535 even when metrics are disabled. Migrate legacy
+port `0` or `false` to `metrics.enabled=false` and a valid port in the same
+upgrade; those legacy values fail rendering. Metrics TLS requires enablement.
 
 The API server proxy connects to each pod from the control plane. A
 NetworkPolicy that accepts the metrics port only from a monitoring namespace
@@ -1582,7 +1610,7 @@ credential failures.
 | `openshell status` fails | Gateway endpoint unreachable or auth mismatch | `openshell gateway info`, gateway logs |
 | Collector receives no OCSF log records, or `openshell.ocsf.gap` records | `[openshell.gateway.otlp.ocsf]` missing or without `enabled = true`, an unreachable endpoint or one that does not speak the table's `protocol`, or export failures and queue pressure | Check `[openshell.gateway.otlp.ocsf]` for `enabled = true` and the endpoint it resolves to, the gateway's `OTLP exporting enabled` startup log for `ocsf_endpoint` and `ocsf_protocol`, export warnings, and `openshell_ocsf_otlp_*` metrics. See the published [gateway configuration reference](https://docs.nvidia.com/openshell/latest/how-it-works/gateways/configuration). |
 | Gateway OCSF JSONL stops growing, has gaps, or is rejected by a SIEM | File errors, queue pressure, or shipper falling behind retention | Inspect gateway warnings and `openshell_ocsf_log_*` metrics; check `[openshell.gateway.ocsf_log]`, directory permissions, free space, per-replica paths, and shipper rotation checkpoints. See the published [gateway configuration reference](https://docs.nvidia.com/openshell/latest/how-it-works/gateways/configuration). |
-| `BatchSpanProcessor.ExportError` repeatedly reports connection refused on `127.0.0.1:4317` | The local gateway started with OTLP configured but the collector forwarding task later stopped, or the config was created manually | Restart `gateway:docker`, `gateway:podman`, or `gateway:vm` so it re-detects the listener; inspect the generated `gateway.toml` for `[openshell.gateway.otlp]` |
+| `BatchSpanProcessor.ExportError` repeatedly reports connection refused on `127.0.0.1:4317` | The local gateway started with `OPENSHELL_DEV_OTLP_ENDPOINT` set but no collector is listening, for example because `helm:k3s:forward` stopped | Start the collector forwarding again, or restart the gateway task without `OPENSHELL_DEV_OTLP_ENDPOINT`; inspect the generated `gateway.toml` for `[openshell.gateway.otlp]` |
 | Sandbox log shows `OTLP agent trace relay inactive: not enabled by the gateway` at startup, then `agent OTLP export attempted but the agent trace relay is not enabled` when the agent exports | The gateway does not enable `[openshell.gateway.otlp.agent]`, so the supervisor refuses the workload's OTLP relay address | Set `enabled = true` in `[openshell.gateway.otlp.agent]` (Helm: `gatewayConfig."openshell.gateway.otlp.agent".enabled`) with an endpoint from that table or `[openshell.gateway.otlp]`, and recreate the sandbox; `openshell logs <sandbox> --source sandbox` then shows `OTLP agent trace relay enabled` |
 | Gateway starts but sandbox create fails | Compute driver cannot reach runtime | Docker/Podman/Kubernetes/VM driver logs |
 | Docker or Podman sandbox never registers | Wrong gateway endpoint, unavailable host networking, or supervisor startup failure | Gateway logs and supervisor container logs |
@@ -1593,6 +1621,8 @@ credential failures.
 | Kubernetes sandbox pod stuck pending, workspace PVC unbound | Cluster has no default `StorageClass` and OpenShell does not set `storageClassName` on the workspace PVC (clusters with a default `StorageClass` bind fine without it) | `kubectl -n openshell describe pvc`; set `server.workspaceStorageClass` (gateway config `workspace_storage_class`) to a valid `StorageClass` |
 | Kubernetes gateway pod crash loops | Missing secret, bad DB URL, bad TLS config | `kubectl -n openshell logs deployment/openshell -c openshell-gateway` or `kubectl -n openshell logs statefulset/openshell -c openshell-gateway` |
 | Mutating RPCs return `UNAVAILABLE` with "timed out waiting for a concurrent mutation" | Advisory-lock contention, a full lock pool on one replica (4 connections unless `database_lock_max_connections` is set), a slow PostgreSQL, or older gateways still running during an upgrade | `openshell_server_mutation_lock_timeouts_total`, `openshell_server_mutation_lock_connections_in_use` against its capacity, the `detail` field of `mutation lock acquisition timed out` in gateway logs, `mutation lock held longer than the lock wait timeout` warnings and `openshell_server_mutation_lock_hold_seconds`, the `pg_locks` query in Step 6 |
+| RPCs fail after about 5 seconds with `UNAVAILABLE` `DATABASE_UNAVAILABLE` or "database unavailable: pool timed out" | PostgreSQL unreachable or not answering, or every data-pool connection busy | `database health check` warnings and `/readyz` on the gateway, PostgreSQL logs, `database_max_connections` and the connection sizing in the High Availability guide |
+| Kubernetes gateway pod Running but never Ready, logging `database unreachable; retrying` | The gateway started while PostgreSQL was unreachable and waits for it | PostgreSQL pod and Service endpoints, the host and port in the database URL, network policy between the gateway and PostgreSQL |
 | Mutating RPCs return `INTERNAL` with "could not open a mutation lock connection" | PostgreSQL out of connection slots, restarting, or unreachable | `openshell_server_mutation_lock_errors_total`, PostgreSQL logs, `SELECT count(*) FROM pg_stat_activity` against `max_connections`, `database_max_connections` and `database_lock_max_connections`, the connection sizing in the High Availability guide |
 | `helm upgrade` fails with an `autoscaling.*` message | HPA values invalid: missing `resources.requests` (or `resources.limits`), `maxReplicas` above 1 without `server.externalDbSecret` (or on a StatefulSet without `workload.allowMultiReplicaStatefulSet`), no metric target, or min/max out of order. "`minReplicas` and `maxReplicas` are not set" means `--reuse-values` kept a release without the chart's autoscaling defaults | Fix the values named in the error; upgrade with `--reset-then-reuse-values` instead of `--reuse-values` |
 | HPA shows `<unknown>` targets | No metrics-server for CPU/memory, or the metrics adapter does not serve the custom metric | `kubectl -n openshell describe hpa openshell`, `kubectl get --raw /apis/custom.metrics.k8s.io/v1beta1` |
@@ -1614,8 +1644,9 @@ credential failures.
 | Provider profiles disappear after enabling an interceptor catalog | `provider_profile_sources` selected only an authoritative interceptor or returned invalid/duplicate IDs | Inspect source list and interceptor `Describe`/catalog logs; include `user` when composition with imported profiles is intended |
 | `provider list-profiles` is empty on a new gateway | Profiles are import-only and nothing has been imported | Import with `openshell provider profile import --from providers --global`; an empty catalog is a valid ready state, not a failure |
 | Sandbox create or provider attach fails naming a missing profile | The provider's profile was never imported, was deleted, or lives at another scope | Import it at the scope the provider uses; the error names the profile ID and the command |
-| Gateway fails after registering supervisor middleware | Service unavailable, invalid manifest, duplicate binding, reserved name, or invalid payload/timeout limit | Middleware service and gateway logs; `[[openshell.supervisor.middleware]]`; `Describe` response |
-| Policy update rejects `network_middlewares` | Unknown middleware name, implementation-owned config invalid, duplicate order, broad/invalid host selector, or fail-closed coverage of `tls: skip` | Policy error, gateway logs, middleware `ValidateConfig`, selector and order fields |
+| Gateway fails after registering supervisor middleware | Service unavailable, invalid manifest, duplicate binding, reserved name, invalid payload/timeout limit, or an HTTP hooks capability that is supported but not required | Middleware service and gateway logs; `[[openshell.supervisor.middleware]]`; `Describe` response |
+| Policy update rejects `network_middlewares` | Unknown middleware name, implementation-owned config invalid, duplicate order, broad/invalid host selector, `fail_open` on an HTTP hook service, overlapping selectors with different HTTP hook versions, or fail-closed coverage of `tls: skip` | Policy error, gateway logs, middleware `ValidateConfig`, selector, order, and `on_error` fields |
+| HTTP traffic fails with `failure_code` `middleware_hook_versions_mixed`, `middleware_cannot_inspect`, `middleware_lifecycle_violation` (OCSF reason `middleware_unimplemented`), `middleware_timeout`, or `stream_idle_timeout`, or with `408 request_timeout` | HTTP hook middleware failure (always fail-closed) or a stalled streaming upload | [Supervisor middleware reference](references/supervisor-middleware.md); sandbox OCSF middleware events |
 | Gateway or extension rejects its peer before serving health | Missing peer metadata, incompatible protocol major, or unmet `required_capabilities` | Gateway and extension startup logs; compare `PeerMetadata`; legacy-to-current migration requires a coordinated gateway and extension outage |
 | Policy mutation returns `FAILED_PRECONDITION` for endpoint ambiguity | Equally specific effective endpoint selectors disagree on connection or request-processing metadata | CLI error, base and provider-composed policy, affected profile attachments; confirm no new revision was stored |
 | Supervisor enters policy quarantine | A runtime candidate failed validation while `policy_validation_failure_mode = "fail_closed"` | Sandbox OCSF config/finding events, validation rationale, active generation, `previous_policy_active` |

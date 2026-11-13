@@ -311,31 +311,43 @@ HTTP Activity and API Activity records emitted inside a sampled OpenTelemetry sp
 
 OTLP log export links every OCSF record, whatever its class, to the active sampled span through the log record's own trace and span ID fields. Use those fields for log-to-trace links in your backend.
 
-With OTLP trace export enabled on a dedicated supervisor, HTTP refusals outside the inspected-request path can create an INFO `supervisor.egress.deny` span around the audit records for that decision. The span records the policy, reason, and destination when available. At the default log level, these are root spans. At debug level, FORWARD denials can join the available connect trace. Inspected requests use the request and policy spans described below instead. Shared supervisor hosts do not initialize OTLP exporters. Uninspected traffic does not adopt workload trace headers.
+With OTLP trace export enabled on a dedicated supervisor, each inspected HTTP request has an INFO `openshell.http.request` span for its allowed, denied or failed outcome. Children measure the policy, middleware, credential, upstream and response stages that actually run. HTTP upgrade tracing ends before the upgraded WebSocket session.
 
-To bound telemetry volume when a workload retries blocked destinations, the supervisor creates at most 10 deny spans per destination at once and one more per second after that. A process-wide budget also allows at most 100 spans at once and refills at 100 per second across destinations. Rate-limited decisions create no additional deny span, while all audit records are still emitted. Records can retain correlation to an already active sampled span, including a connect span at debug level.
+`openshell.upstream.send` measures request writes and flush, not the full upstream round trip. Response handling has a separate span.
+
+The supervisor owns the request trace. A valid workload `traceparent`, sampled or unsampled, becomes an explicitly untrusted link, never its parent. Invalid or duplicate context is ignored; workload `tracestate` is not adopted. Your backend may show the agent and supervisor as separate linked traces rather than one nested tree.
+
+Inspected requests do not also create a denial-only `supervisor.egress.deny` span. Other denied HTTP decisions retain that legacy span: a root at the default log level, or a child of an available connect span at debug level. Shared supervisor hosts do not initialize OTLP exporters, so their records carry no trace correlation.
+
+The legacy deny-span limiter allows at most 10 spans per destination at once and one more per second after that. A process-wide budget also allows at most 100 spans at once and refills at 100 per second across destinations. Rate-limited decisions create no additional deny span, while all audit records are still emitted. These denial-specific budgets do not select inspected request spans, which cover every outcome rather than denials alone.
 
 Gateway records and their OTLP trace context can inherit the caller's incoming `traceparent`, including before authentication succeeds. The caller also decides whether they are correlated at all, because an unsampled `traceparent` suppresses `trace.uid`. Treat gateway trace IDs as correlation hints, not evidence of the caller's identity, and do not treat a missing `trace.uid` as meaningful.
 
 ## Join Inspected HTTP Requests
 
-Inspected HTTP requests create an `openshell.http.request` span and an
-`openshell.policy.evaluate` child when policy evaluation runs. One valid,
-sampled workload `traceparent` supplies an untrusted parent. Invalid or duplicate
-headers are ignored. Unsampled context is linked rather than adopted, and
-`tracestate` is not adopted.
+The supervisor assigns each inspected HTTP request a UUID shared by middleware
+`RequestContext.request_id`, OCSF `metadata.correlation_uid`, and the
+`x-openshell-request-id` response header. It also exports the ID as the OTLP log
+attribute `ocsf.metadata.correlation_uid`.
 
-The supervisor assigns a request UUID shared by middleware, the request span,
-OCSF `metadata.correlation_uid`, and the `x-openshell-request-id` response header.
-It removes workload, middleware, and upstream attempts to set that header on
-inspected paths. Neither the trace ID nor the receipt proves identity or
-authorization. L4 and uninspected traffic do not provide this receipt guarantee.
+This header is reserved for OpenShell: workload and upstream values are removed,
+and middleware cannot set or remove it. Use a different header for
+application-owned correlation. The receipt is a join key, not proof of identity,
+authorization or downstream execution. L4 and uninspected traffic do not provide
+this receipt guarantee.
 
 One primary HTTP Activity record is emitted when the final response head is
 written. If the request ends earlier, a guard emits the available outcome.
-The receipt does not prove that the body was delivered. Records still join
-through the request UUID when no sampled trace exists. Security logs do not
-need to be returned to the sandbox.
+Routine middleware outcomes share that record; security findings remain separate.
+A failure observed after the primary record can produce an additional correlated
+record. The response header does not prove that the body was delivered.
+
+The request ID join and enforcement work without tracing, when spans are not
+sampled, and when the collector is unavailable. Sampled OCSF trace fields identify
+the supervisor trace; the request ID remains the join key when those fields are
+absent. An instrumented client can record the receipt on its own trace and use it
+to find OpenShell's security records; it does not need to receive those records
+inside the sandbox.
 
 ## OCSF Event Classes in JSON
 

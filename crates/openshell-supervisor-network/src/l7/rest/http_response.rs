@@ -3,10 +3,12 @@
 
 //! HTTP response relay and pre-return middleware integration.
 
+mod http_hooks;
+
 use super::*;
 use crate::l7::correlation::{
-    MiddlewareObservation, MiddlewareOutcome, MiddlewarePhase, RequestCorrelation, emit_ocsf,
-    emit_phase_events,
+    HttpOutcome, MiddlewareObservation, MiddlewareOutcome, MiddlewarePhase, RequestCorrelation,
+    RequestStage, emit_ocsf, emit_phase_events,
 };
 
 /// Default wall-clock bound shared by whole-body stages in one response.
@@ -22,6 +24,31 @@ pub struct HttpResponseMiddlewareRelay<'a> {
     pub(crate) policy_name: &'a str,
     pub(crate) generation_guard: Option<&'a PolicyGenerationGuard>,
     pub(crate) whole_body_timeout: std::time::Duration,
+    /// The client request used HTTP/1.1, so an HTTP hook response may
+    /// be re-framed chunked. An HTTP/1.0 client cannot decode chunked framing.
+    pub(crate) client_accepts_chunked: bool,
+    /// The request head as request middleware forwarded it, before
+    /// credentials. HTTP hook response stages receive its headers, and
+    /// fail closed without it.
+    pub(crate) request_head: Option<crate::l7::middleware::ForwardedRequestHead>,
+}
+
+impl HttpResponseMiddlewareRelay<'_> {
+    /// Whether an HTTP hook stage of this response chain may inspect bodies.
+    ///
+    /// A chain that cannot be described fails when the response arrives, so
+    /// the request is left unchanged.
+    pub(super) async fn inspects_bodies(&self) -> bool {
+        if self.chain.is_empty() {
+            return false;
+        }
+        self.runner
+            .describe_http_response_chain(self.chain)
+            .await
+            .is_ok_and(|described| {
+                openshell_supervisor_middleware::chain_inspects_http_response_bodies(&described)
+            })
+    }
 }
 
 #[derive(Clone)]
@@ -79,7 +106,9 @@ where
         }
 
         if let Some(header_end) = header_end {
-            if let Err(error) = validate_http_response_header_block(&buf[..header_end]) {
+            if options.correlation.is_some()
+                && let Err(error) = validate_http_response_header_block(&buf[..header_end])
+            {
                 if let Some(observer) = options.observer.as_ref() {
                     observer.observe(EndpointResult::TransportFailed);
                 }
@@ -92,7 +121,11 @@ where
                 Some(100 | 102..=199)
             ) {
                 informational_header_bytes += header_end;
-                let sanitized = strip_platform_request_id_from_head(&buf[..header_end]);
+                let sanitized = if options.correlation.is_some() {
+                    strip_platform_request_id_from_head(&buf[..header_end])
+                } else {
+                    Cow::Borrowed(&buf[..header_end])
+                };
                 client.write_all(&sanitized).await.into_diagnostic()?;
                 client.flush().await.into_diagnostic()?;
                 buf.drain(..header_end);
@@ -106,9 +139,8 @@ where
             if let Some(observer) = options.observer.as_ref() {
                 observer.observe(EndpointResult::TransportFailed);
             }
-            if let Some(correlation) = options.correlation {
-                send_incomplete_response(client, correlation).await?;
-            } else if !buf.is_empty() {
+            record_upstream_response_error(options.correlation, "upstream_response_incomplete");
+            if !buf.is_empty() {
                 client.write_all(&buf).await.into_diagnostic()?;
             }
             return Ok(RelayOutcome::Consumed);
@@ -116,16 +148,13 @@ where
         buf.extend_from_slice(&tmp[..n]);
     };
 
-    let sanitized = strip_platform_request_id_from_head(&buf[..header_end]);
-    if sanitized.len() != header_end {
+    if options.correlation.is_some()
+        && let Cow::Owned(sanitized) = strip_platform_request_id_from_head(&buf[..header_end])
+    {
         let overflow = buf.split_off(header_end);
         buf = sanitized;
         header_end = buf.len();
         buf.extend_from_slice(&overflow);
-    }
-
-    if let Some(correlation) = options.correlation {
-        correlation.record_target_reached();
     }
 
     // Parse response framing
@@ -282,7 +311,14 @@ where
             }
         }
         BodyLength::Chunked => {
-            relay_chunked(upstream, client, overflow, None).await?;
+            relay_chunked_with_receipt_protection(
+                upstream,
+                client,
+                overflow,
+                None,
+                options.correlation.is_some(),
+            )
+            .await?;
         }
         BodyLength::None => unreachable!(),
     }
@@ -298,68 +334,31 @@ where
     Ok(outcome)
 }
 
-async fn send_incomplete_response<C: AsyncWrite + Unpin>(
-    client: &mut C,
-    correlation: &RequestCorrelation,
-) -> Result<()> {
-    record_upstream_response_error(Some(correlation), "upstream_response_incomplete");
-    let body = serde_json::json!({
-        "error": "upstream_response_incomplete",
-        "request_id": correlation.request_id(),
-    })
-    .to_string();
-    let response = format!(
-        "HTTP/1.1 502 Bad Gateway\r\nContent-Type: application/json\r\n{}: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-        openshell_core::token_grant_failure::REQUEST_ID_HEADER,
-        correlation.request_id(),
-        body.len(),
-        body,
-    );
-    client
-        .write_all(response.as_bytes())
-        .await
-        .into_diagnostic()?;
-    client.flush().await.into_diagnostic()
-}
-
 fn record_allowed_response(correlation: Option<&RequestCorrelation>) {
     if let Some(correlation) = correlation {
-        correlation.record_final_http_outcome("allowed");
+        correlation.record_outcome(HttpOutcome::Allowed);
     }
 }
 
-fn record_denied_response(correlation: Option<&RequestCorrelation>, stage: &str) {
+fn record_denied_response(correlation: Option<&RequestCorrelation>, stage: &'static str) {
     if let Some(correlation) = correlation {
-        correlation.record_response_status(403);
-        correlation.record_final_http_outcome("denied");
-        correlation.record_error_stage(stage);
+        correlation.record_rejection(403, HttpOutcome::Denied, Some(stage));
     }
 }
 
-fn record_platform_response_error(correlation: Option<&RequestCorrelation>, stage: &str) {
+fn record_upstream_response_error(correlation: Option<&RequestCorrelation>, stage: &'static str) {
     if let Some(correlation) = correlation {
-        correlation.record_response_status(502);
-        correlation.record_final_http_outcome("platform_error");
-        correlation.record_error_stage(stage);
-    }
-}
-
-fn record_upstream_response_error(correlation: Option<&RequestCorrelation>, stage: &str) {
-    if let Some(correlation) = correlation {
-        correlation.record_response_status(502);
-        correlation.record_final_http_outcome("upstream_error");
-        correlation.record_error_stage(stage);
+        correlation.record_failure(HttpOutcome::UpstreamError, stage);
     }
 }
 
 fn record_committed_response_error(
     correlation: Option<&RequestCorrelation>,
-    outcome: &'static str,
-    stage: &str,
+    outcome: HttpOutcome,
+    stage: &'static str,
 ) {
     if let Some(correlation) = correlation {
-        correlation.record_final_http_outcome(outcome);
-        correlation.record_error_stage(stage);
+        correlation.record_failure(outcome, stage);
     }
 }
 
@@ -434,45 +433,48 @@ fn validate_http_response_status_line(status_line: &[u8]) -> Result<()> {
             "HTTP response status line must use HTTP/1.0 or HTTP/1.1"
         ));
     };
-    if remainder.len() < 4 || remainder[3] != b' ' {
+    if remainder.len() < 3 || (remainder.len() > 3 && remainder[3] != b' ') {
         return Err(miette!("HTTP response status line is malformed"));
     }
     http::StatusCode::from_bytes(&remainder[..3])
         .map_err(|_| miette!("HTTP response status code is invalid"))?;
-    http::HeaderValue::from_bytes(&remainder[4..])
+    http::HeaderValue::from_bytes(remainder.get(4..).unwrap_or_default())
         .map_err(|_| miette!("HTTP response reason phrase is malformed"))?;
     Ok(())
 }
 
-fn final_response_head(headers: &[u8], correlation: Option<&RequestCorrelation>) -> Vec<u8> {
-    let stripped = strip_platform_request_id_from_head(headers);
-    let stripped = strip_platform_request_id_from_connection(&stripped);
+fn final_response_head<'a>(
+    headers: &'a [u8],
+    correlation: Option<&RequestCorrelation>,
+) -> Cow<'a, [u8]> {
     let Some(correlation) = correlation else {
-        return stripped;
+        return Cow::Borrowed(headers);
     };
+    let stripped =
+        strip_platform_request_id_from_connection(strip_platform_request_id_from_head(headers));
     let Some(header_end) = stripped.windows(4).position(|window| window == b"\r\n\r\n") else {
         return stripped;
     };
-    let receipt = format!(
-        "{}: {}\r\n\r\n",
-        openshell_core::token_grant_failure::REQUEST_ID_HEADER,
-        correlation.request_id(),
-    );
-    let mut output = Vec::with_capacity(stripped.len() + receipt.len());
+    let name = openshell_core::token_grant_failure::REQUEST_ID_HEADER;
+    let request_id = correlation.request_id();
+    let mut output = Vec::with_capacity(stripped.len() + name.len() + request_id.len() + 4);
     output.extend_from_slice(&stripped[..header_end + 2]);
-    output.extend_from_slice(receipt.as_bytes());
+    output.extend_from_slice(name.as_bytes());
+    output.extend_from_slice(b": ");
+    output.extend_from_slice(request_id.as_bytes());
+    output.extend_from_slice(b"\r\n\r\n");
     output.extend_from_slice(&stripped[header_end + 4..]);
-    output
+    Cow::Owned(output)
 }
 
-fn strip_platform_request_id_from_connection(headers: &[u8]) -> Vec<u8> {
+fn strip_platform_request_id_from_connection(headers: Cow<'_, [u8]>) -> Cow<'_, [u8]> {
     let header_end = headers
         .windows(4)
         .position(|window| window == b"\r\n\r\n")
         .map_or(headers.len(), |position| position + 4);
     let (header_block, buffered_suffix) = headers.split_at(header_end);
     let protected = openshell_core::token_grant_failure::REQUEST_ID_HEADER.as_bytes();
-    let mut output = Vec::with_capacity(headers.len());
+    let mut output: Option<Vec<u8>> = None;
     let mut position = 0usize;
 
     while position < header_block.len() {
@@ -482,65 +484,64 @@ fn strip_platform_request_id_from_connection(headers: &[u8]) -> Vec<u8> {
             .map_or(header_block.len(), |end| position + end);
         let line = &header_block[position..line_end];
         if line.is_empty() {
-            output.extend_from_slice(b"\r\n");
+            if position + 2 < header_block.len() {
+                output.get_or_insert_with(|| header_block[..position].to_vec());
+            }
+            if let Some(output) = &mut output {
+                output.extend_from_slice(b"\r\n");
+            }
             break;
         }
 
-        let Some(colon) = line.iter().position(|byte| *byte == b':') else {
-            output.extend_from_slice(line);
-            output.extend_from_slice(b"\r\n");
-            position = line_end.saturating_add(2);
-            continue;
-        };
-        let name = trim_ascii_ows(&line[..colon]);
-        if !name.eq_ignore_ascii_case(b"connection") {
-            output.extend_from_slice(line);
-            output.extend_from_slice(b"\r\n");
+        if let Some(colon) = line.iter().position(|byte| *byte == b':')
+            && trim_ascii_ows(&line[..colon]).eq_ignore_ascii_case(b"connection")
+            && line[colon + 1..]
+                .split(|byte| *byte == b',')
+                .any(|value| trim_ascii_ows(value).eq_ignore_ascii_case(protected))
+        {
+            let output = output.get_or_insert_with(|| {
+                let mut output = Vec::with_capacity(headers.len());
+                output.extend_from_slice(&header_block[..position]);
+                output
+            });
+            let mut retained = line[colon + 1..]
+                .split(|byte| *byte == b',')
+                .map(trim_ascii_ows)
+                .filter(|token| !token.is_empty() && !token.eq_ignore_ascii_case(protected));
+            if let Some(first) = retained.next() {
+                output.extend_from_slice(&line[..=colon]);
+                output.push(b' ');
+                output.extend_from_slice(first);
+                for token in retained {
+                    output.extend_from_slice(b", ");
+                    output.extend_from_slice(token);
+                }
+                output.extend_from_slice(b"\r\n");
+            }
             position = line_end.saturating_add(2);
             continue;
         }
-
-        let mut removed_protected = false;
-        let retained: Vec<_> = line[colon + 1..]
-            .split(|byte| *byte == b',')
-            .filter_map(|value| {
-                let token = trim_ascii_ows(value);
-                if token.eq_ignore_ascii_case(protected) {
-                    removed_protected = true;
-                    None
-                } else if token.is_empty() {
-                    None
-                } else {
-                    Some(token)
-                }
-            })
-            .collect();
-        if !removed_protected {
+        if line_end + 2 > header_block.len() {
+            output.get_or_insert_with(|| header_block[..position].to_vec());
+        }
+        if let Some(output) = &mut output {
             output.extend_from_slice(line);
-            output.extend_from_slice(b"\r\n");
-        } else if !retained.is_empty() {
-            output.extend_from_slice(&line[..=colon]);
-            output.push(b' ');
-            for (index, token) in retained.iter().enumerate() {
-                if index > 0 {
-                    output.extend_from_slice(b", ");
-                }
-                output.extend_from_slice(token);
-            }
             output.extend_from_slice(b"\r\n");
         }
         position = line_end.saturating_add(2);
     }
 
-    output.extend_from_slice(buffered_suffix);
-    output
+    if let Some(output) = &mut output {
+        output.extend_from_slice(buffered_suffix);
+    }
+    output.map_or(headers, Cow::Owned)
 }
 
 /// Body framing determines when delivery finishes, not whether another
 /// request is permitted. Signal EOF (including TLS `close_notify`) before the
 /// caller tears down a closing CONNECT tunnel; waiting for another request
 /// deadlocks clients that are themselves waiting for EOF.
-async fn finish_response<C>(client: &mut C, close: bool) -> Result<RelayOutcome>
+pub(super) async fn finish_response<C>(client: &mut C, close: bool) -> Result<RelayOutcome>
 where
     C: AsyncWrite + Unpin,
 {
@@ -597,28 +598,78 @@ where
         }
         Err(error) => Err(error),
     };
+    let span = response_correlation.map_or_else(tracing::Span::none, |correlation| {
+        correlation.stage(RequestStage::ResponseMiddleware)
+    });
+    let _phase = response_correlation
+        .map(|correlation| correlation.begin_middleware(MiddlewarePhase::Response, span.clone()));
+    let result = relay_described_response_through_middleware(
+        request_method,
+        upstream,
+        client,
+        middleware,
+        buffered,
+        header_end,
+        status_code,
+        body_length,
+        server_wants_close,
+        event_stream,
+        response_correlation,
+        parsed,
+    )
+    .instrument(span)
+    .await;
+    if result.is_err() {
+        complete_response_middleware(response_correlation, MiddlewareOutcome::PlatformError);
+    }
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn relay_described_response_through_middleware<U, C>(
+    request_method: &str,
+    upstream: &mut U,
+    client: &mut C,
+    middleware: HttpResponseMiddlewareRelay<'_>,
+    buffered: &[u8],
+    header_end: usize,
+    status_code: u16,
+    body_length: BodyLength,
+    server_wants_close: bool,
+    event_stream: bool,
+    response_correlation: Option<&RequestCorrelation>,
+    parsed: Result<(
+        Vec<openshell_supervisor_middleware::DescribedChainEntry>,
+        ParsedResponseHead,
+    )>,
+) -> Result<Option<RelayOutcome>>
+where
+    U: AsyncRead + Unpin,
+    C: AsyncWrite + Unpin,
+{
+    let header_bytes = &buffered[..header_end];
     if let Some(guard) = middleware.generation_guard {
         guard.ensure_current()?;
     }
     let (described, parsed) = match parsed {
         Ok(parsed) => parsed,
         Err(error) => {
-            let _phase = response_correlation
-                .map(|correlation| correlation.begin_middleware(MiddlewarePhase::Response));
             complete_response_middleware(response_correlation, MiddlewareOutcome::PlatformError);
             debug!(error = %error, "HTTP response head normalization failed");
             emit_http_response_middleware_failure(
+                response_correlation,
                 middleware.policy_name,
                 &middleware.target,
                 status_code,
                 false,
-                response_correlation,
             );
             send_response_delivery_failure(
                 client,
                 request_method,
                 middleware.policy_name,
                 &middleware.target,
+                None,
+                HttpOutcome::PlatformError,
                 "response_middleware_headers",
                 response_correlation,
             )
@@ -626,8 +677,52 @@ where
             return Ok(Some(RelayOutcome::Consumed));
         }
     };
-    let _phase = response_correlation
-        .map(|correlation| correlation.begin_middleware(MiddlewarePhase::Response));
+    match openshell_supervisor_middleware::chain_http_hook_version(&described) {
+        openshell_supervisor_middleware::ChainHttpHookVersion::Legacy => {}
+        openshell_supervisor_middleware::ChainHttpHookVersion::Current => {
+            return Box::pin(http_hooks::relay_response_through_pipeline(
+                request_method,
+                upstream,
+                client,
+                middleware,
+                described,
+                parsed,
+                buffered,
+                header_end,
+                status_code,
+                body_length,
+                server_wants_close,
+                event_stream,
+                response_correlation,
+            ))
+            .await;
+        }
+        openshell_supervisor_middleware::ChainHttpHookVersion::Mixed => {
+            debug!(
+                reason = openshell_supervisor_middleware::MIDDLEWARE_HOOK_VERSIONS_MIXED,
+                "HTTP response middleware chain mixes HTTP hook versions"
+            );
+            emit_http_response_middleware_failure(
+                response_correlation,
+                middleware.policy_name,
+                &middleware.target,
+                status_code,
+                false,
+            );
+            send_response_delivery_failure(
+                client,
+                request_method,
+                middleware.policy_name,
+                &middleware.target,
+                None,
+                HttpOutcome::PlatformError,
+                "response_middleware_hook_version",
+                response_correlation,
+            )
+            .await?;
+            return Ok(Some(RelayOutcome::Consumed));
+        }
+    }
     let original_headers = parsed.headers.clone();
     let preserved_credential_headers = parsed.preserved_credential_headers;
     let upstream_declared_trailers = parsed.declared_trailers.clone();
@@ -642,18 +737,13 @@ where
         },
         headers: parsed.headers,
         connection_nominated_headers: parsed.connection_nominated,
+        request_headers: Vec::new(),
     };
     let preflight_result = if parsed.representable {
-        let preflight = middleware
+        middleware
             .runner
-            .preflight_described_http_response(described, input);
-        if let Some(correlation) = response_correlation {
-            correlation
-                .within_middleware(MiddlewarePhase::Response, preflight)
-                .await
-        } else {
-            preflight.await
-        }
+            .preflight_described_http_response(described, input)
+            .await
     } else {
         Ok(middleware
             .runner
@@ -671,17 +761,19 @@ where
             complete_response_middleware(response_correlation, MiddlewareOutcome::PlatformError);
             debug!(error = %error, "HTTP response middleware preflight failed");
             emit_http_response_middleware_failure(
+                response_correlation,
                 middleware.policy_name,
                 &middleware.target,
                 status_code,
                 false,
-                response_correlation,
             );
             send_response_delivery_failure(
                 client,
                 request_method,
                 middleware.policy_name,
                 &middleware.target,
+                None,
+                HttpOutcome::PlatformError,
                 "response_middleware_preflight",
                 response_correlation,
             )
@@ -765,6 +857,8 @@ where
                 request_method,
                 middleware.policy_name,
                 &middleware.target,
+                None,
+                HttpOutcome::PlatformError,
                 "response_middleware_preflight",
                 response_correlation,
             )
@@ -838,6 +932,8 @@ where
                     request_method,
                     middleware.policy_name,
                     &middleware.target,
+                    None,
+                    HttpOutcome::PlatformError,
                     "response_middleware_finish",
                     response_correlation,
                 )
@@ -1014,13 +1110,13 @@ where
                 if middleware_stop.is_some_and(|stop| stop.failure.denial.is_some()) {
                     record_committed_response_error(
                         response_correlation,
-                        "denied",
+                        HttpOutcome::Denied,
                         "response_middleware_body",
                     );
                 } else {
                     record_committed_response_error(
                         response_correlation,
-                        "platform_error",
+                        HttpOutcome::PlatformError,
                         "response_middleware_body",
                     );
                 }
@@ -1044,6 +1140,8 @@ where
                     request_method,
                     middleware.policy_name,
                     &middleware.target,
+                    None,
+                    HttpOutcome::PlatformError,
                     "response_middleware_body",
                     response_correlation,
                 )
@@ -1094,13 +1192,13 @@ where
                 if error.denial.is_some() {
                     record_committed_response_error(
                         response_correlation,
-                        "denied",
+                        HttpOutcome::Denied,
                         "response_middleware_finish",
                     );
                 } else {
                     record_committed_response_error(
                         response_correlation,
-                        "platform_error",
+                        HttpOutcome::PlatformError,
                         "response_middleware_finish",
                     );
                 }
@@ -1126,6 +1224,8 @@ where
                     request_method,
                     middleware.policy_name,
                     &middleware.target,
+                    None,
+                    HttpOutcome::PlatformError,
                     "response_middleware_finish",
                     response_correlation,
                 )
@@ -1289,7 +1389,16 @@ where
                 relay_fixed(upstream, client, remaining, None).await?;
             }
         }
-        BodyLength::Chunked => relay_chunked(upstream, client, overflow, None).await?,
+        BodyLength::Chunked => {
+            relay_chunked_with_receipt_protection(
+                upstream,
+                client,
+                overflow,
+                None,
+                response_correlation.is_some(),
+            )
+            .await?;
+        }
         BodyLength::None if server_wants_close || event_stream => {
             if !overflow.is_empty() {
                 client.write_all(overflow).await.into_diagnostic()?;
@@ -1590,7 +1699,7 @@ pub(super) fn http_response_middleware_invocation_events(
                 openshell_supervisor_middleware::HttpResponseInvocationOutcome::BlockDelivery
                     | openshell_supervisor_middleware::HttpResponseInvocationOutcome::FailClosed
             );
-            openshell_ocsf::HttpActivityBuilder::new(ocsf_ctx())
+            openshell_ocsf::HttpActivityBuilder::new(openshell_ocsf::ctx::ctx())
             .activity(openshell_ocsf::ActivityId::Other)
             .action(if blocked {
                 openshell_ocsf::ActionId::Denied
@@ -1738,12 +1847,13 @@ pub(super) fn http_response_middleware_fail_open_finding_event(
 }
 
 fn emit_http_response_middleware_failure(
+    correlation: Option<&RequestCorrelation>,
     policy_name: &str,
     target: &HttpRequestTarget,
     status_code: u16,
     committed: bool,
-    correlation: Option<&RequestCorrelation>,
 ) {
+    complete_response_middleware(correlation, MiddlewareOutcome::PlatformError);
     emit_phase_events(
         correlation,
         MiddlewarePhase::Response,
@@ -2105,7 +2215,7 @@ async fn relay_normalized_response_body<R, C>(
     target: &HttpRequestTarget,
     status_code: u16,
     connection_nominated_headers: &[String],
-    response_correlation: Option<&RequestCorrelation>,
+    correlation: Option<&RequestCorrelation>,
 ) -> Result<Vec<HttpHeader>>
 where
     R: AsyncRead + Unpin,
@@ -2120,7 +2230,7 @@ where
         policy_name,
         target,
         status_code,
-        response_correlation,
+        correlation,
     };
     match body_length {
         BodyLength::ContentLength(mut remaining) => {
@@ -2324,7 +2434,7 @@ struct ResponseOutputState<'a> {
     policy_name: &'a str,
     target: &'a HttpRequestTarget,
     status_code: u16,
-    response_correlation: Option<&'a RequestCorrelation>,
+    correlation: Option<&'a RequestCorrelation>,
 }
 
 #[derive(Debug)]
@@ -2383,12 +2493,9 @@ async fn expire_whole_body_deadline<C: AsyncWrite + Unpin>(
 ) -> Result<()> {
     let output = session.expire_whole_body_deadline().await;
     let diagnostics = session.take_diagnostics();
-    observe_response_diagnostics(framing.response_correlation, &diagnostics);
+    observe_response_diagnostics(framing.correlation, &diagnostics);
     if let Err(failure) = &output {
-        observe_response_admission_exhaustion(
-            framing.response_correlation,
-            failure.admission_exhausted(),
-        );
+        observe_response_admission_exhaustion(framing.correlation, failure.admission_exhausted());
     }
     if let Some(guard) = framing.generation_guard {
         guard.ensure_current()?;
@@ -2401,7 +2508,7 @@ async fn expire_whole_body_deadline<C: AsyncWrite + Unpin>(
             &diagnostics,
             false,
             None,
-            framing.response_correlation,
+            framing.correlation,
         );
     }
     let output = output.map_err(|failure| ResponseMiddlewareStop::new(failure, diagnostics))?;
@@ -2537,12 +2644,9 @@ async fn process_response_unit<C: AsyncWrite + Unpin>(
 ) -> Result<()> {
     let output = session.push_body(unit).await;
     let diagnostics = session.take_diagnostics();
-    observe_response_diagnostics(framing.response_correlation, &diagnostics);
+    observe_response_diagnostics(framing.correlation, &diagnostics);
     if let Err(failure) = &output {
-        observe_response_admission_exhaustion(
-            framing.response_correlation,
-            failure.admission_exhausted(),
-        );
+        observe_response_admission_exhaustion(framing.correlation, failure.admission_exhausted());
     }
     if let Some(guard) = framing.generation_guard {
         guard.ensure_current()?;
@@ -2555,7 +2659,7 @@ async fn process_response_unit<C: AsyncWrite + Unpin>(
             &diagnostics,
             false,
             None,
-            framing.response_correlation,
+            framing.correlation,
         );
     }
     let output = output.map_err(|failure| ResponseMiddlewareStop::new(failure, diagnostics))?;
@@ -2582,7 +2686,7 @@ async fn deliver_response_units<C: AsyncWrite + Unpin>(
             .write_all(framing.commit_head)
             .await
             .map_err(ResponseDownstreamWrite)?;
-        record_response_delivery_started(framing.response_correlation);
+        record_response_delivery_started(framing.correlation);
         client.flush().await.map_err(ResponseDownstreamWrite)?;
     }
     if *framing.committed {
@@ -2720,16 +2824,28 @@ async fn send_response_middleware_denial<C: AsyncWrite + Unpin>(
     Ok(())
 }
 
+/// Answer a response that middleware failed before its head was committed.
+/// An HTTP hook failure carries its platform-owned code and stage.
+#[allow(clippy::too_many_arguments)]
 async fn send_response_delivery_failure<C: AsyncWrite + Unpin>(
     client: &mut C,
     request_method: &str,
     policy_name: &str,
     target: &HttpRequestTarget,
+    failure: Option<&openshell_supervisor_middleware::MiddlewareFailureDetail>,
+    outcome: HttpOutcome,
     stage: &'static str,
     correlation: Option<&RequestCorrelation>,
 ) -> Result<()> {
-    record_platform_response_error(correlation, stage);
-    let body = serde_json::to_vec(&serde_json::json!({
+    if let Some(correlation) = correlation {
+        if outcome == HttpOutcome::UpstreamError {
+            correlation.record_response_status(502);
+            correlation.record_failure(outcome, stage);
+        } else {
+            correlation.record_rejection(502, outcome, Some(stage));
+        }
+    }
+    let mut body = serde_json::json!({
         "error": "response_delivery_failed",
         "detail": "The upstream request may have completed, but OpenShell could not deliver its response. Retrying may repeat upstream side effects.",
         "policy": policy_name,
@@ -2738,8 +2854,12 @@ async fn send_response_delivery_failure<C: AsyncWrite + Unpin>(
         "path": target.path,
         "host": target.host,
         "port": target.port,
-    }))
-    .into_diagnostic()?;
+    });
+    if let Some(failure) = failure {
+        insert_middleware_failure(&mut body, failure);
+    }
+    let body = body_with_request_id(body, correlation.map(RequestCorrelation::request_id));
+    let body = serde_json::to_vec(&body).into_diagnostic()?;
     let head = format!(
         "HTTP/1.1 502 Bad Gateway\r\nContent-Type: application/json\r\nContent-Length: {}\r\nX-OpenShell-Policy: {policy_name}\r\nConnection: close\r\n\r\n",
         body.len()
@@ -2824,9 +2944,13 @@ pub(super) fn response_is_event_stream(headers: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use super::{final_response_head, strip_platform_request_id_from_connection};
+    use crate::l7::correlation::HttpOutcome;
+    use crate::l7::rest::strip_platform_request_id_from_head;
     use openshell_supervisor_middleware::{
         HttpResponseInvocation, HttpResponseInvocationOutcome as Outcome, NamespacedFinding,
     };
+    use std::borrow::Cow;
 
     fn invocation(outcome: Outcome, failed: bool) -> HttpResponseInvocation {
         HttpResponseInvocation {
@@ -2859,65 +2983,35 @@ mod tests {
 
     #[test]
     fn response_finalization_findings_keep_the_request_id_without_trace_export() {
-        use std::sync::{Arc, Mutex};
-        use tracing_subscriber::layer::SubscriberExt as _;
-        use tracing_subscriber::{Layer, layer::Context, registry::LookupSpan};
-
-        #[derive(Clone, Default)]
-        struct EventScopes(Arc<Mutex<Vec<&'static str>>>);
-
-        impl<S: tracing::Subscriber + for<'lookup> LookupSpan<'lookup>> Layer<S> for EventScopes {
-            fn on_event(&self, event: &tracing::Event<'_>, ctx: Context<'_, S>) {
-                if event.metadata().target() == "ocsf"
-                    && let Some(span) = ctx.event_span(event)
-                {
-                    self.0.lock().unwrap().push(span.metadata().name());
-                }
-            }
-        }
-
-        for export in [false, true] {
-            let capture = openshell_ocsf::test_support::OcsfCapture::default();
-            let scopes = EventScopes::default();
-            let exporter = opentelemetry_sdk::trace::InMemorySpanExporterBuilder::new().build();
-            let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
-                .with_simple_exporter(exporter.clone())
-                .build();
-            let subscriber = tracing_subscriber::registry()
-                .with(capture.clone())
-                .with(scopes.clone())
-                .with(export.then(|| openshell_otel::layer(&provider, "response-findings")));
-            tracing::subscriber::with_default(subscriber, || {
+        use crate::test_support::request_tracing::RequestTracing;
+        use opentelemetry_sdk::trace::Sampler;
+        for sampler in [None, Some(Sampler::AlwaysOff), Some(Sampler::AlwaysOn)] {
+            let capture = RequestTracing::new(sampler);
+            tracing::subscriber::with_default(capture.subscriber(), || {
                 let correlation = test_correlation("response-finalization");
-                let _phase =
-                    correlation.begin_middleware(crate::l7::correlation::MiddlewarePhase::Response);
+                let span =
+                    correlation.stage(crate::l7::correlation::RequestStage::ResponseMiddleware);
+                let _phase = correlation
+                    .begin_middleware(crate::l7::correlation::MiddlewarePhase::Response, span);
                 super::emit_http_response_findings(&[finding()], Some(&correlation));
             });
-            let findings = capture
+            let findings: Vec<_> = capture
+                .events
                 .json_events()
                 .into_iter()
                 .filter(|event| event["finding_info"]["uid"] == "test.finding")
-                .collect::<Vec<_>>();
+                .collect();
             assert_eq!(findings.len(), 1);
             assert_eq!(
                 findings[0]["metadata"]["correlation_uid"],
                 "response-finalization"
             );
-            provider.force_flush().unwrap();
-            let spans = exporter.get_finished_spans().unwrap();
-            assert_eq!(spans.is_empty(), !export);
-            assert_eq!(
-                scopes
-                    .0
-                    .lock()
-                    .unwrap()
-                    .iter()
-                    .filter(|scope| **scope == "openshell.middleware.response")
-                    .count(),
-                1,
-                "finding uses response context regardless of export",
+            assert!(
+                !capture
+                    .created_span_names()
+                    .contains(&"supervisor.egress.deny")
             );
-            provider.shutdown().unwrap();
+            capture.shutdown();
         }
     }
 
@@ -2930,11 +3024,11 @@ mod tests {
         for committed in [false, true] {
             let (events, received) = exported("warn", || {
                 super::emit_http_response_middleware_failure(
+                    None,
                     "response-policy",
                     &HttpRequestTarget::default(),
                     200,
                     committed,
-                    None,
                 );
             })
             .await;
@@ -3031,6 +3125,60 @@ mod tests {
                     .unwrap();
             assert_eq!(failure["action_id"] == 2, denied);
         }
+    }
+
+    #[test]
+    fn late_fail_open_invocation_does_not_hide_block_delivery() {
+        let capture = openshell_ocsf::test_support::OcsfCapture::default();
+        let _subscriber = capture.install();
+        let correlation = test_correlation("late-response-receipt");
+        let target = HttpRequestTarget {
+            method: "GET".into(),
+            scheme: "https".into(),
+            host: "example.test".into(),
+            path: "/data".into(),
+            port: 443,
+            ..Default::default()
+        };
+        correlation.emit(
+            openshell_ocsf::HttpActivityBuilder::new(openshell_ocsf::ctx::ctx())
+                .http_request(openshell_ocsf::HttpRequest::new(
+                    "GET",
+                    openshell_ocsf::Url::new("https", "example.test", "/data", 443),
+                ))
+                .action(openshell_ocsf::ActionId::Allowed)
+                .status(openshell_ocsf::StatusId::Success)
+                .build(),
+        );
+        correlation.response_selected(200);
+        for (outcome, failed) in [(Outcome::FailOpen, true), (Outcome::BlockDelivery, false)] {
+            for event in super::http_response_middleware_invocation_events(
+                "response-policy",
+                &target,
+                200,
+                &[invocation(outcome, failed)],
+                true,
+            ) {
+                correlation.emit(event);
+            }
+        }
+        drop(correlation);
+        let events: Vec<_> = capture
+            .json_events()
+            .into_iter()
+            .filter(|event| event["class_uid"] == 4002)
+            .collect();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[1]["action"], "Denied");
+        assert_eq!(events[1]["http_response"]["code"], 200);
+        assert_eq!(
+            events[1]["unmapped"]["response_middleware_outcome"],
+            "blockdelivery"
+        );
+        assert_eq!(
+            events[1]["metadata"]["correlation_uid"],
+            "late-response-receipt"
+        );
     }
 
     use super::{
@@ -3159,6 +3307,8 @@ mod tests {
             policy_name: "test-policy",
             generation_guard: None,
             whole_body_timeout: DEFAULT_HTTP_RESPONSE_WHOLE_BODY_TIMEOUT,
+            client_accepts_chunked: true,
+            request_head: None,
         }
     }
 
@@ -3510,6 +3660,45 @@ mod tests {
         test_correlation_for_method(request_id, "GET")
     }
 
+    #[test]
+    fn untouched_receipt_heads_remain_borrowed() {
+        let head = b"HTTP/1.1 200\r\nX-Opaque: \xff\xfe\r\nX-Duplicate: first\r\nX-Duplicate: second\r\nConnection: keep-alive\r\nTrailer: X-Checksum\r\n\r\nbody";
+        let uncorrelated = final_response_head(head, None);
+        assert!(matches!(uncorrelated, Cow::Borrowed(_)));
+        assert_eq!(uncorrelated.as_ref(), head);
+
+        let stripped = strip_platform_request_id_from_head(head);
+        assert!(matches!(stripped, Cow::Borrowed(_)));
+        let stripped = strip_platform_request_id_from_connection(stripped);
+        assert!(matches!(stripped, Cow::Borrowed(_)));
+        assert_eq!(stripped.as_ref(), head);
+    }
+
+    #[test]
+    fn receipt_head_rewrite_preserves_unrelated_bytes_and_buffered_body() {
+        let correlation = test_correlation("receipt-cow");
+        let head = b"HTTP/1.1 200\r\nX-Opaque: \xff\xfe\r\nX-Duplicate: first\r\nX-Duplicate: second\r\nX-OpenShell-Request-ID: forged\r\nx-openshell-request-id: forged-again\r\nConnection: keep-alive, X-OpenShell-Request-ID, , Upgrade\r\nTrailer: X-OpenShell-Request-ID, X-Checksum\r\n\r\n\x00\xffbody";
+
+        let rewritten = final_response_head(head, Some(&correlation));
+        assert!(matches!(rewritten, Cow::Owned(_)));
+        assert_eq!(
+            rewritten.as_ref(),
+            b"HTTP/1.1 200\r\nX-Opaque: \xff\xfe\r\nX-Duplicate: first\r\nX-Duplicate: second\r\nConnection: keep-alive, Upgrade\r\nTrailer: X-Checksum\r\nx-openshell-request-id: receipt-cow\r\n\r\n\x00\xffbody"
+        );
+    }
+
+    #[test]
+    fn clean_correlated_head_adds_only_the_receipt() {
+        let correlation = test_correlation("receipt-clean");
+        let head = b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nbody";
+
+        let rewritten = final_response_head(head, Some(&correlation));
+        assert_eq!(
+            rewritten.as_ref(),
+            b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nx-openshell-request-id: receipt-clean\r\n\r\nbody"
+        );
+    }
+
     fn request_id_header_count(response: &[u8]) -> usize {
         String::from_utf8_lossy(response)
             .lines()
@@ -3548,23 +3737,145 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn branch08_response_middleware_denial_records_that_upstream_was_reached() {
-        use tracing_subscriber::layer::SubscriberExt as _;
+    async fn delivery_failure_receipt_distinguishes_upstream_error_from_local_block() {
+        for outcome in [HttpOutcome::UpstreamError, HttpOutcome::PlatformError] {
+            let capture = openshell_ocsf::test_support::OcsfCapture::default();
+            let _subscriber = capture.install();
+            let correlation = test_correlation("delivery-failure");
+            let target = HttpRequestTarget {
+                scheme: "https".into(),
+                host: "example.test".into(),
+                port: 443,
+                method: "GET".into(),
+                path: "/data".into(),
+                query: String::new(),
+            };
+            let mut client = Vec::new();
+            {
+                let mut client = correlation.observe_response(&mut client);
+                super::send_response_delivery_failure(
+                    &mut client,
+                    "GET",
+                    "policy",
+                    &target,
+                    None,
+                    outcome,
+                    "response_body",
+                    Some(&correlation),
+                )
+                .await
+                .unwrap();
+            }
+            drop(correlation);
+            assert_eq!(request_id_header_count(&client), 1);
+            let events = capture.json_events();
+            assert_eq!(events.len(), 1);
+            assert_eq!(events[0]["http_response"]["code"], 502);
+            assert_eq!(events[0]["metadata"]["correlation_uid"], "delivery-failure");
+            assert_eq!(
+                events[0]["action"] == "Denied",
+                outcome == HttpOutcome::PlatformError
+            );
+        }
+    }
 
-        let exporter = opentelemetry_sdk::trace::InMemorySpanExporterBuilder::new().build();
-        let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
-            .with_simple_exporter(exporter.clone())
-            .build();
-        let ocsf = openshell_ocsf::test_support::OcsfCapture::default();
-        let subscriber = tracing_subscriber::registry()
-            .with(openshell_otel::layer(
-                &provider,
-                "response-correlation-test",
-            ))
-            .with(ocsf.clone());
-        let _subscriber = tracing::subscriber::set_default(subscriber);
-        tracing::callsite::rebuild_interest_cache();
+    #[tokio::test]
+    async fn correlated_upstream_eof_preserves_transport_close_and_audits_failure() {
+        let capture = openshell_ocsf::test_support::OcsfCapture::default();
+        let _subscriber = capture.install();
+        let correlation = test_correlation("eof-request");
+        let mut upstream = tokio::io::empty();
+        let mut client = Vec::new();
+        let outcome = relay_response(
+            "GET",
+            &mut upstream,
+            &mut client,
+            RelayResponseOptions {
+                correlation: Some(&correlation),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .expect("upstream close");
+        assert!(matches!(outcome, RelayOutcome::Consumed));
+        assert!(
+            client.is_empty(),
+            "EOF must not become a synthetic HTTP response"
+        );
+        drop(correlation);
+        let records = capture.json_events();
+        let primary: Vec<_> = records
+            .iter()
+            .filter(|event| event["class_uid"] == 4002)
+            .collect();
+        assert_eq!(primary.len(), 1, "{records:?}");
+        assert_eq!(primary[0]["status"], "Failure");
+        assert_eq!(primary[0]["metadata"]["correlation_uid"], "eof-request");
+        assert!(primary[0].get("http_response").is_none());
+    }
+
+    #[tokio::test]
+    async fn correlated_response_without_reason_phrase_retains_legacy_tolerance() {
+        let correlation = test_correlation("empty-reason");
+        let mut upstream = b"HTTP/1.1 200\r\nContent-Length: 0\r\n\r\n".as_slice();
+        let mut client = Vec::new();
+        relay_response(
+            "GET",
+            &mut upstream,
+            &mut client,
+            RelayResponseOptions {
+                correlation: Some(&correlation),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .expect("tolerated status line");
+        assert!(client.starts_with(b"HTTP/1.1 200\r\n"));
+        assert_eq!(request_id_header_count(&client), 1);
+    }
+
+    #[tokio::test]
+    async fn uncorrelated_response_preserves_application_owned_request_id() {
+        let response =
+            b"HTTP/1.1 200\r\nContent-Length: 0\r\nX-OpenShell-Request-ID: application\r\n\r\n";
+        let mut upstream = response.as_slice();
+        let mut client = Vec::new();
+        relay_response(
+            "GET",
+            &mut upstream,
+            &mut client,
+            RelayResponseOptions::default(),
+            None,
+        )
+        .await
+        .expect("legacy response");
+        assert_eq!(client, response);
+    }
+
+    #[tokio::test]
+    async fn response_middleware_denial_has_one_correlated_primary_without_tracing() {
+        let capture = openshell_ocsf::test_support::OcsfCapture::default();
+        let _subscriber = capture.install();
+        exercise_response_middleware_block().await;
+
+        assert_response_middleware_block_record(&capture.json_events(), false);
+    }
+
+    async fn exercise_response_middleware_block() {
         let correlation = test_correlation_for_method("response-denied", "POST");
+        correlation.emit(
+            openshell_ocsf::HttpActivityBuilder::new(openshell_ocsf::ctx::ctx())
+                .http_request(openshell_ocsf::HttpRequest::new(
+                    "POST",
+                    openshell_ocsf::Url::new("https", "example.test", "/mutate", 443),
+                ))
+                .firewall_rule("test-policy", "l7-rest")
+                .action(openshell_ocsf::ActionId::Allowed)
+                .status(openshell_ocsf::StatusId::Success)
+                .build(),
+        );
         let runner =
             openshell_supervisor_middleware::ChainRunner::new(Arc::new(BlockingResponseMiddleware));
         let chain = vec![openshell_supervisor_middleware::ChainEntry {
@@ -3593,6 +3904,8 @@ mod tests {
             policy_name: "test-policy",
             generation_guard: None,
             whole_body_timeout: DEFAULT_HTTP_RESPONSE_WHOLE_BODY_TIMEOUT,
+            client_accepts_chunked: true,
+            request_head: None,
         };
         let mut upstream = &b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"[..];
         let mut client = Vec::new();
@@ -3617,31 +3930,46 @@ mod tests {
                 .contains("x-openshell-request-id: response-denied\r\n")
         );
         drop(correlation);
+    }
 
-        let span = exporter
-            .get_finished_spans()
-            .expect("finished spans")
-            .into_iter()
-            .find(|span| span.name == "openshell.http.request")
-            .expect("HTTP enforcement span");
-        assert!(matches!(
-            span.status,
-            opentelemetry::trace::Status::Error { .. }
-        ));
-        let attributes = span
-            .attributes
-            .into_iter()
-            .map(|attribute| {
-                (
-                    attribute.key.as_str().to_string(),
-                    attribute.value.to_string(),
-                )
-            })
-            .collect::<std::collections::BTreeMap<_, _>>();
-        assert_eq!(attributes["openshell.target.reached"], "true");
-        assert_eq!(attributes["openshell.http.outcome"], "denied");
-        assert_eq!(attributes["http.response.status_code"], "403");
-        assert!(!attributes.contains_key("openshell.error.stage"));
+    fn assert_response_middleware_block_record(records: &[serde_json::Value], traced: bool) {
+        let primary: Vec<_> = records
+            .iter()
+            .filter(|event| event["class_uid"] == 4002)
+            .collect();
+        assert_eq!(primary.len(), 1, "{records:?}");
+        assert_eq!(primary[0]["action"], "Denied");
+        assert_eq!(primary[0]["status"], "Failure");
+        assert_eq!(primary[0]["http_response"]["code"], 403);
+        assert_eq!(primary[0]["http_request"]["url"]["path"], "/mutate");
+        assert_eq!(primary[0]["firewall_rule"]["type"], "l7-rest");
+        assert_eq!(primary[0]["metadata"]["correlation_uid"], "response-denied");
+        assert_eq!(primary[0].get("trace").is_some(), traced);
+    }
+
+    #[tokio::test]
+    async fn response_middleware_block_never_creates_a_denial_only_span() {
+        use crate::l7::relay::correlation_dispatch_tests::capture_request_spans;
+
+        for sampled in [true, false] {
+            let evidence = Box::pin(capture_request_spans(
+                sampled,
+                exercise_response_middleware_block(),
+            ))
+            .await;
+            evidence.assert_no_deny_span(sampled);
+            assert_response_middleware_block_record(&evidence.events, sampled);
+            if sampled {
+                assert_eq!(
+                    evidence
+                        .spans
+                        .iter()
+                        .filter(|span| span.name == "openshell.middleware.response")
+                        .count(),
+                    1
+                );
+            }
+        }
     }
 
     #[tokio::test]
@@ -3656,9 +3984,8 @@ mod tests {
             &provider,
             "response-correlation-test",
         ));
-        let correlation = tracing::subscriber::with_default(subscriber, || {
-            test_correlation_for_method("response-streaming", "GET")
-        });
+        let _subscriber = tracing::subscriber::set_default(subscriber);
+        let correlation = test_correlation_for_method("response-streaming", "GET");
         let runner = openshell_supervisor_middleware::ChainRunner::new(Arc::new(
             StreamingResponseMiddleware,
         ));
@@ -3688,6 +4015,8 @@ mod tests {
             policy_name: "test-policy",
             generation_guard: None,
             whole_body_timeout: DEFAULT_HTTP_RESPONSE_WHOLE_BODY_TIMEOUT,
+            client_accepts_chunked: true,
+            request_head: None,
         };
         let body = vec![b'a'; 9_000];
         let mut response =
@@ -3787,6 +4116,8 @@ mod tests {
             policy_name: "test-policy",
             generation_guard: None,
             whole_body_timeout: DEFAULT_HTTP_RESPONSE_WHOLE_BODY_TIMEOUT,
+            client_accepts_chunked: true,
+            request_head: None,
         };
         let mut upstream = &b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nbody"[..];
         let mut client = Vec::new();
@@ -3848,9 +4179,8 @@ mod tests {
             &provider,
             "response-correlation-test",
         ));
-        let correlation = tracing::subscriber::with_default(subscriber, || {
-            test_correlation_for_method("response-stale-transform", "GET")
-        });
+        let _subscriber = tracing::subscriber::set_default(subscriber);
+        let correlation = test_correlation_for_method("response-stale-transform", "GET");
         let engine = Arc::new(
             crate::opa::OpaEngine::from_strings(
                 include_str!("../../../data/sandbox-policy.rego"),
@@ -3891,6 +4221,8 @@ mod tests {
             policy_name: "test-policy",
             generation_guard: Some(&generation_guard),
             whole_body_timeout: DEFAULT_HTTP_RESPONSE_WHOLE_BODY_TIMEOUT,
+            client_accepts_chunked: true,
+            request_head: None,
         };
         let mut upstream = &b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nbody"[..];
         let mut client = Vec::new();
@@ -3930,7 +4262,7 @@ mod tests {
                 )
             })
             .collect::<std::collections::BTreeMap<_, _>>();
-        assert_eq!(attributes["openshell.middleware.outcome"], "incomplete");
+        assert_eq!(attributes["openshell.middleware.outcome"], "platform_error");
         assert_eq!(attributes["openshell.middleware.mutated"], "true");
         assert_eq!(attributes["openshell.response.delivery_started"], "true");
         assert_eq!(attributes["openshell.response.partial_delivery"], "true");
@@ -4142,7 +4474,6 @@ mod tests {
             ("invalid status range", b"HTTP/1.1 099 Nope\r\n\r\n"),
             ("non-numeric status", b"HTTP/1.1 2O0 Nope\r\n\r\n"),
             ("four-digit status", b"HTTP/1.1 2000 Nope\r\n\r\n"),
-            ("missing reason separator", b"HTTP/1.1 200\r\n\r\n"),
             ("malformed field", b"HTTP/1.1 200 OK\r\nX-Test\r\n\r\n"),
             ("empty field name", b"HTTP/1.1 200 OK\r\n: value\r\n\r\n"),
             (
@@ -4180,6 +4511,7 @@ mod tests {
     fn response_head_validation_accepts_supported_informational_and_upgrade_responses() {
         for response in [
             &b"HTTP/1.0 200 OK\r\nX-Test: yes\r\n\r\n"[..],
+            &b"HTTP/1.1 200\r\nContent-Length: 0\r\n\r\n"[..],
             &b"HTTP/1.1 103 Early Hints\r\nLink: </style.css>; rel=preload\r\n\r\n"[..],
             &b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n"[..],
         ] {
@@ -4219,6 +4551,8 @@ mod tests {
             policy_name: "test-policy",
             generation_guard: None,
             whole_body_timeout: DEFAULT_HTTP_RESPONSE_WHOLE_BODY_TIMEOUT,
+            client_accepts_chunked: true,
+            request_head: None,
         };
         let mut upstream = &b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nbody\r\n0\r\nX-OpenShell-Request-ID: forged\r\n\r\n"[..];
         let mut client = Vec::new();

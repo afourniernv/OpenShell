@@ -8,20 +8,26 @@
 //! and chunked transfer encoding for body framing.
 
 mod http_response;
+mod request_body;
 
 pub(crate) use http_response::{
     DEFAULT_HTTP_RESPONSE_WHOLE_BODY_TIMEOUT, HttpResponseMiddlewareRelay,
 };
-use http_response::{RelayResponseOptions, relay_response};
+use http_response::{RelayResponseOptions, finish_response, relay_response};
 #[cfg(test)]
 use http_response::{
     http_response_middleware_fail_open_finding_event, http_response_middleware_invocation_events,
     parse_connection_close, parse_status_code, response_is_event_stream,
     strip_response_integrity_headers,
 };
+pub(crate) use request_body::{
+    LiveRequestFailure, RequestBodyReader, prepare_request_body_stream,
+    rebuild_request_for_live_body, rebuild_request_headers_only,
+    rebuild_request_with_middleware_body,
+};
 
 use crate::l7::EndpointObserver;
-use crate::l7::correlation::RequestCorrelation;
+use crate::l7::correlation::{RequestCorrelation, RequestStage};
 use crate::l7::http::{parse_chunk_size_line, validate_chunk_trailer_line};
 use crate::l7::provider::{BodyLength, L7Provider, L7Request, RelayOutcome};
 use crate::opa::PolicyGenerationGuard;
@@ -39,16 +45,17 @@ use openshell_core::secrets::{
 };
 use openshell_ocsf::ctx::ctx as ocsf_ctx;
 use sha1::{Digest, Sha1};
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::fmt::{self, Write as _};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tracing::debug;
+use tracing::{Instrument as _, debug};
 
 const MAX_HEADER_BYTES: usize = 16384; // 16 KiB for HTTP headers
-const MAX_REWRITE_BODY_BYTES: usize = 256 * 1024;
+pub(crate) const MAX_REWRITE_BODY_BYTES: usize = 256 * 1024;
 /// Maximum body bytes for `SigV4` body-signing mode. Larger than the credential
 /// rewrite limit because Bedrock payloads can be several megabytes.
-const MAX_SIGV4_BODY_BYTES: usize = 10 * 1024 * 1024;
+pub(crate) const MAX_SIGV4_BODY_BYTES: usize = 10 * 1024 * 1024;
 #[cfg(test)]
 async fn max_middleware_body_bytes() -> usize {
     let chain = openshell_supervisor_middleware::ChainRunner::new(
@@ -89,6 +96,7 @@ pub(crate) const UNSUPPORTED_H2C_UPGRADE_DETAIL: &str =
 pub(crate) const UNSUPPORTED_JSONRPC_UPGRADE_DETAIL: &str =
     "HTTP upgrade is not supported for JSON-RPC or MCP endpoints";
 pub(crate) const UNSUPPORTED_GRAPHQL_UPGRADE_DETAIL: &str = "HTTP upgrade is not supported for GraphQL endpoints; serve GraphQL over WebSocket from a separate protocol: websocket endpoint on another path or port";
+pub(crate) const UNSUPPORTED_REST_UPGRADE_DETAIL: &str = "HTTP upgrade is not supported for REST endpoints; use a separate protocol: websocket endpoint with explicit message rules";
 const MIN_HTTP2_PREFACE_DETECTION_BYTES: usize = 8;
 
 /// Idle timeout for `relay_until_eof`.  If no data arrives within this window
@@ -181,6 +189,13 @@ impl<'a> DenyResponseContext<'a> {
 }
 
 impl RestProvider {
+    pub(crate) async fn parse_uninspected_request<C: AsyncRead + Unpin>(
+        &self,
+        client: &mut C,
+    ) -> Result<Option<L7Request>> {
+        parse_http_request_with_receipt_protection(client, &self.canonicalize_options, false).await
+    }
+
     /// Deny with a redacted target for the response body.
     pub(crate) async fn deny_with_redacted_target<C: AsyncRead + AsyncWrite + Unpin + Send>(
         &self,
@@ -206,6 +221,14 @@ impl RestProvider {
 async fn parse_http_request<C: AsyncRead + Unpin>(
     client: &mut C,
     canonicalize_options: &crate::l7::path::CanonicalizeOptions,
+) -> Result<Option<L7Request>> {
+    parse_http_request_with_receipt_protection(client, canonicalize_options, true).await
+}
+
+async fn parse_http_request_with_receipt_protection<C: AsyncRead + Unpin>(
+    client: &mut C,
+    canonicalize_options: &crate::l7::path::CanonicalizeOptions,
+    protect_receipt: bool,
 ) -> Result<Option<L7Request>> {
     let mut buf = Vec::with_capacity(4096);
 
@@ -310,7 +333,9 @@ async fn parse_http_request<C: AsyncRead + Unpin>(
         )?;
     }
 
-    buf = strip_platform_request_id_from_head(&buf);
+    if protect_receipt && let Cow::Owned(sanitized) = strip_platform_request_id_from_head(&buf) {
+        buf = sanitized;
+    }
 
     Ok(Some(L7Request {
         action: method,
@@ -332,6 +357,20 @@ pub(crate) fn request_from_buffered_http(
     query_target: &str,
     raw_header: Vec<u8>,
 ) -> Result<L7Request> {
+    let mut request =
+        request_from_buffered_http_unprotected(action, target, query_target, raw_header)?;
+    if let Cow::Owned(sanitized) = strip_platform_request_id_from_head(&request.raw_header) {
+        request.raw_header = sanitized;
+    }
+    Ok(request)
+}
+
+pub(crate) fn request_from_buffered_http_unprotected(
+    action: impl Into<String>,
+    target: impl Into<String>,
+    query_target: &str,
+    raw_header: Vec<u8>,
+) -> Result<L7Request> {
     let header_end = raw_header
         .windows(4)
         .position(|window| window == b"\r\n\r\n")
@@ -342,8 +381,6 @@ pub(crate) fn request_from_buffered_http(
         .map_err(|_| miette!("HTTP headers contain invalid UTF-8"))?;
     let body_length = parse_body_length(header_str)?;
     let (_, query_params) = parse_target_query(query_target)?;
-
-    let raw_header = strip_platform_request_id_from_head(&raw_header);
 
     Ok(L7Request {
         action: action.into(),
@@ -768,6 +805,7 @@ where
             websocket_extensions: WebSocketExtensionMode::Preserve,
             request_body_credential_rewrite: false,
             deny_uninspected_credentials: false,
+            identity_response_coding: false,
             credential_signing: crate::l7::CredentialSigning::None,
             signing_service: "",
             signing_region: "",
@@ -796,6 +834,11 @@ pub(crate) struct RelayRequestOptions<'a> {
     pub(crate) websocket_extensions: WebSocketExtensionMode,
     pub(crate) request_body_credential_rewrite: bool,
     pub(crate) deny_uninspected_credentials: bool,
+    /// Ask the upstream for an identity-coded response.
+    ///
+    /// The relay sets it when an HTTP hook response stage may inspect
+    /// the body.
+    pub(crate) identity_response_coding: bool,
     pub(crate) credential_signing: crate::l7::CredentialSigning,
     pub(crate) signing_service: &'a str,
     pub(crate) signing_region: &'a str,
@@ -825,33 +868,12 @@ pub(crate) struct CredentialGenerationGuard<'a> {
 #[derive(Debug)]
 pub(crate) struct CredentialUnavailableError {
     reason: &'static str,
-    kind: CredentialUnavailableKind,
 }
 
 impl CredentialUnavailableError {
     fn new(reason: &'static str) -> Self {
-        Self {
-            reason,
-            kind: CredentialUnavailableKind::MaterialUnavailable,
-        }
+        Self { reason }
     }
-
-    fn generation_changed(reason: &'static str) -> Self {
-        Self {
-            reason,
-            kind: CredentialUnavailableKind::GenerationChanged,
-        }
-    }
-
-    pub(crate) fn generation_is_stale(&self) -> bool {
-        self.kind == CredentialUnavailableKind::GenerationChanged
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CredentialUnavailableKind {
-    MaterialUnavailable,
-    GenerationChanged,
 }
 
 impl fmt::Display for CredentialUnavailableError {
@@ -893,11 +915,9 @@ impl<'a> CredentialGenerationGuard<'a> {
         {
             Ok(())
         } else {
-            Err(miette::Report::new(
-                CredentialUnavailableError::generation_changed(
-                    "provider credential generation changed before upstream write",
-                ),
-            ))
+            Err(miette::Report::new(CredentialUnavailableError::new(
+                "provider credential generation changed before upstream write",
+            )))
         }
     }
 }
@@ -962,8 +982,48 @@ where
     C: AsyncRead + AsyncWrite + Unpin,
     U: AsyncRead + AsyncWrite + Unpin,
 {
-    let mut observed_upstream = ObservedUpstream { upstream, observer };
+    Box::pin(relay_http_request_with_body_guarded_observed_correlated(
+        req,
+        client,
+        upstream,
+        options,
+        None,
+        response_middleware,
+        observer,
+        correlation,
+    ))
+    .await
+}
+
+/// Relay one request and its response. `live_body` carries a body that HTTP
+/// hook request middleware streams; `req` then holds only its head.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn relay_http_request_with_body_guarded_observed_correlated<C, U>(
+    req: &L7Request,
+    client: &mut C,
+    upstream: &mut U,
+    options: RelayRequestOptions<'_>,
+    live_body: Option<&mut crate::l7::middleware::RequestBodyStream>,
+    response_middleware: Option<HttpResponseMiddlewareRelay<'_>>,
+    observer: Option<&EndpointObserver>,
+    correlation: Option<&RequestCorrelation>,
+) -> Result<RelayOutcome>
+where
+    C: AsyncRead + AsyncWrite + Unpin,
+    U: AsyncRead + AsyncWrite + Unpin,
+{
+    let mut observed_upstream = ObservedUpstream {
+        upstream,
+        observer,
+        correlation,
+        request_span: None,
+        track_request_span: live_body.is_none(),
+    };
     let upstream = &mut observed_upstream;
+    let mut options = options;
+    if let Some(middleware) = response_middleware.as_ref() {
+        options.identity_response_coding = middleware.inspects_bodies().await;
+    }
     ensure_credential_generation_current(options)?;
     let header_end = req
         .raw_header
@@ -973,6 +1033,40 @@ where
     let header_str = std::str::from_utf8(&req.raw_header[..header_end])
         .map_err(|_| miette!("HTTP headers contain invalid UTF-8"))?;
     let client_requested_upgrade = client_requested_upgrade(header_str);
+    if let Some(body) = live_body {
+        // Signing, body rewriting, and MCP validation need the whole body, so
+        // their routes withhold middleware output instead.
+        if options.credential_signing.is_sigv4()
+            || options.request_body_credential_rewrite
+            || options.mcp_request_validation.is_some()
+        {
+            return Err(miette!(
+                "this route cannot stream a request middleware body to the upstream"
+            ));
+        }
+        let relayed = request_body::relay_live_request_and_response(
+            req,
+            client,
+            upstream,
+            body,
+            options,
+            RelayResponseOptions {
+                websocket_extensions: options.websocket_extensions,
+                websocket: None,
+                client_requested_upgrade,
+                observer,
+                correlation,
+            },
+            response_middleware,
+        )
+        .await;
+        if let Err(error) = &relayed
+            && let Some(reason) = error.downcast_ref::<BodyCredentialError>()
+        {
+            emit_uninspected_body_credential_denial(req, &options, *reason);
+        }
+        return relayed;
+    }
     let is_websocket_request = request_is_websocket_upgrade(&req.raw_header[..header_end]);
     let websocket_request = if options.websocket_extensions == WebSocketExtensionMode::Preserve {
         None
@@ -996,7 +1090,10 @@ where
         options.websocket_extensions,
         websocket_request.is_some(),
     )?;
-    let header_bytes = strip_connection_nominated_headers(&header_bytes, is_websocket_request)?;
+    let mut header_bytes = strip_connection_nominated_headers(&header_bytes, is_websocket_request)?;
+    if options.identity_response_coding {
+        header_bytes = require_identity_response_coding(&header_bytes)?;
+    }
     let websocket_response =
         websocket_request
             .as_ref()
@@ -1006,8 +1103,18 @@ where
                 offered_subprotocols: request.subprotocols.clone(),
             });
 
-    let rewrite_result =
-        rewrite_http_header_block(&header_bytes, options.resolver).map_err(miette::Report::new)?;
+    let rewrite_span =
+        if options.resolver.is_some() || contains_reserved_credential_marker_bytes(&header_bytes) {
+            correlation.map_or_else(tracing::Span::none, |correlation| {
+                correlation.stage(RequestStage::CredentialPrepare)
+            })
+        } else {
+            tracing::Span::none()
+        };
+    let rewrite_result = rewrite_span
+        .in_scope(|| rewrite_http_header_block(&header_bytes, options.resolver))
+        .map_err(miette::Report::new)?;
+    drop(rewrite_span);
 
     if let Some(validation) = options.mcp_request_validation {
         // Header credential resolution and hop-by-hop cleanup must finish
@@ -1162,15 +1269,22 @@ where
                             guard.ensure_current()?;
                         }
 
-                        let signed = crate::sigv4::apply_sigv4_to_request(
-                            &full_request,
-                            options.host,
-                            &region,
-                            service,
-                            access_key,
-                            secret_key,
-                            session_token,
-                        )?;
+                        let signing_span = correlation
+                            .map_or_else(tracing::Span::none, |correlation| {
+                                correlation.stage(RequestStage::CredentialPrepare)
+                            });
+                        let signed = signing_span.in_scope(|| {
+                            crate::sigv4::apply_sigv4_to_request(
+                                &full_request,
+                                options.host,
+                                &region,
+                                service,
+                                access_key,
+                                secret_key,
+                                session_token,
+                            )
+                        })?;
+                        drop(signing_span);
                         ensure_credential_generation_current(options)?;
                         upstream.write_all(&signed).await.into_diagnostic()?;
                     } else {
@@ -1181,16 +1295,23 @@ where
                             }
                             _ => SignableBody::UnsignedPayload,
                         };
-                        let signed_headers = crate::sigv4::apply_sigv4_headers_only_with_body(
-                            &rewrite_result.rewritten,
-                            options.host,
-                            &region,
-                            service,
-                            access_key,
-                            secret_key,
-                            session_token,
-                            signable_body,
-                        )?;
+                        let signing_span = correlation
+                            .map_or_else(tracing::Span::none, |correlation| {
+                                correlation.stage(RequestStage::CredentialPrepare)
+                            });
+                        let signed_headers = signing_span.in_scope(|| {
+                            crate::sigv4::apply_sigv4_headers_only_with_body(
+                                &rewrite_result.rewritten,
+                                options.host,
+                                &region,
+                                service,
+                                access_key,
+                                secret_key,
+                                session_token,
+                                signable_body,
+                            )
+                        })?;
+                        drop(signing_span);
                         ensure_credential_generation_current(options)?;
                         upstream
                             .write_all(&signed_headers)
@@ -1216,8 +1337,14 @@ where
                                 }
                             }
                             BodyLength::Chunked => {
-                                relay_chunked(client, upstream, overflow, options.generation_guard)
-                                    .await?;
+                                relay_chunked_with_receipt_protection(
+                                    client,
+                                    upstream,
+                                    overflow,
+                                    options.generation_guard,
+                                    correlation.is_some(),
+                                )
+                                .await?;
                             }
                             BodyLength::None => {
                                 if !overflow.is_empty() {
@@ -1283,6 +1410,7 @@ where
             &rewrite_result.rewritten,
             &req.raw_header[header_end..],
             options,
+            correlation.is_some(),
         )
         .await
         {
@@ -1311,7 +1439,14 @@ where
                 }
             }
             BodyLength::Chunked => {
-                relay_chunked(client, upstream, overflow, options.generation_guard).await?;
+                relay_chunked_with_receipt_protection(
+                    client,
+                    upstream,
+                    overflow,
+                    options.generation_guard,
+                    correlation.is_some(),
+                )
+                .await?;
             }
             BodyLength::None => {
                 if !overflow.is_empty() {
@@ -1321,7 +1456,11 @@ where
         }
     }
     upstream.flush().await.into_diagnostic()?;
+    upstream.request_span.take();
 
+    let response_span = correlation.map_or_else(tracing::Span::none, |correlation| {
+        correlation.stage(RequestStage::Response)
+    });
     let outcome = relay_response(
         &req.action,
         upstream,
@@ -1335,6 +1474,7 @@ where
         },
         response_middleware,
     )
+    .instrument(response_span)
     .await?;
 
     Ok(outcome)
@@ -1359,6 +1499,9 @@ fn ensure_body_generation_current(options: RelayRequestOptions<'_>) -> Result<()
 struct ObservedUpstream<'a, U> {
     upstream: &'a mut U,
     observer: Option<&'a EndpointObserver>,
+    correlation: Option<&'a RequestCorrelation>,
+    request_span: Option<tracing::Span>,
+    track_request_span: bool,
 }
 
 impl<U: AsyncRead + Unpin> AsyncRead for ObservedUpstream<'_, U> {
@@ -1385,7 +1528,17 @@ impl<U: AsyncWrite + Unpin> AsyncWrite for ObservedUpstream<'_, U> {
         buf: &[u8],
     ) -> std::task::Poll<std::io::Result<usize>> {
         let this = self.get_mut();
-        let result = std::pin::Pin::new(&mut *this.upstream).poll_write(cx, buf);
+        let result = if this.track_request_span {
+            let span = this.request_span.get_or_insert_with(|| {
+                this.correlation
+                    .map_or_else(tracing::Span::none, |correlation| {
+                        correlation.stage(RequestStage::UpstreamSend)
+                    })
+            });
+            span.in_scope(|| std::pin::Pin::new(&mut *this.upstream).poll_write(cx, buf))
+        } else {
+            std::pin::Pin::new(&mut *this.upstream).poll_write(cx, buf)
+        };
         if matches!(result, std::task::Poll::Ready(Err(_)))
             && let Some(observer) = this.observer
         {
@@ -1399,7 +1552,11 @@ impl<U: AsyncWrite + Unpin> AsyncWrite for ObservedUpstream<'_, U> {
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
         let this = self.get_mut();
-        let result = std::pin::Pin::new(&mut *this.upstream).poll_flush(cx);
+        let result = if let Some(span) = &this.request_span {
+            span.in_scope(|| std::pin::Pin::new(&mut *this.upstream).poll_flush(cx))
+        } else {
+            std::pin::Pin::new(&mut *this.upstream).poll_flush(cx)
+        };
         if matches!(result, std::task::Poll::Ready(Err(_)))
             && let Some(observer) = this.observer
         {
@@ -1451,6 +1608,7 @@ async fn relay_request_body_with_marker_guard<C, U>(
     headers: &[u8],
     already_read: &[u8],
     options: RelayRequestOptions<'_>,
+    protect_receipt: bool,
 ) -> Result<()>
 where
     C: AsyncRead + Unpin,
@@ -1492,7 +1650,14 @@ where
             write_body_bytes(upstream, &scanner.finish()?, options).await?;
         }
         BodyLength::Chunked => {
-            relay_chunked_with_marker_guard(client, upstream, already_read, options).await?;
+            relay_chunked_with_marker_guard(
+                client,
+                upstream,
+                already_read,
+                options,
+                protect_receipt,
+            )
+            .await?;
         }
     }
     Ok(())
@@ -1503,6 +1668,7 @@ async fn relay_chunked_with_marker_guard<C, U>(
     upstream: &mut U,
     already_read: &[u8],
     options: RelayRequestOptions<'_>,
+    protect_receipt: bool,
 ) -> Result<()>
 where
     C: AsyncRead + Unpin,
@@ -1538,10 +1704,12 @@ where
                     write_body_bytes(upstream, b"\r\n", options).await?;
                     return Ok(());
                 }
-                if !http_field_line_has_name(
-                    &trailer,
-                    openshell_core::token_grant_failure::REQUEST_ID_HEADER,
-                ) {
+                if !protect_receipt
+                    || !http_field_line_has_name(
+                        &trailer,
+                        openshell_core::token_grant_failure::REQUEST_ID_HEADER,
+                    )
+                {
                     write_body_bytes(upstream, &trailer, options).await?;
                     write_body_bytes(upstream, b"\r\n", options).await?;
                 }
@@ -2360,14 +2528,14 @@ fn strip_header(headers: &[u8], strip_name: &str) -> Result<Vec<u8>> {
     Ok(out.into_bytes())
 }
 
-fn strip_platform_request_id_from_head(headers: &[u8]) -> Vec<u8> {
+fn strip_platform_request_id_from_head(headers: &[u8]) -> Cow<'_, [u8]> {
     let header_end = headers
         .windows(4)
         .position(|window| window == b"\r\n\r\n")
         .map_or(headers.len(), |position| position + 4);
     let (header_block, buffered_suffix) = headers.split_at(header_end);
     let protected = openshell_core::token_grant_failure::REQUEST_ID_HEADER.as_bytes();
-    let mut out = Vec::with_capacity(headers.len());
+    let mut out: Option<Vec<u8>> = None;
     let mut position = 0usize;
 
     while position < header_block.len() {
@@ -2377,48 +2545,61 @@ fn strip_platform_request_id_from_head(headers: &[u8]) -> Vec<u8> {
             .map_or(header_block.len(), |end| position + end);
         let line = &header_block[position..line_end];
         if line.is_empty() {
-            out.extend_from_slice(b"\r\n");
+            if position + 2 < header_block.len() {
+                out.get_or_insert_with(|| header_block[..position].to_vec());
+            }
+            if let Some(out) = &mut out {
+                out.extend_from_slice(b"\r\n");
+            }
             break;
         }
-        let Some(colon) = line.iter().position(|byte| *byte == b':') else {
-            out.extend_from_slice(line);
-            out.extend_from_slice(b"\r\n");
-            position = line_end.saturating_add(2);
-            continue;
-        };
-        let name = trim_ascii_ows(&line[..colon]);
-        if name.eq_ignore_ascii_case(protected) {
-            position = line_end.saturating_add(2);
-            continue;
-        }
-        if name.eq_ignore_ascii_case(b"trailer") {
-            let values: Vec<_> = line[colon + 1..]
-                .split(|byte| *byte == b',')
-                .filter(|value| !trim_ascii_ows(value).eq_ignore_ascii_case(protected))
-                .collect();
-            if values.len() != line[colon + 1..].split(|byte| *byte == b',').count() {
-                if values.iter().all(|value| trim_ascii_ows(value).is_empty()) {
-                    position = line_end.saturating_add(2);
-                    continue;
-                }
-                out.extend_from_slice(&line[..=colon]);
-                for (index, value) in values.iter().enumerate() {
-                    if index > 0 {
-                        out.push(b',');
+        if let Some(colon) = line.iter().position(|byte| *byte == b':') {
+            let name = trim_ascii_ows(&line[..colon]);
+            let receipt = name.eq_ignore_ascii_case(protected);
+            let trailer = name.eq_ignore_ascii_case(b"trailer")
+                && line[colon + 1..]
+                    .split(|byte| *byte == b',')
+                    .any(|value| trim_ascii_ows(value).eq_ignore_ascii_case(protected));
+            if receipt || trailer {
+                let out = out.get_or_insert_with(|| {
+                    let mut out = Vec::with_capacity(headers.len());
+                    out.extend_from_slice(&header_block[..position]);
+                    out
+                });
+                if trailer {
+                    let mut values = line[colon + 1..]
+                        .split(|byte| *byte == b',')
+                        .filter(|value| !trim_ascii_ows(value).eq_ignore_ascii_case(protected));
+                    let mut retained = values.clone();
+                    if retained.any(|value| !trim_ascii_ows(value).is_empty()) {
+                        out.extend_from_slice(&line[..=colon]);
+                        if let Some(first) = values.next() {
+                            out.extend_from_slice(first);
+                        }
+                        for value in values {
+                            out.push(b',');
+                            out.extend_from_slice(value);
+                        }
+                        out.extend_from_slice(b"\r\n");
                     }
-                    out.extend_from_slice(value);
                 }
-                out.extend_from_slice(b"\r\n");
                 position = line_end.saturating_add(2);
                 continue;
             }
         }
-        out.extend_from_slice(line);
-        out.extend_from_slice(b"\r\n");
+        if line_end + 2 > header_block.len() {
+            out.get_or_insert_with(|| header_block[..position].to_vec());
+        }
+        if let Some(out) = &mut out {
+            out.extend_from_slice(line);
+            out.extend_from_slice(b"\r\n");
+        }
         position = line_end.saturating_add(2);
     }
-    out.extend_from_slice(buffered_suffix);
-    out
+    out.map_or(Cow::Borrowed(headers), |mut out| {
+        out.extend_from_slice(buffered_suffix);
+        Cow::Owned(out)
+    })
 }
 
 fn trim_ascii_ows(mut value: &[u8]) -> &[u8] {
@@ -2478,6 +2659,15 @@ fn strip_connection_nominated_headers(
     Ok(out)
 }
 
+/// Replace every `Accept-Encoding` field with `identity`.
+///
+/// A request without the field lets the server choose any content coding, so
+/// the field is set rather than removed.
+fn require_identity_response_coding(headers: &[u8]) -> Result<Vec<u8>> {
+    let headers = strip_header(headers, "accept-encoding")?;
+    Ok(append_header(&headers, "Accept-Encoding", "identity"))
+}
+
 fn append_header(headers: &[u8], name: &str, value: &str) -> Vec<u8> {
     let split = headers
         .windows(4)
@@ -2493,7 +2683,10 @@ fn append_header(headers: &[u8], name: &str, value: &str) -> Vec<u8> {
     out
 }
 
-fn apply_header_mutations(headers: &[u8], mutations: &[HeaderMutation]) -> Result<Vec<u8>> {
+pub(crate) fn apply_header_mutations(
+    headers: &[u8],
+    mutations: &[HeaderMutation],
+) -> Result<Vec<u8>> {
     let mut out = headers.to_vec();
     for mutation in mutations {
         match mutation.operation.as_ref() {
@@ -2594,11 +2787,11 @@ pub(crate) fn unsupported_upgrade_detail(
 /// individual HTTP requests, or `None` for a protocol that may relay an
 /// allowed upgrade.
 ///
-/// JSON-RPC, MCP and GraphQL rules inspect each HTTP request body or query.
+/// REST, JSON-RPC, MCP and GraphQL rules inspect individual HTTP requests.
 /// After an upgrade the relay would copy frames that no rule of these
 /// protocols evaluates, so they never upgrade; GraphQL over WebSocket is
 /// served by separate `protocol: websocket` endpoints with GraphQL operation
-/// rules. REST and WebSocket endpoints relay allowed upgrades, and SQL
+/// rules. WebSocket endpoints relay allowed upgrades, and SQL
 /// endpoints keep their existing upgrade behavior. The match is exhaustive so
 /// a new protocol must choose.
 pub(crate) fn upgrade_refusal_for_protocol(
@@ -2608,7 +2801,8 @@ pub(crate) fn upgrade_refusal_for_protocol(
     match protocol {
         L7Protocol::JsonRpc | L7Protocol::Mcp => Some(UNSUPPORTED_JSONRPC_UPGRADE_DETAIL),
         L7Protocol::Graphql => Some(UNSUPPORTED_GRAPHQL_UPGRADE_DETAIL),
-        L7Protocol::Rest | L7Protocol::Websocket | L7Protocol::Sql => None,
+        L7Protocol::Rest => Some(UNSUPPORTED_REST_UPGRADE_DETAIL),
+        L7Protocol::Websocket | L7Protocol::Sql => None,
     }
 }
 
@@ -2621,7 +2815,7 @@ pub(crate) fn upgrade_refusal_for_protocol(
 /// upstream `101` may reach the client. A refusal based on this test therefore
 /// covers every request either one treats as an upgrade. Headers that are not
 /// UTF-8 return false; the shared relay rejects them before forwarding.
-fn request_has_upgrade_header(raw_header: &[u8]) -> bool {
+pub(crate) fn request_has_upgrade_header(raw_header: &[u8]) -> bool {
     let header_end = raw_header
         .windows(4)
         .position(|w| w == b"\r\n\r\n")
@@ -3004,15 +3198,20 @@ pub(crate) async fn send_middleware_deny_response<C: AsyncWrite + Unpin>(
 ///
 /// Unlike an L7 policy denial, a middleware failure does not indicate a
 /// missing policy rule. The response therefore omits policy-advisor guidance
-/// and does not include the middleware runtime's diagnostic text.
+/// and does not include the middleware runtime's diagnostic text. An HTTP
+/// hook failure carries its platform-owned code and stage.
 pub(crate) async fn send_middleware_failure_response<C: AsyncWrite + Unpin>(
     req: &L7Request,
     policy_name: &str,
+    failure: Option<&openshell_supervisor_middleware::MiddlewareFailureDetail>,
     client: &mut C,
     redacted_target: Option<&str>,
     context: Option<DenyResponseContext<'_>>,
 ) -> Result<()> {
-    let body = middleware_failure_response_body(req, policy_name, redacted_target, context);
+    let mut body = middleware_failure_response_body(req, policy_name, redacted_target, context);
+    if let Some(failure) = failure {
+        insert_middleware_failure(&mut body, failure);
+    }
     send_json_response_internal(
         policy_name,
         body_with_request_id(body, context.and_then(|context| context.request_id)),
@@ -3024,6 +3223,24 @@ pub(crate) async fn send_middleware_failure_response<C: AsyncWrite + Unpin>(
     .await
 }
 
+/// Add a middleware failure's stage and platform-owned code to a response
+/// body.
+pub(crate) fn insert_middleware_failure(
+    body: &mut serde_json::Value,
+    failure: &openshell_supervisor_middleware::MiddlewareFailureDetail,
+) {
+    let serde_json::Value::Object(fields) = body else {
+        return;
+    };
+    if let Some(config_name) = &failure.config_name {
+        fields.insert("middleware".to_string(), serde_json::json!(config_name));
+    }
+    fields.insert(
+        "failure_code".to_string(),
+        serde_json::json!(failure.code.as_str()),
+    );
+}
+
 /// Send a platform-owned availability response when shared middleware work
 /// admission is exhausted before the request body is buffered.
 pub(crate) async fn send_middleware_unavailable_response<C: AsyncWrite + Unpin>(
@@ -3033,7 +3250,14 @@ pub(crate) async fn send_middleware_unavailable_response<C: AsyncWrite + Unpin>(
     redacted_target: Option<&str>,
     context: Option<DenyResponseContext<'_>>,
 ) -> Result<()> {
-    let body = middleware_failure_response_body(req, policy_name, redacted_target, context);
+    let mut body = middleware_failure_response_body(req, policy_name, redacted_target, context);
+    insert_middleware_failure(
+        &mut body,
+        &openshell_supervisor_middleware::MiddlewareFailureDetail {
+            config_name: None,
+            code: openshell_supervisor_middleware::HttpFailureCode::Unavailable,
+        },
+    );
     send_json_response_internal(
         policy_name,
         body_with_request_id(body, context.and_then(|context| context.request_id)),
@@ -3053,6 +3277,34 @@ fn body_with_request_id(
         fields.insert("request_id".to_string(), serde_json::json!(request_id));
     }
     body
+}
+
+/// Send a platform-owned 408 when the sandbox stops sending a request body
+/// that request middleware is processing.
+pub(crate) async fn send_request_timeout_response<C: AsyncWrite + Unpin>(
+    req: &L7Request,
+    policy_name: &str,
+    client: &mut C,
+    redacted_target: Option<&str>,
+    context: Option<DenyResponseContext<'_>>,
+) -> Result<()> {
+    let mut body = middleware_failure_response_body(req, policy_name, redacted_target, context);
+    if let serde_json::Value::Object(fields) = &mut body {
+        fields.insert("error".to_string(), serde_json::json!("request_timeout"));
+        fields.insert(
+            "detail".to_string(),
+            serde_json::json!("Request body was not received in time"),
+        );
+    }
+    send_json_response_internal(
+        policy_name,
+        body_with_request_id(body, context.and_then(|context| context.request_id)),
+        client,
+        "408 Request Timeout",
+        None,
+        context.and_then(|context| context.request_id),
+    )
+    .await
 }
 
 /// Send a platform-owned JSON response with an explicit HTTP status.
@@ -3079,18 +3331,15 @@ pub(crate) async fn send_json_response_with_allow<C: AsyncWrite + Unpin>(
 
 pub(crate) async fn send_json_response_with_allow_and_request_id<C: AsyncWrite + Unpin>(
     policy_name: &str,
-    mut body: serde_json::Value,
+    body: serde_json::Value,
     client: &mut C,
     status: &str,
     allowed_methods: Option<&'static str>,
     request_id: &str,
 ) -> Result<()> {
-    if let serde_json::Value::Object(fields) = &mut body {
-        fields.insert("request_id".to_string(), serde_json::json!(request_id));
-    }
     send_json_response_internal(
         policy_name,
-        body,
+        body_with_request_id(body, Some(request_id)),
         client,
         status,
         allowed_methods,
@@ -3101,15 +3350,20 @@ pub(crate) async fn send_json_response_with_allow_and_request_id<C: AsyncWrite +
 
 pub(crate) async fn send_json_response_with_request_id<C: AsyncWrite + Unpin>(
     policy_name: &str,
-    mut body: serde_json::Value,
+    body: serde_json::Value,
     client: &mut C,
     status: &str,
     request_id: &str,
 ) -> Result<()> {
-    if let serde_json::Value::Object(fields) = &mut body {
-        fields.insert("request_id".to_string(), serde_json::json!(request_id));
-    }
-    send_json_response_internal(policy_name, body, client, status, None, Some(request_id)).await
+    send_json_response_with_allow_and_request_id(
+        policy_name,
+        body,
+        client,
+        status,
+        None,
+        request_id,
+    )
+    .await
 }
 
 async fn send_json_response_internal<C: AsyncWrite + Unpin>(
@@ -3464,11 +3718,12 @@ where
 /// `already_read` are overflow bytes buffered while parsing the headers. They
 /// are validated here before being written so ambiguous framing cannot reach
 /// the peer.
-async fn relay_chunked<R, W>(
+async fn relay_chunked_with_receipt_protection<R, W>(
     reader: &mut R,
     writer: &mut W,
     already_read: &[u8],
     generation_guard: Option<&PolicyGenerationGuard>,
+    protect_receipt: bool,
 ) -> Result<()>
 where
     R: AsyncRead + Unpin,
@@ -3519,10 +3774,12 @@ where
                     );
                     return Ok(());
                 }
-                if http_field_line_has_name(
-                    &trailer_line,
-                    openshell_core::token_grant_failure::REQUEST_ID_HEADER,
-                ) {
+                if protect_receipt
+                    && http_field_line_has_name(
+                        &trailer_line,
+                        openshell_core::token_grant_failure::REQUEST_ID_HEADER,
+                    )
+                {
                     input.pending.truncate(pending_start);
                 }
                 if trailer_count == MAX_CHUNK_TRAILER_FIELDS {
@@ -4349,9 +4606,10 @@ mod tests {
         let mut reader = CountingReader::new(wire);
         let mut writer = tokio::io::sink();
 
-        let error = relay_chunked(&mut reader, &mut writer, &[], None)
-            .await
-            .expect_err("an incomplete chunk must fail");
+        let error =
+            relay_chunked_with_receipt_protection(&mut reader, &mut writer, &[], None, false)
+                .await
+                .expect_err("an incomplete chunk must fail");
 
         assert!(error.to_string().contains("ended mid-chunk"));
         assert_eq!(
@@ -4368,9 +4626,10 @@ mod tests {
         let mut reader = CountingReader::new(wire);
         let mut writer = tokio::io::sink();
 
-        let error = relay_chunked(&mut reader, &mut writer, &[], None)
-            .await
-            .expect_err("an oversized chunk-size line must fail");
+        let error =
+            relay_chunked_with_receipt_protection(&mut reader, &mut writer, &[], None, false)
+                .await
+                .expect_err("an oversized chunk-size line must fail");
 
         assert!(error.to_string().contains("Chunk-size line exceeds"));
     }
@@ -4387,9 +4646,10 @@ mod tests {
         let mut reader = CountingReader::new(wire);
         let mut writer = tokio::io::sink();
 
-        let error = relay_chunked(&mut reader, &mut writer, &[], None)
-            .await
-            .expect_err("an oversized trailer block must fail");
+        let error =
+            relay_chunked_with_receipt_protection(&mut reader, &mut writer, &[], None, false)
+                .await
+                .expect_err("an oversized trailer block must fail");
 
         assert!(error.to_string().contains("Chunk trailers exceed"));
     }
@@ -4404,9 +4664,10 @@ mod tests {
         let mut reader = CountingReader::new(wire);
         let mut writer = tokio::io::sink();
 
-        let error = relay_chunked(&mut reader, &mut writer, &[], None)
-            .await
-            .expect_err("too many trailer fields must fail");
+        let error =
+            relay_chunked_with_receipt_protection(&mut reader, &mut writer, &[], None, false)
+                .await
+                .expect_err("too many trailer fields must fail");
 
         assert!(
             error
@@ -4432,9 +4693,15 @@ mod tests {
                 let mut reader = CountingReader::new(input);
                 let mut writer = CountingWriter::default();
 
-                let error = relay_chunked(&mut reader, &mut writer, already_read, None)
-                    .await
-                    .expect_err("ambiguous chunked framing must fail closed");
+                let error = relay_chunked_with_receipt_protection(
+                    &mut reader,
+                    &mut writer,
+                    already_read,
+                    None,
+                    false,
+                )
+                .await
+                .expect_err("ambiguous chunked framing must fail closed");
 
                 assert!(
                     error.to_string().contains("chunk"),
@@ -5216,9 +5483,15 @@ mod tests {
         let mut relay_reader = tokio::io::BufReader::with_capacity(4096, relay_reader);
         let (mut relay_writer, mut upstream_reader) = tokio::io::duplex(4096);
 
-        relay_chunked(&mut relay_reader, &mut relay_writer, &[], None)
-            .await
-            .expect("chunked body should relay");
+        relay_chunked_with_receipt_protection(
+            &mut relay_reader,
+            &mut relay_writer,
+            &[],
+            None,
+            false,
+        )
+        .await
+        .expect("chunked body should relay");
 
         let mut remaining = vec![0; pipelined_request.len()];
         relay_reader.read_exact(&mut remaining).await.unwrap();
@@ -5244,9 +5517,15 @@ mod tests {
         let mut relay_reader = tokio::io::BufReader::with_capacity(4096, relay_reader);
         let (mut relay_writer, mut upstream_reader) = tokio::io::duplex(4096);
 
-        relay_chunked(&mut relay_reader, &mut relay_writer, already_read, None)
-            .await
-            .expect("chunked body with trailers should relay");
+        relay_chunked_with_receipt_protection(
+            &mut relay_reader,
+            &mut relay_writer,
+            already_read,
+            None,
+            false,
+        )
+        .await
+        .expect("chunked body with trailers should relay");
 
         let mut remaining = vec![0; pipelined_request.len()];
         relay_reader.read_exact(&mut remaining).await.unwrap();
@@ -5266,7 +5545,7 @@ mod tests {
             b"3\r\nabc\r\n0\r\nX-OpenShell-Request-ID: forged\r\nX-Checksum: ok\r\n\r\n".as_slice();
         let mut writer = Vec::new();
 
-        relay_chunked(&mut reader, &mut writer, &[], None)
+        relay_chunked_with_receipt_protection(&mut reader, &mut writer, &[], None, true)
             .await
             .expect("chunked body should relay");
 
@@ -5284,16 +5563,12 @@ mod tests {
             &mut writer,
             &[],
             RelayRequestOptions::default(),
+            true,
         )
         .await
         .expect("guarded chunked body should relay");
 
-        assert!(
-            !String::from_utf8_lossy(&writer)
-                .to_ascii_lowercase()
-                .contains("x-openshell-request-id")
-        );
-        assert!(String::from_utf8_lossy(&writer).contains("X-Checksum: ok\r\n"));
+        assert_eq!(writer, b"3\r\nabc\r\n0\r\nX-Checksum: ok\r\n\r\n");
     }
 
     #[tokio::test]
@@ -5310,7 +5585,7 @@ mod tests {
         let mut reader =
             tokio::io::BufReader::with_capacity(RELAY_BUF_SIZE, CountingReader::new(wire));
         let mut writer = CountingWriter::default();
-        relay_chunked(&mut reader, &mut writer, &[], None)
+        relay_chunked_with_receipt_protection(&mut reader, &mut writer, &[], None, false)
             .await
             .expect("valid tiny chunks must not be rejected by an aggregate framing limit");
 
@@ -5338,7 +5613,14 @@ mod tests {
         let relay = tokio::spawn(async move {
             let mut relay_reader = tokio::io::BufReader::with_capacity(4096, relay_reader);
             let mut relay_writer = relay_writer;
-            relay_chunked(&mut relay_reader, &mut relay_writer, &[], None).await
+            relay_chunked_with_receipt_protection(
+                &mut relay_reader,
+                &mut relay_writer,
+                &[],
+                None,
+                false,
+            )
+            .await
         });
 
         let first_chunk = b"5\r\nhello\r\n";
@@ -5576,6 +5858,23 @@ mod tests {
         assert!(!sanitized.to_ascii_lowercase().contains("keep-alive:"));
         assert!(!sanitized.to_ascii_lowercase().contains("connection:"));
         assert!(sanitized.contains("X-Visible: yes\r\n"));
+    }
+
+    #[test]
+    fn identity_response_coding_replaces_every_accept_encoding_field() {
+        for raw in [
+            &b"GET /api HTTP/1.1\r\nHost: x\r\nAccept-Encoding: gzip, br\r\naccept-encoding: zstd;q=0.5\r\nX-Visible: yes\r\n\r\n"[..],
+            // Without the field the server may choose any coding.
+            b"GET /api HTTP/1.1\r\nHost: x\r\nX-Visible: yes\r\n\r\n",
+        ] {
+            let rewritten = require_identity_response_coding(raw).expect("rewrite request head");
+            let rewritten = String::from_utf8(rewritten).unwrap();
+
+            assert_eq!(
+                rewritten,
+                "GET /api HTTP/1.1\r\nHost: x\r\nX-Visible: yes\r\nAccept-Encoding: identity\r\n\r\n"
+            );
+        }
     }
 
     #[test]
@@ -6785,6 +7084,9 @@ mod tests {
             let mut upstream = ObservedUpstream {
                 upstream: &mut response,
                 observer: Some(&observer),
+                correlation: None,
+                request_span: None,
+                track_request_span: true,
             };
             let mut client = Vec::new();
             relay_response(
@@ -6813,31 +7115,11 @@ mod tests {
 
     #[tokio::test]
     async fn endpoint_observation_rejects_malformed_http_status() {
-        let (observer, mut receiver) = test_endpoint_observer().await;
-        let mut upstream = &b"not-http 200 nope\r\nContent-Length: 0\r\n\r\n"[..];
-        let mut client = Vec::new();
-
-        let result = relay_response(
-            "POST",
-            &mut upstream,
-            &mut client,
-            RelayResponseOptions {
-                observer: Some(&observer),
-                ..Default::default()
-            },
-            None,
+        assert_observed_response_result(
+            b"not-http 200 nope\r\nContent-Length: 0\r\n\r\n",
+            EndpointResult::TransportFailed,
         )
         .await;
-
-        assert!(result.is_err(), "malformed response must fail closed");
-        assert!(client.is_empty());
-        assert!(matches!(
-            receiver.try_recv().expect("transport failure observation"),
-            EndpointStatusCommand::Observe {
-                result: EndpointResult::TransportFailed,
-                ..
-            }
-        ));
     }
 
     #[tokio::test]
@@ -7176,7 +7458,22 @@ mod tests {
             policy_name: "test-policy",
             generation_guard: None,
             whole_body_timeout: DEFAULT_HTTP_RESPONSE_WHOLE_BODY_TIMEOUT,
+            client_accepts_chunked: true,
+            request_head: Some(forwarded_request_head(&format!(
+                "{method} /data HTTP/1.1\r\nHost: example.test\r\n\r\n"
+            ))),
         }
+    }
+
+    /// The forwarded head of a request whose raw head is `raw`.
+    fn forwarded_request_head(raw: &str) -> crate::l7::middleware::ForwardedRequestHead {
+        crate::l7::middleware::ForwardedRequestHead::new(&L7Request {
+            action: "GET".into(),
+            target: "/data".into(),
+            query_params: HashMap::new(),
+            raw_header: raw.as_bytes().to_vec(),
+            body_length: BodyLength::None,
+        })
     }
 
     async fn run_response_middleware_relay(
@@ -7729,6 +8026,600 @@ mod tests {
         assert!(delivered.is_empty());
     }
 
+    /// HTTP hook response stage that streams its input back and
+    /// declares `declared` output bytes. A stage that declares an empty output
+    /// emits nothing. With `gate`, it waits after the first byte of each input
+    /// chunk. It rejects at `input_end` when `reject` is set. `output_start`
+    /// carries `late_mutations`. With `captured_request_headers`, it records
+    /// the request headers its preflight carries.
+    #[derive(Default)]
+    struct HookEchoStage {
+        declared: Option<u64>,
+        reject: bool,
+        gate: Option<ResponseBodyGate>,
+        late_mutations: Vec<HeaderMutation>,
+        captured_request_headers: Option<Arc<std::sync::Mutex<Option<Vec<HttpHeader>>>>>,
+    }
+
+    async fn emit_hook_result(
+        sender: &mpsc::Sender<
+            std::result::Result<openshell_core::proto::HttpResponseHookResult, tonic::Status>,
+        >,
+        result: openshell_core::proto::http_response_hook_result::Result,
+    ) -> bool {
+        sender
+            .send(Ok(openshell_core::proto::HttpResponseHookResult {
+                result: Some(result),
+            }))
+            .await
+            .is_ok()
+    }
+
+    #[tonic::async_trait]
+    impl openshell_supervisor_middleware::InProcessMiddleware for HookEchoStage {
+        async fn describe(&self) -> MiddlewareManifest {
+            MiddlewareManifest {
+                name: "test/session-echo".into(),
+                service_version: "test".into(),
+                bindings: vec![MiddlewareBinding {
+                    operation: SupervisorMiddlewareOperation::HttpResponse as i32,
+                    phase: SupervisorMiddlewarePhase::PreReturn as i32,
+                    max_payload_bytes: 4096,
+                    request_timeout: None,
+                }],
+                expected_audience: String::new(),
+                extension: Some(
+                    openshell_core::extension_protocol::http_hooks_middleware_metadata(
+                        "openshell/test-session-echo",
+                        "test",
+                    ),
+                ),
+            }
+        }
+
+        async fn validate_config(
+            &self,
+            _middleware_name: &str,
+            _config: &prost_types::Struct,
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        async fn evaluate_http_request(
+            &self,
+            _request: openshell_supervisor_middleware::HttpRequestView<'_>,
+        ) -> Result<HttpRequestResult> {
+            Err(miette!("HTTP hook test stage"))
+        }
+
+        async fn open_http_response_hook(
+            &self,
+            mut events: mpsc::Receiver<openshell_core::proto::HttpResponseHookEvent>,
+        ) -> std::result::Result<
+            openshell_supervisor_middleware::HttpResponseHookResultStream,
+            tonic::Status,
+        > {
+            use openshell_core::proto::{
+                HttpDenial, HttpDuplexMode, HttpFinish, HttpInspect, HttpOutputChunk,
+                HttpOutputStart, HttpPreflightResult, MiddlewareDiagnostics, http_inspect,
+                http_preflight_result, http_response_hook_event, http_response_hook_result,
+            };
+            let (declared, reject, gate) = (self.declared, self.reject, self.gate.clone());
+            let late_mutations = self.late_mutations.clone();
+            let captured_request_headers = self.captured_request_headers.clone();
+            let (sender, receiver) = mpsc::channel(4);
+            tokio::spawn(async move {
+                while let Some(event) = events.recv().await {
+                    let sent = match event.event {
+                        Some(http_response_hook_event::Event::Preflight(preflight)) => {
+                            if let Some(captured) = &captured_request_headers {
+                                *captured.lock().expect("preflight capture lock") =
+                                    preflight.response.map(|response| response.request_headers);
+                            }
+                            emit_hook_result(
+                                &sender,
+                                http_response_hook_result::Result::PreflightResult(
+                                    HttpPreflightResult {
+                                        decision: Some(http_preflight_result::Decision::Inspect(
+                                            HttpInspect {
+                                                mode: Some(http_inspect::Mode::Duplex(
+                                                    HttpDuplexMode {},
+                                                )),
+                                            },
+                                        )),
+                                        ..Default::default()
+                                    },
+                                ),
+                            )
+                            .await
+                        }
+                        Some(http_response_hook_event::Event::Begin(_)) => {
+                            emit_hook_result(
+                                &sender,
+                                http_response_hook_result::Result::OutputStart(HttpOutputStart {
+                                    header_mutations: late_mutations.clone(),
+                                    output_body_bytes: declared,
+                                }),
+                            )
+                            .await
+                        }
+                        Some(http_response_hook_event::Event::InputChunk(_))
+                            if declared == Some(0) =>
+                        {
+                            true
+                        }
+                        Some(http_response_hook_event::Event::InputChunk(chunk)) => {
+                            let (first, rest) = chunk.data.split_at(1);
+                            let mut sent = emit_hook_result(
+                                &sender,
+                                http_response_hook_result::Result::OutputChunk(HttpOutputChunk {
+                                    data: first.to_vec(),
+                                }),
+                            )
+                            .await;
+                            if let Some(gate) = &gate {
+                                gate.entered.notify_one();
+                                gate.release.notified().await;
+                            }
+                            if sent && !rest.is_empty() {
+                                sent = emit_hook_result(
+                                    &sender,
+                                    http_response_hook_result::Result::OutputChunk(
+                                        HttpOutputChunk {
+                                            data: rest.to_vec(),
+                                        },
+                                    ),
+                                )
+                                .await;
+                            }
+                            sent
+                        }
+                        Some(http_response_hook_event::Event::InputEnd(_)) if reject => {
+                            emit_hook_result(
+                                &sender,
+                                http_response_hook_result::Result::BlockDelivery(HttpDenial {
+                                    diagnostics: Some(MiddlewareDiagnostics {
+                                        reason_code: "late_match".into(),
+                                        ..Default::default()
+                                    }),
+                                }),
+                            )
+                            .await
+                        }
+                        Some(http_response_hook_event::Event::InputEnd(_)) => {
+                            emit_hook_result(
+                                &sender,
+                                http_response_hook_result::Result::Finish(HttpFinish::default()),
+                            )
+                            .await
+                        }
+                        _ => break,
+                    };
+                    if !sent {
+                        break;
+                    }
+                }
+            });
+            Ok(Box::pin(ReceiverStream::new(receiver)))
+        }
+    }
+
+    fn hook_echo_fixture(
+        stage: HookEchoStage,
+    ) -> (
+        openshell_supervisor_middleware::ChainRunner,
+        Vec<openshell_supervisor_middleware::ChainEntry>,
+    ) {
+        let runner = openshell_supervisor_middleware::ChainRunner::new(Arc::new(stage));
+        let chain = vec![openshell_supervisor_middleware::ChainEntry {
+            name: "response".into(),
+            implementation: "test/session-echo".into(),
+            order: 0,
+            config: prost_types::Struct::default(),
+            on_error: openshell_supervisor_middleware::OnError::FailClosed,
+        }];
+        (runner, chain)
+    }
+
+    #[tokio::test]
+    async fn hook_response_holds_back_completion_until_the_stage_finishes() {
+        let response = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello";
+        for (name, declared, reject, expected_end) in [
+            ("declared length, finished", Some(5), false, "\r\n\r\nhello"),
+            // The client sees a body one byte short of its declared length.
+            ("declared length, rejected", Some(5), true, "\r\n\r\nhell"),
+            ("chunked, finished", None, false, "4\r\nello\r\n0\r\n\r\n"),
+            // No terminating chunk follows a rejection.
+            ("chunked, rejected", None, true, "1\r\nh\r\n4\r\nello\r\n"),
+        ] {
+            let (runner, chain) = hook_echo_fixture(HookEchoStage {
+                declared,
+                reject,
+                ..Default::default()
+            });
+            let mut upstream = response.as_slice();
+            let mut delivered = Vec::new();
+            let outcome = relay_response(
+                "GET",
+                &mut upstream,
+                &mut delivered,
+                RelayResponseOptions::default(),
+                Some(response_middleware_context(&runner, &chain, "GET")),
+            )
+            .await;
+            assert_eq!(outcome.is_ok(), !reject, "{name}: {outcome:?}");
+            let delivered = String::from_utf8(delivered).unwrap();
+            assert!(
+                delivered.starts_with("HTTP/1.1 200 OK\r\n"),
+                "{name}: {delivered}"
+            );
+            assert!(delivered.ends_with(expected_end), "{name}: {delivered}");
+        }
+    }
+
+    #[tokio::test]
+    async fn hook_response_correlation_separates_denial_failure_and_mutation() {
+        use crate::test_support::request_tracing::RequestTracing;
+        use opentelemetry_sdk::trace::Sampler;
+        use tracing::instrument::WithSubscriber as _;
+
+        for (declared, reject, expected) in [
+            (5, false, "allowed"),
+            (5, true, "denied"),
+            (4, false, "platform_error"),
+        ] {
+            for sampler in [None, Some(Sampler::AlwaysOff), Some(Sampler::AlwaysOn)] {
+                let sampled = matches!(sampler, Some(Sampler::AlwaysOn));
+                let capture = RequestTracing::new(sampler);
+                async {
+                    let request = request_from_buffered_http(
+                        "GET",
+                        "/data",
+                        "/data",
+                        b"GET /data HTTP/1.1\r\nHost: example.test\r\n\r\n".to_vec(),
+                    )
+                    .unwrap();
+                    let context = crate::l7::relay::L7EvalContext {
+                        host: "example.test".into(),
+                        port: 443,
+                        ..Default::default()
+                    };
+                    let correlation = RequestCorrelation::with_request_id(
+                        &request,
+                        &context,
+                        "current-response".into(),
+                    );
+                    let (runner, chain) = hook_echo_fixture(HookEchoStage {
+                        declared: Some(declared),
+                        reject,
+                        late_mutations: vec![write_header(
+                            "X-Inspected",
+                            "yes",
+                            ExistingHeaderAction::Overwrite,
+                        )],
+                        ..Default::default()
+                    });
+                    let mut middleware = response_middleware_context(&runner, &chain, "GET");
+                    middleware.request_context.request_id = correlation.request_id().into();
+                    let mut upstream =
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello".as_slice();
+                    let mut delivered = Vec::new();
+                    let result = relay_response(
+                        "GET",
+                        &mut upstream,
+                        &mut delivered,
+                        RelayResponseOptions {
+                            correlation: Some(&correlation),
+                            ..Default::default()
+                        },
+                        Some(middleware),
+                    )
+                    .await;
+                    assert_eq!(
+                        result.is_ok(),
+                        expected == "allowed",
+                        "{expected}: {result:?}"
+                    );
+                    assert!(
+                        String::from_utf8_lossy(&delivered)
+                            .contains("x-openshell-request-id: current-response\r\n")
+                    );
+                }
+                .with_subscriber(capture.subscriber())
+                .await;
+                let events = capture.events.json_events();
+                let primary: Vec<_> = events
+                    .iter()
+                    .filter(|event| event["class_uid"] == 4002)
+                    .collect();
+                assert!(!primary.is_empty());
+                assert!(
+                    primary
+                        .iter()
+                        .all(|event| event["metadata"]["correlation_uid"] == "current-response")
+                );
+                assert!(
+                    !capture
+                        .created_span_names()
+                        .contains(&"supervisor.egress.deny")
+                );
+                let spans = capture.spans();
+                if sampled {
+                    let root = spans
+                        .iter()
+                        .find(|span| span.name == "openshell.http.request")
+                        .unwrap();
+                    let phases: Vec<_> = spans
+                        .iter()
+                        .filter(|span| span.name == "openshell.middleware.response")
+                        .collect();
+                    assert_eq!(phases.len(), 1);
+                    assert_eq!(phases[0].parent_span_id, root.span_context.span_id());
+                    for (key, value) in [
+                        ("openshell.middleware.outcome", expected),
+                        ("openshell.middleware.mutated", "true"),
+                    ] {
+                        assert!(
+                            phases[0]
+                                .attributes
+                                .iter()
+                                .any(|field| field.key.as_str() == key
+                                    && field.value.as_str() == value),
+                            "{:?}",
+                            phases[0]
+                        );
+                    }
+                } else {
+                    assert!(spans.is_empty());
+                }
+                capture.shutdown();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn hook_response_preflight_carries_forwarded_request_headers() {
+        let captured = Arc::new(std::sync::Mutex::new(None));
+        let (runner, chain) = hook_echo_fixture(HookEchoStage {
+            declared: Some(5),
+            captured_request_headers: Some(Arc::clone(&captured)),
+            ..Default::default()
+        });
+        let mut context = response_middleware_context(&runner, &chain, "POST");
+        // The head as request middleware forwarded it, before credentials,
+        // with its inline body.
+        context.request_head = Some(forwarded_request_head(
+            "POST /data HTTP/1.1\r\n\
+             Host: example.test\r\n\
+             Content-Type: application/json\r\n\
+             Authorization: Bearer sandbox-token\r\n\
+             Cookie: session=secret\r\n\
+             X-Api-Key: openshell:resolve:env:API_KEY\r\n\
+             X-Upstream-Auth: Basic dXNlcjpvcGVuc2hlbGw6cmVzb2x2ZTplbnY6UEFTU1dPUkQ=\r\n\
+             X-Trace: one\r\n\
+             X-Trace: two\r\n\
+             Content-Length: 2\r\n\r\n{}",
+        ));
+        let response = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello";
+        let mut upstream = response.as_slice();
+        let mut delivered = Vec::new();
+
+        relay_response(
+            "POST",
+            &mut upstream,
+            &mut delivered,
+            RelayResponseOptions::default(),
+            Some(context),
+        )
+        .await
+        .expect("response relay");
+
+        let observed = captured
+            .lock()
+            .expect("preflight capture lock")
+            .clone()
+            .expect("stage received a response preflight");
+        assert_eq!(
+            observed
+                .iter()
+                .map(|header| (header.name.as_str(), header.value.as_str()))
+                .collect::<Vec<_>>(),
+            [
+                ("content-type", "application/json"),
+                ("x-trace", "one"),
+                ("x-trace", "two"),
+            ]
+        );
+        assert!(delivered.ends_with(b"\r\n\r\nhello"));
+    }
+
+    #[tokio::test]
+    async fn hook_response_without_forwarded_request_head_fails_closed() {
+        let captured = Arc::new(std::sync::Mutex::new(None));
+        let (runner, chain) = hook_echo_fixture(HookEchoStage {
+            captured_request_headers: Some(Arc::clone(&captured)),
+            ..Default::default()
+        });
+        let mut context = response_middleware_context(&runner, &chain, "GET");
+        context.request_head = None;
+        let response = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello";
+        let mut upstream = response.as_slice();
+        let mut delivered = Vec::new();
+
+        let outcome = relay_response(
+            "GET",
+            &mut upstream,
+            &mut delivered,
+            RelayResponseOptions::default(),
+            Some(context),
+        )
+        .await;
+
+        assert!(matches!(outcome.unwrap(), RelayOutcome::Consumed));
+        assert!(captured.lock().expect("preflight capture lock").is_none());
+        let delivered = String::from_utf8(delivered).unwrap();
+        assert!(
+            delivered.starts_with("HTTP/1.1 502 Bad Gateway\r\n"),
+            "{delivered}"
+        );
+        assert!(
+            delivered.contains("middleware_cannot_inspect"),
+            "{delivered}"
+        );
+    }
+
+    #[tokio::test]
+    async fn hook_response_stages_own_integrity_headers() {
+        let response = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nETag: \"v1\"\r\nContent-MD5: md5\r\n\r\nhello";
+        for (name, late_mutations, kept, absent) in [
+            // A DUPLEX stage that passes the body through keeps the
+            // upstream's validators.
+            (
+                "pass-through",
+                Vec::new(),
+                vec!["etag: \"v1\"\r\n", "content-md5: md5\r\n"],
+                vec![],
+            ),
+            // A stage that changes the body replaces or removes them itself.
+            (
+                "rewritten",
+                vec![
+                    write_header("ETag", "\"v2\"", ExistingHeaderAction::Overwrite),
+                    remove_header("Content-MD5"),
+                ],
+                vec!["etag: \"v2\"\r\n"],
+                vec!["content-md5", "\"v1\""],
+            ),
+        ] {
+            let (runner, chain) = hook_echo_fixture(HookEchoStage {
+                declared: Some(5),
+                late_mutations,
+                ..Default::default()
+            });
+            let mut upstream = response.as_slice();
+            let mut delivered = Vec::new();
+            let outcome = relay_response(
+                "GET",
+                &mut upstream,
+                &mut delivered,
+                RelayResponseOptions::default(),
+                Some(response_middleware_context(&runner, &chain, "GET")),
+            )
+            .await;
+            assert!(outcome.is_ok(), "{name}: {outcome:?}");
+            let delivered = String::from_utf8(delivered).unwrap().to_ascii_lowercase();
+            for header in kept {
+                assert!(delivered.contains(header), "{name}: {delivered}");
+            }
+            for text in absent {
+                assert!(!delivered.contains(text), "{name}: {delivered}");
+            }
+            assert!(delivered.ends_with("\r\n\r\nhello"), "{name}: {delivered}");
+        }
+    }
+
+    #[tokio::test]
+    async fn hook_response_holds_the_head_of_an_empty_declared_body() {
+        let response = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello";
+        for reject in [false, true] {
+            let (runner, chain) = hook_echo_fixture(HookEchoStage {
+                declared: Some(0),
+                reject,
+                ..Default::default()
+            });
+            let mut upstream = response.as_slice();
+            let mut delivered = Vec::new();
+            let outcome = relay_response(
+                "GET",
+                &mut upstream,
+                &mut delivered,
+                RelayResponseOptions::default(),
+                Some(response_middleware_context(&runner, &chain, "GET")),
+            )
+            .await;
+            assert!(outcome.is_ok(), "{outcome:?}");
+            let delivered = String::from_utf8(delivered).unwrap();
+            if reject {
+                // Nothing was committed, so the client gets the canonical
+                // denial.
+                assert!(
+                    delivered.starts_with("HTTP/1.1 403 Forbidden\r\n"),
+                    "{delivered}"
+                );
+                assert!(delivered.contains("middleware_denied"), "{delivered}");
+            } else {
+                assert!(delivered.starts_with("HTTP/1.1 200 OK\r\n"), "{delivered}");
+                assert!(delivered.contains("Content-Length: 0\r\n"), "{delivered}");
+                assert!(delivered.ends_with("\r\n\r\n"), "{delivered}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn hook_response_checks_the_policy_generation_before_every_write() {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let (runner, chain) = hook_echo_fixture(HookEchoStage {
+            declared: None,
+            reject: false,
+            gate: Some(ResponseBodyGate {
+                entered: Arc::clone(&entered),
+                release: Arc::clone(&release),
+            }),
+            ..Default::default()
+        });
+        let engine = OpaEngine::from_strings(TEST_POLICY, "network_policies: {}\n").unwrap();
+        let guard = engine
+            .generation_guard(engine.current_generation())
+            .expect("initial generation guard");
+        let mut middleware = response_middleware_context(&runner, &chain, "GET");
+        middleware.generation_guard = Some(&guard);
+        let mut upstream = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nAB".as_slice();
+        let (mut client_read, mut client_write) = tokio::io::duplex(4096);
+        let relay = async move {
+            let outcome = relay_response(
+                "GET",
+                &mut upstream,
+                &mut client_write,
+                RelayResponseOptions::default(),
+                Some(middleware),
+            )
+            .await;
+            drop(client_write);
+            outcome
+        };
+        let client = async {
+            // The stage consumed the whole input, emitted `A`, and waits.
+            entered.notified().await;
+            let mut delivered = Vec::new();
+            let mut buffer = [0u8; 512];
+            while !delivered.windows(6).any(|window| window == b"1\r\nA\r\n") {
+                let count = client_read.read(&mut buffer).await.unwrap();
+                assert!(count > 0, "client closed before the first output chunk");
+                delivered.extend_from_slice(&buffer[..count]);
+            }
+            engine
+                .reload(TEST_POLICY, "network_policies: {}\n")
+                .expect("policy reload");
+            release.notify_one();
+            client_read.read_to_end(&mut delivered).await.unwrap();
+            delivered
+        };
+        let (outcome, delivered) = tokio::join!(relay, client);
+
+        let error = outcome.expect_err("output after a policy reload must not be delivered");
+        assert!(
+            error.to_string().contains("policy generation is stale"),
+            "{error}"
+        );
+        assert!(
+            !delivered.windows(6).any(|window| window == b"1\r\nB\r\n"),
+            "{}",
+            String::from_utf8_lossy(&delivered)
+        );
+        assert!(!delivered.ends_with(b"0\r\n\r\n"));
+    }
+
     #[tokio::test]
     async fn response_middleware_whole_body_timeout_obeys_failure_policy() {
         let response = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello";
@@ -7928,16 +8819,8 @@ mod tests {
 
     #[tokio::test]
     async fn response_middleware_rejects_malformed_response_fields_before_commit() {
-        let (outcome, delivered) = run_response_middleware_relay(
-            b"HTTP/1.1 200 OK\r\nBad Name: value\r\nContent-Length: 0\r\n\r\n",
-            "GET",
-            ResponseRelayScript::WholeBody,
-        )
-        .await;
-        assert!(outcome.is_err());
-        assert!(delivered.is_empty());
-
         for response in [
+            b"HTTP/1.1 200 OK\r\nBad Name: value\r\nContent-Length: 0\r\n\r\n".as_slice(),
             b"HTTP/1.1 200 OK\r\nTrailer: content-length\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n".as_slice(),
             b"HTTP/1.1 200 OK\r\nConnection: x-private\r\nTrailer: x-private\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n".as_slice(),
         ] {
@@ -8187,30 +9070,17 @@ mod tests {
     #[tokio::test]
     async fn response_middleware_obs_text_does_not_bypass_unsafe_headers() {
         for response in [
-            b"HTTP/1.1 200 OK\r\nX-Legacy: \xff\r\nBad Name: value\r\nContent-Length: 2\r\n\r\nok"
-                .as_slice(),
+            b"HTTP/1.1 200 OK\r\nX-Legacy: \xff\r\nBad Name: value\r\nContent-Length: 2\r\n\r\nok".as_slice(),
             b"HTTP/1.1 200 OK\r\nX-Legacy: \xff\x00\r\nContent-Length: 2\r\n\r\nok".as_slice(),
+            b"HTTP/1.1 200 OK\r\nX-Legacy: \xff\r\nTrailer: content-length\r\nContent-Length: 2\r\n\r\nok".as_slice(),
         ] {
             let (outcome, delivered) = run_response_middleware_relay_with_error(
-                response,
-                "GET",
-                ResponseRelayScript::HeadersOnly,
+                response, "GET", ResponseRelayScript::HeadersOnly,
                 openshell_supervisor_middleware::OnError::FailOpen,
-            )
-            .await;
-            assert!(outcome.is_err());
-            assert!(delivered.is_empty());
+            ).await;
+            assert!(matches!(outcome.unwrap(), RelayOutcome::Consumed));
+            assert!(delivered.starts_with(b"HTTP/1.1 502 Bad Gateway\r\n"));
         }
-
-        let (outcome, delivered) = run_response_middleware_relay_with_error(
-            b"HTTP/1.1 200 OK\r\nX-Legacy: \xff\r\nTrailer: content-length\r\nContent-Length: 2\r\n\r\nok",
-            "GET",
-            ResponseRelayScript::HeadersOnly,
-            openshell_supervisor_middleware::OnError::FailOpen,
-        )
-        .await;
-        assert!(matches!(outcome.unwrap(), RelayOutcome::Consumed));
-        assert!(delivered.starts_with(b"HTTP/1.1 502 Bad Gateway\r\n"));
     }
 
     #[tokio::test]
@@ -9852,16 +10722,10 @@ mod tests {
         let websocket = format!(
             "GET /ws HTTP/1.1\r\nHost: example.com\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {VALID_WS_KEY}\r\nSec-WebSocket-Version: 13\r\n\r\n"
         );
-        for protocol in [
-            crate::l7::L7Protocol::Rest,
-            crate::l7::L7Protocol::Websocket,
-        ] {
-            assert_eq!(
-                unsupported_upgrade_detail(websocket.as_bytes(), protocol),
-                None,
-                "{protocol:?}"
-            );
-        }
+        assert_eq!(
+            unsupported_upgrade_detail(websocket.as_bytes(), crate::l7::L7Protocol::Websocket),
+            None,
+        );
 
         // Streamable HTTP requests, a look-alike header name, and a stray
         // `Connection: upgrade` without an `Upgrade` header stay allowed;
@@ -9874,6 +10738,7 @@ mod tests {
         ];
         for raw in ordinary {
             for protocol in [
+                crate::l7::L7Protocol::Rest,
                 crate::l7::L7Protocol::JsonRpc,
                 crate::l7::L7Protocol::Mcp,
                 crate::l7::L7Protocol::Graphql,
@@ -9924,7 +10789,11 @@ mod tests {
             upgrade_refusal_for_protocol(L7Protocol::Graphql),
             Some(UNSUPPORTED_GRAPHQL_UPGRADE_DETAIL)
         );
-        for protocol in [L7Protocol::Rest, L7Protocol::Websocket, L7Protocol::Sql] {
+        assert_eq!(
+            upgrade_refusal_for_protocol(L7Protocol::Rest),
+            Some(UNSUPPORTED_REST_UPGRADE_DETAIL)
+        );
+        for protocol in [L7Protocol::Websocket, L7Protocol::Sql] {
             assert_eq!(upgrade_refusal_for_protocol(protocol), None, "{protocol:?}");
         }
     }
@@ -9962,6 +10831,7 @@ mod tests {
                 "fixture must be an upgrade to the relay: {raw}"
             );
             for protocol in [
+                crate::l7::L7Protocol::Rest,
                 crate::l7::L7Protocol::JsonRpc,
                 crate::l7::L7Protocol::Mcp,
                 crate::l7::L7Protocol::Graphql,
@@ -10594,6 +11464,7 @@ mod tests {
                             )),
                             ..Default::default()
                         },
+                        false,
                     )
                     .await
                     .unwrap();
@@ -10739,6 +11610,7 @@ mod tests {
             &mut upstream_writer,
             wire,
             RelayRequestOptions::default(),
+            false,
         )
         .await
         .expect_err("encoded placeholder must fail closed");
@@ -10759,6 +11631,7 @@ mod tests {
             &mut output,
             wire,
             RelayRequestOptions::default(),
+            false,
         )
         .await
         .expect_err("ambiguous trailer framing must fail closed");

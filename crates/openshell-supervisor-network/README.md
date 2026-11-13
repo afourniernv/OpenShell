@@ -15,6 +15,10 @@ default features, so this instrumentation does not
 require the compute runtime or Unix-only sandbox library. It is a development
 dependency only.
 
+## Connections without inspection
+
+Before the supervisor forwards a connection it cannot inspect (`tls: skip`, transparent TCP, h2c, unsupported tunnels, SQL passthrough), `uninspectable_traffic_gate` checks the matching middleware chain. Any `fail_closed` entry denies the connection, and an all-`fail_open` chain relays it with a bypass finding. For `tls: skip`, the gate runs before `200 Connection Established`, so a denial is a `403`.
+
 ## Sandbox instance inputs
 
 `run_networking` takes a `SandboxInstanceNetwork` with the sandbox identity,
@@ -54,49 +58,32 @@ signing retains the endpoint-scoped resolver's existing trusted access.
 
 ## HTTP enforcement correlation
 
-Inspected HTTP requests create an `openshell.http.request` span with a
-`openshell.policy.evaluate` child when policy evaluation runs. A single
-valid, sampled W3C `traceparent` becomes its parent. OpenShell treats incoming
-trace context as an untrusted correlation hint: malformed or duplicate values
-are ignored, `tracestate` is not adopted into the enforcement span, and an
-unsampled context becomes a link so a caller cannot suppress local enforcement
-telemetry.
+Each inspected HTTP request has one UUID shared by middleware, OCSF
+`metadata.correlation_uid`, and the protected `x-openshell-request-id` response
+header. Application correlation must use another header. The receipt is only a
+join key: it does not establish identity, authorization or complete delivery.
+L4 and passthrough traffic do not provide this header guarantee.
 
-The network supervisor assigns each inspected request a UUID. It stores that
-value in the enforcement span, in correlated OCSF events, and in the
-`x-openshell-request-id` response header. OpenShell removes workload,
-middleware, and upstream attempts to set that header on inspected HTTP paths.
-The header is a correlation handle, not proof of an enforcement decision. A
-consumer must match it to trusted OpenShell OTLP or OCSF output for the same
-sandbox and trace, and must never authorize from the header alone. L4 and
-passthrough traffic do not provide this anti-spoofing guarantee. Span
-attributes distinguish the policy decision from the enforcement action and
-final outcome, such as a local denial, an allowed response, or an upstream or
-platform failure. An unfinished request is reported as incomplete. The
-attributes never include credentials, query values, or request and response
-bodies.
+The audit state commits one primary HTTP Activity record when the final response
+head is written, with an early-termination fallback. It retains the original
+request and process context while consolidating middleware and credential
+outcomes. Routine outcomes do not add records; existing security findings and
+post-header failure records remain distinct. A process crash or indefinitely
+hung request cannot be finalized by the fallback.
 
-Each inspected request emits one primary HTTP Activity record when the final
-response head is written, after response middleware selects what can be returned.
-Informational responses do not commit that record. If the request ends before
-the final head, a guard emits it with the available outcome instead. The byte
-observer does not buffer headers or alter transport behavior. A receipt confirms
-only observation of a response head, not completion of its body. Process crashes
-and requests that remain hung cannot be finalized by the guard.
+Request IDs and audit outcomes do not depend on OpenTelemetry, sampling or
+collector availability. Inspected requests have a supervisor-owned request span
+and children around stages that actually run, with valid workload W3C context
+only as an untrusted link. Their records never create an extra denial-only span,
+even if the request span is disabled or unsampled. Other egress paths retain the
+legacy bounded deny-span behavior. End HTTP tracing before an upgraded session.
+The `openshell.upstream.send` stage measures request writes and flush; response
+handling is measured separately. Receipt filtering preserves raw HTTP bytes
+and borrows unchanged header blocks.
 
-When selected, request and response middleware have separate child spans. Routine
-invocations stay in sampled traces; security findings and notable failures remain
-in OCSF output, linked by the same request ID. Each phase closes when its work
-ends rather than waiting for the entire request. Cancelling an unfinished phase
-marks its span as incomplete without inventing a middleware verdict.
-Streaming observations record flag transitions, not one attribute update per
-body unit, so long responses retain room for their final verdict.
-
-Middleware RPCs propagate the supervisor's current trace context, replacing
-caller-supplied trace metadata without changing bearer authentication. Response
-diagnostics have a session-wide budget; exceeding it preserves enforcement and
-emits a bounded truncation finding.
-
-The middleware crate's Rust `ChainOutcome` now includes a typed termination
-reason. Rust consumers constructing that result must supply the new field;
-middleware protobuf messages and RPC signatures are unchanged.
+Selected middleware phases enrich those existing stage spans with bounded
+outcomes and mutation, failure, admission and partial-delivery observations.
+Legacy and current HTTP hooks share this reporting path. Current streamed
+request phases remain open through body processing or cancellation; response
+phases include finalization. Remote RPC transport status is separate from a
+middleware decision. Findings retain the request UUID even without trace export.
