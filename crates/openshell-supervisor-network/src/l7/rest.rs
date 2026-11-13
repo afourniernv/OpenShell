@@ -27,7 +27,10 @@ pub(crate) use request_body::{
 };
 
 use crate::l7::EndpointObserver;
-use crate::l7::correlation::{RequestCorrelation, RequestStage};
+use crate::l7::correlation::{
+    CredentialMechanism, CredentialOutcome, CredentialPreparation, CredentialSurface,
+    RequestCorrelation, RequestStage,
+};
 use crate::l7::http::{parse_chunk_size_line, validate_chunk_trailer_line};
 use crate::l7::provider::{BodyLength, L7Provider, L7Request, RelayOutcome};
 use crate::opa::PolicyGenerationGuard;
@@ -41,7 +44,7 @@ use openshell_core::proto::{
 };
 use openshell_core::secrets::{
     SecretResolver, contains_reserved_credential_marker, contains_reserved_credential_marker_bytes,
-    rewrite_http_header_block,
+    header_value_contains_reserved_credential_marker, rewrite_http_header_block,
 };
 use openshell_ocsf::ctx::ctx as ocsf_ctx;
 use sha1::{Digest, Sha1};
@@ -868,11 +871,32 @@ pub(crate) struct CredentialGenerationGuard<'a> {
 #[derive(Debug)]
 pub(crate) struct CredentialUnavailableError {
     reason: &'static str,
+    kind: CredentialUnavailableKind,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum CredentialUnavailableKind {
+    MaterialUnavailable,
+    GenerationChanged,
 }
 
 impl CredentialUnavailableError {
     fn new(reason: &'static str) -> Self {
-        Self { reason }
+        Self {
+            reason,
+            kind: CredentialUnavailableKind::MaterialUnavailable,
+        }
+    }
+
+    fn generation_changed(reason: &'static str) -> Self {
+        Self {
+            reason,
+            kind: CredentialUnavailableKind::GenerationChanged,
+        }
+    }
+
+    pub(crate) fn generation_is_stale(&self) -> bool {
+        matches!(self.kind, CredentialUnavailableKind::GenerationChanged)
     }
 }
 
@@ -915,9 +939,11 @@ impl<'a> CredentialGenerationGuard<'a> {
         {
             Ok(())
         } else {
-            Err(miette::Report::new(CredentialUnavailableError::new(
-                "provider credential generation changed before upstream write",
-            )))
+            Err(miette::Report::new(
+                CredentialUnavailableError::generation_changed(
+                    "provider credential generation changed before upstream write",
+                ),
+            ))
         }
     }
 }
@@ -927,6 +953,99 @@ fn ensure_credential_generation_current(options: RelayRequestOptions<'_>) -> Res
         guard.ensure_current()?;
     }
     Ok(())
+}
+
+pub(crate) fn observe_static_credential_surfaces(
+    raw_header: &[u8],
+    correlation: Option<&RequestCorrelation>,
+) -> bool {
+    let Some(correlation) = correlation else {
+        return false;
+    };
+    let Some(header_end) = raw_header
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .map(|position| position + 4)
+    else {
+        return false;
+    };
+    let Ok(header_text) = std::str::from_utf8(&raw_header[..header_end]) else {
+        return false;
+    };
+    let mut lines = header_text.split("\r\n");
+    let mut selected = false;
+
+    if let Some(target) = lines
+        .next()
+        .and_then(|request_line| request_line.split_whitespace().nth(1))
+    {
+        let (path, query) = target
+            .split_once('?')
+            .map_or((target, None), |(path, query)| (path, Some(query)));
+        if contains_reserved_credential_marker(path) {
+            correlation.observe_credential(
+                CredentialMechanism::StaticPlaceholder,
+                CredentialSurface::Path,
+            );
+            selected = true;
+        }
+        if query.is_some_and(contains_reserved_credential_marker) {
+            correlation.observe_credential(
+                CredentialMechanism::StaticPlaceholder,
+                CredentialSurface::Query,
+            );
+            selected = true;
+        }
+    }
+
+    for line in lines.take_while(|line| !line.is_empty()) {
+        let Some((_, value)) = line.split_once(':') else {
+            continue;
+        };
+        if header_value_contains_reserved_credential_marker(value) {
+            correlation.observe_credential(
+                CredentialMechanism::StaticPlaceholder,
+                CredentialSurface::Header,
+            );
+            selected = true;
+        }
+    }
+    selected
+}
+
+fn rewrite_credential_headers(
+    header: &[u8],
+    resolver: Option<&SecretResolver>,
+    correlation: Option<&RequestCorrelation>,
+) -> std::result::Result<
+    openshell_core::secrets::RewriteResult,
+    openshell_core::secrets::UnresolvedPlaceholderError,
+> {
+    let selected = observe_static_credential_surfaces(header, correlation);
+    let span = if resolver.is_some() || contains_reserved_credential_marker_bytes(header) {
+        correlation.map_or_else(tracing::Span::none, |correlation| {
+            correlation.stage(RequestStage::CredentialPrepare)
+        })
+    } else {
+        tracing::Span::none()
+    };
+    let preparation = CredentialPreparation::new(correlation, span);
+    let result = preparation
+        .span()
+        .in_scope(|| rewrite_http_header_block(header, resolver));
+    if selected && let Some(correlation) = correlation {
+        correlation.complete_credential_mechanism(
+            CredentialMechanism::StaticPlaceholder,
+            match &result {
+                Ok(_) => CredentialOutcome::Prepared,
+                Err(error) if error.is_endpoint_mismatch() || error.is_placement_mismatch() => {
+                    CredentialOutcome::Denied
+                }
+                Err(_) => CredentialOutcome::Unavailable,
+            },
+        );
+    }
+    result
 }
 
 pub(crate) async fn relay_http_request_with_options_guarded<C, U>(
@@ -1018,6 +1137,7 @@ where
         correlation,
         request_span: None,
         track_request_span: live_body.is_none(),
+        delivery_started: false,
     };
     let upstream = &mut observed_upstream;
     let mut options = options;
@@ -1103,18 +1223,8 @@ where
                 offered_subprotocols: request.subprotocols.clone(),
             });
 
-    let rewrite_span =
-        if options.resolver.is_some() || contains_reserved_credential_marker_bytes(&header_bytes) {
-            correlation.map_or_else(tracing::Span::none, |correlation| {
-                correlation.stage(RequestStage::CredentialPrepare)
-            })
-        } else {
-            tracing::Span::none()
-        };
-    let rewrite_result = rewrite_span
-        .in_scope(|| rewrite_http_header_block(&header_bytes, options.resolver))
+    let rewrite_result = rewrite_credential_headers(&header_bytes, options.resolver, correlation)
         .map_err(miette::Report::new)?;
-    drop(rewrite_span);
 
     if let Some(validation) = options.mcp_request_validation {
         // Header credential resolution and hop-by-hop cleanup must finish
@@ -1150,9 +1260,23 @@ where
 
     // Apply SigV4 signing if configured.
     if options.credential_signing.is_sigv4() {
+        let signing_span = correlation.map_or_else(tracing::Span::none, |correlation| {
+            correlation.stage(RequestStage::CredentialPrepare)
+        });
+        let preparation = CredentialPreparation::new(correlation, signing_span);
+        if let Some(correlation) = correlation {
+            correlation
+                .observe_credential(CredentialMechanism::SigV4, CredentialSurface::Signature);
+        }
         // Defense-in-depth: credential_signing and request_body_credential_rewrite
         // are mutually exclusive (validated at policy load time).
         if options.request_body_credential_rewrite {
+            if let Some(correlation) = correlation {
+                correlation.complete_credential_mechanism(
+                    CredentialMechanism::SigV4,
+                    CredentialOutcome::Unavailable,
+                );
+            }
             return Err(miette!(
                 "credential_signing and request_body_credential_rewrite are \
                  mutually exclusive on the same endpoint"
@@ -1170,16 +1294,28 @@ where
             client.flush().await.into_diagnostic()?;
         }
         if let Some(resolver) = options.resolver {
-            let access_key = resolver
-                .resolve_current_env_key_checked("AWS_ACCESS_KEY_ID", "sigv4")
-                .map_err(miette::Report::new)?;
-            let secret_key = resolver
-                .resolve_current_env_key_checked("AWS_SECRET_ACCESS_KEY", "sigv4")
-                .map_err(miette::Report::new)?;
-            let session_token = resolver
-                .resolve_current_env_key_checked("AWS_SESSION_TOKEN", "sigv4")
-                .map_err(miette::Report::new)?;
+            let resolve = |key| {
+                resolver
+                    .resolve_current_env_key_checked(key, "sigv4")
+                    .inspect_err(|error| {
+                        if let Some(correlation) = correlation {
+                            correlation.complete_credential_mechanism(
+                                CredentialMechanism::SigV4,
+                                if error.is_endpoint_mismatch() || error.is_placement_mismatch() {
+                                    CredentialOutcome::Denied
+                                } else {
+                                    CredentialOutcome::Unavailable
+                                },
+                            );
+                        }
+                    })
+                    .map_err(miette::Report::new)
+            };
+            let access_key = resolve("AWS_ACCESS_KEY_ID")?;
+            let secret_key = resolve("AWS_SECRET_ACCESS_KEY")?;
+            let session_token = resolve("AWS_SESSION_TOKEN")?;
 
+            #[allow(clippy::single_match_else)]
             match (access_key, secret_key) {
                 (Some(access_key), Some(secret_key)) => {
                     // Use explicit signing_region from policy if set,
@@ -1188,6 +1324,12 @@ where
                         match crate::sigv4::extract_aws_region(options.host) {
                             Some(r) => r,
                             None => {
+                                if let Some(correlation) = correlation {
+                                    correlation.complete_credential_mechanism(
+                                        CredentialMechanism::SigV4,
+                                        CredentialOutcome::Unavailable,
+                                    );
+                                }
                                 return Err(miette!(
                                     "SigV4 signing: cannot extract AWS region from \
                                      hostname '{host}'; set signing_region in the \
@@ -1201,6 +1343,12 @@ where
                     };
                     let service = &options.signing_service;
                     if service.is_empty() {
+                        if let Some(correlation) = correlation {
+                            correlation.complete_credential_mechanism(
+                                CredentialMechanism::SigV4,
+                                CredentialOutcome::Unavailable,
+                            );
+                        }
                         return Err(miette!(
                             "SigV4 signing configured but signing_service not set in policy"
                         ));
@@ -1211,7 +1359,20 @@ where
                         crate::l7::CredentialSigning::SigV4NoBody => {
                             SigV4PayloadMode::UnsignedPayload
                         }
-                        crate::l7::CredentialSigning::SigV4 => detect_payload_mode(header_str)?,
+                        crate::l7::CredentialSigning::SigV4 => {
+                            match detect_payload_mode(header_str) {
+                                Ok(mode) => mode,
+                                Err(error) => {
+                                    if let Some(correlation) = correlation {
+                                        correlation.complete_credential_mechanism(
+                                            CredentialMechanism::SigV4,
+                                            CredentialOutcome::Denied,
+                                        );
+                                    }
+                                    return Err(error);
+                                }
+                            }
+                        }
                         crate::l7::CredentialSigning::None => unreachable!(),
                     };
 
@@ -1232,6 +1393,12 @@ where
                                 // detect_payload_mode's catch-all.
                             }
                             BodyLength::Chunked => {
+                                if let Some(correlation) = correlation {
+                                    correlation.complete_credential_mechanism(
+                                        CredentialMechanism::SigV4,
+                                        CredentialOutcome::Denied,
+                                    );
+                                }
                                 return Err(miette!(
                                     "SigV4 body signing requires Content-Length; \
                                      chunked transfer encoding is not supported in this mode"
@@ -1249,6 +1416,12 @@ where
                         full_request.extend_from_slice(overflow);
                         if let BodyLength::ContentLength(body_len) = body_length {
                             if body_len > MAX_SIGV4_BODY_BYTES as u64 {
+                                if let Some(correlation) = correlation {
+                                    correlation.complete_credential_mechanism(
+                                        CredentialMechanism::SigV4,
+                                        CredentialOutcome::Denied,
+                                    );
+                                }
                                 return Err(miette!(
                                     "SigV4 body signing buffers at most {MAX_SIGV4_BODY_BYTES} bytes"
                                 ));
@@ -1269,22 +1442,34 @@ where
                             guard.ensure_current()?;
                         }
 
-                        let signing_span = correlation
-                            .map_or_else(tracing::Span::none, |correlation| {
-                                correlation.stage(RequestStage::CredentialPrepare)
-                            });
-                        let signed = signing_span.in_scope(|| {
-                            crate::sigv4::apply_sigv4_to_request(
-                                &full_request,
-                                options.host,
-                                &region,
-                                service,
-                                access_key,
-                                secret_key,
-                                session_token,
-                            )
-                        })?;
-                        drop(signing_span);
+                        let signed = preparation
+                            .span()
+                            .in_scope(|| {
+                                crate::sigv4::apply_sigv4_to_request(
+                                    &full_request,
+                                    options.host,
+                                    &region,
+                                    service,
+                                    access_key,
+                                    secret_key,
+                                    session_token,
+                                )
+                            })
+                            .inspect_err(|_| {
+                                if let Some(correlation) = correlation {
+                                    correlation.complete_credential_mechanism(
+                                        CredentialMechanism::SigV4,
+                                        CredentialOutcome::Unavailable,
+                                    );
+                                }
+                            })?;
+                        if let Some(correlation) = correlation {
+                            correlation.complete_credential_mechanism(
+                                CredentialMechanism::SigV4,
+                                CredentialOutcome::Prepared,
+                            );
+                        }
+                        drop(preparation);
                         ensure_credential_generation_current(options)?;
                         upstream.write_all(&signed).await.into_diagnostic()?;
                     } else {
@@ -1295,23 +1480,35 @@ where
                             }
                             _ => SignableBody::UnsignedPayload,
                         };
-                        let signing_span = correlation
-                            .map_or_else(tracing::Span::none, |correlation| {
-                                correlation.stage(RequestStage::CredentialPrepare)
-                            });
-                        let signed_headers = signing_span.in_scope(|| {
-                            crate::sigv4::apply_sigv4_headers_only_with_body(
-                                &rewrite_result.rewritten,
-                                options.host,
-                                &region,
-                                service,
-                                access_key,
-                                secret_key,
-                                session_token,
-                                signable_body,
-                            )
-                        })?;
-                        drop(signing_span);
+                        let signed_headers = preparation
+                            .span()
+                            .in_scope(|| {
+                                crate::sigv4::apply_sigv4_headers_only_with_body(
+                                    &rewrite_result.rewritten,
+                                    options.host,
+                                    &region,
+                                    service,
+                                    access_key,
+                                    secret_key,
+                                    session_token,
+                                    signable_body,
+                                )
+                            })
+                            .inspect_err(|_| {
+                                if let Some(correlation) = correlation {
+                                    correlation.complete_credential_mechanism(
+                                        CredentialMechanism::SigV4,
+                                        CredentialOutcome::Unavailable,
+                                    );
+                                }
+                            })?;
+                        if let Some(correlation) = correlation {
+                            correlation.complete_credential_mechanism(
+                                CredentialMechanism::SigV4,
+                                CredentialOutcome::Prepared,
+                            );
+                        }
+                        drop(preparation);
                         ensure_credential_generation_current(options)?;
                         upstream
                             .write_all(&signed_headers)
@@ -1376,12 +1573,24 @@ where
                     crate::telemetry::egress_emit!(event);
                 }
                 _ => {
+                    if let Some(correlation) = correlation {
+                        correlation.complete_credential_mechanism(
+                            CredentialMechanism::SigV4,
+                            CredentialOutcome::Unavailable,
+                        );
+                    }
                     return Err(miette::Report::new(CredentialUnavailableError::new(
                         "SigV4 signing configured but AWS credentials not found in provider",
                     )));
                 }
             }
         } else {
+            if let Some(correlation) = correlation {
+                correlation.complete_credential_mechanism(
+                    CredentialMechanism::SigV4,
+                    CredentialOutcome::Unavailable,
+                );
+            }
             return Err(miette::Report::new(CredentialUnavailableError::new(
                 "SigV4 signing configured but no secret resolver available",
             )));
@@ -1393,8 +1602,8 @@ where
             &rewrite_result.rewritten,
             header_str,
             &req.raw_header[header_end..],
-            options.resolver,
-            options.generation_guard,
+            options,
+            correlation,
         )
         .await?;
         ensure_credential_generation_current(options)?;
@@ -1415,6 +1624,16 @@ where
         .await
         {
             if let Some(reason) = error.downcast_ref::<BodyCredentialError>() {
+                if let Some(correlation) = correlation {
+                    correlation.observe_credential(
+                        CredentialMechanism::StaticPlaceholder,
+                        CredentialSurface::Body,
+                    );
+                    correlation.complete_credential_mechanism(
+                        CredentialMechanism::StaticPlaceholder,
+                        CredentialOutcome::Denied,
+                    );
+                }
                 emit_uninspected_body_credential_denial(req, &options, *reason);
             }
             return Err(error);
@@ -1502,6 +1721,7 @@ struct ObservedUpstream<'a, U> {
     correlation: Option<&'a RequestCorrelation>,
     request_span: Option<tracing::Span>,
     track_request_span: bool,
+    delivery_started: bool,
 }
 
 impl<U: AsyncRead + Unpin> AsyncRead for ObservedUpstream<'_, U> {
@@ -1539,6 +1759,14 @@ impl<U: AsyncWrite + Unpin> AsyncWrite for ObservedUpstream<'_, U> {
         } else {
             std::pin::Pin::new(&mut *this.upstream).poll_write(cx, buf)
         };
+        if !this.delivery_started
+            && matches!(result, std::task::Poll::Ready(Ok(written)) if written > 0)
+        {
+            this.delivery_started = true;
+            if let Some(correlation) = this.correlation {
+                correlation.record_request_delivery_started();
+            }
+        }
         if matches!(result, std::task::Poll::Ready(Err(_)))
             && let Some(observer) = this.observer
         {
@@ -2000,12 +2228,28 @@ async fn collect_and_rewrite_request_body<C: AsyncRead + Unpin>(
     rewritten_headers: &[u8],
     original_header_str: &str,
     already_read: &[u8],
-    resolver: Option<&SecretResolver>,
-    generation_guard: Option<&PolicyGenerationGuard>,
+    options: RelayRequestOptions<'_>,
+    correlation: Option<&RequestCorrelation>,
 ) -> Result<PreparedRequestBody> {
+    let span = correlation.map_or_else(tracing::Span::none, |correlation| {
+        correlation.stage(RequestStage::CredentialPrepare)
+    });
+    let _preparation = CredentialPreparation::new(correlation, span);
+    let resolver = options.resolver;
+    let generation_guard = options.generation_guard;
     match req.body_length {
         BodyLength::None => {
             if body_bytes_contain_reserved_marker(already_read) {
+                if let Some(correlation) = correlation {
+                    correlation.observe_credential(
+                        CredentialMechanism::StaticPlaceholder,
+                        CredentialSurface::Body,
+                    );
+                    correlation.complete_credential_mechanism(
+                        CredentialMechanism::StaticPlaceholder,
+                        CredentialOutcome::Denied,
+                    );
+                }
                 return Err(miette!(
                     "request body credential rewrite cannot resolve placeholders without explicit body framing"
                 ));
@@ -2042,8 +2286,13 @@ async fn collect_and_rewrite_request_body<C: AsyncRead + Unpin>(
                 body.extend_from_slice(&buf[..n]);
                 remaining -= n;
             }
-            let (headers, body) =
-                rewrite_buffered_body(rewritten_headers, original_header_str, body, resolver)?;
+            let (headers, body) = rewrite_buffered_body(
+                rewritten_headers,
+                original_header_str,
+                body,
+                resolver,
+                correlation,
+            )?;
             Ok(PreparedRequestBody { headers, body })
         }
         BodyLength::Chunked => {
@@ -2055,8 +2304,13 @@ async fn collect_and_rewrite_request_body<C: AsyncRead + Unpin>(
             )
             .await
             .map_err(CollectChunkedError::into_report)?;
-            let (mut headers, body) =
-                rewrite_buffered_body(rewritten_headers, original_header_str, body, resolver)?;
+            let (mut headers, body) = rewrite_buffered_body(
+                rewritten_headers,
+                original_header_str,
+                body,
+                resolver,
+                correlation,
+            )?;
             headers = set_content_length(&headers, body.len())?;
             headers = strip_header(&headers, "transfer-encoding")?;
             headers = strip_header(&headers, "trailer")?;
@@ -2070,14 +2324,28 @@ fn rewrite_buffered_body(
     original_header_str: &str,
     body: Vec<u8>,
     resolver: Option<&SecretResolver>,
+    correlation: Option<&RequestCorrelation>,
 ) -> Result<(Vec<u8>, Vec<u8>)> {
     if body.is_empty() {
         return Ok((headers.to_vec(), body));
     }
 
+    let static_credential_selected = body_bytes_contain_reserved_marker(&body);
+    if static_credential_selected && let Some(correlation) = correlation {
+        correlation.observe_credential(
+            CredentialMechanism::StaticPlaceholder,
+            CredentialSurface::Body,
+        );
+    }
     let content_type = content_type(original_header_str);
     if !is_rewritable_content_type(content_type.as_deref()) {
-        if body_bytes_contain_reserved_marker(&body) {
+        if static_credential_selected {
+            if let Some(correlation) = correlation {
+                correlation.complete_credential_mechanism(
+                    CredentialMechanism::StaticPlaceholder,
+                    CredentialOutcome::Denied,
+                );
+            }
             return Err(miette!(
                 "request body credential rewrite found placeholders in an unsupported content type"
             ));
@@ -2085,31 +2353,80 @@ fn rewrite_buffered_body(
         return Ok((headers.to_vec(), body));
     }
 
-    let mut text = String::from_utf8(body)
-        .map_err(|_| miette!("request body credential rewrite requires UTF-8 text bodies"))?;
+    let Ok(mut text) = String::from_utf8(body) else {
+        if static_credential_selected && let Some(correlation) = correlation {
+            correlation.complete_credential_mechanism(
+                CredentialMechanism::StaticPlaceholder,
+                CredentialOutcome::Denied,
+            );
+        }
+        return Err(miette!(
+            "request body credential rewrite requires UTF-8 text bodies"
+        ));
+    };
     if !contains_reserved_credential_marker(&text) {
         return Ok((headers.to_vec(), text.into_bytes()));
     }
 
     let Some(resolver) = resolver else {
+        if let Some(correlation) = correlation {
+            correlation.complete_credential_mechanism(
+                CredentialMechanism::StaticPlaceholder,
+                CredentialOutcome::Unavailable,
+            );
+        }
         return Err(miette!(
             "request body credential rewrite found placeholders but no resolver is available"
         ));
     };
 
-    let replacements = if content_type.as_deref() == Some("application/x-www-form-urlencoded") {
-        let (rewritten, replacements) = rewrite_form_urlencoded_body(&text, resolver)?;
-        text = rewritten;
-        replacements
-    } else {
-        resolver
-            .rewrite_text_placeholders(&mut text, "request_body")
-            .map_err(miette::Report::new)?
+    let rewrite_result: Result<usize> =
+        if content_type.as_deref() == Some("application/x-www-form-urlencoded") {
+            rewrite_form_urlencoded_body(&text, resolver).map(|(rewritten, replacements)| {
+                text = rewritten;
+                replacements
+            })
+        } else {
+            resolver
+                .rewrite_text_placeholders(&mut text, "request_body")
+                .map_err(miette::Report::new)
+        };
+    let replacements = match rewrite_result {
+        Ok(replacements) => replacements,
+        Err(error) => {
+            if let Some(correlation) = correlation {
+                let outcome = if error
+                    .downcast_ref::<openshell_core::secrets::UnresolvedPlaceholderError>()
+                    .is_some_and(|error| {
+                        error.is_endpoint_mismatch() || error.is_placement_mismatch()
+                    }) {
+                    CredentialOutcome::Denied
+                } else {
+                    CredentialOutcome::Unavailable
+                };
+                correlation
+                    .complete_credential_mechanism(CredentialMechanism::StaticPlaceholder, outcome);
+            }
+            return Err(error);
+        }
     };
     if replacements == 0 || contains_reserved_credential_marker(&text) {
+        if let Some(correlation) = correlation {
+            correlation.complete_credential_mechanism(
+                CredentialMechanism::StaticPlaceholder,
+                CredentialOutcome::Unavailable,
+            );
+        }
         return Err(miette!(
             "request body credential rewrite left unresolved credential placeholders"
         ));
+    }
+
+    if let Some(correlation) = correlation {
+        correlation.complete_credential_mechanism(
+            CredentialMechanism::StaticPlaceholder,
+            CredentialOutcome::Prepared,
+        );
     }
 
     let body = text.into_bytes();
@@ -4290,6 +4607,40 @@ mod tests {
         captured_preflight_headers: Option<Arc<std::sync::Mutex<Vec<HttpHeader>>>>,
     }
 
+    #[derive(Clone, Copy)]
+    enum TestWriteResult {
+        Success,
+        Zero,
+        Failure,
+    }
+
+    struct TestWriter(TestWriteResult);
+
+    impl AsyncWrite for TestWriter {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            match self.0 {
+                TestWriteResult::Success => Poll::Ready(Ok(buf.len())),
+                TestWriteResult::Zero => Poll::Ready(Ok(0)),
+                TestWriteResult::Failure => Poll::Ready(Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "test write failure",
+                ))),
+            }
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
     #[derive(Clone)]
     struct ResponseBodyGate {
         entered: Arc<tokio::sync::Notify>,
@@ -6052,7 +6403,7 @@ mod tests {
             headers,
             std::str::from_utf8(headers).expect("headers"),
             &wire,
-            None,
+            RelayRequestOptions::default(),
             None,
         )
         .await;
@@ -6084,7 +6435,7 @@ mod tests {
             headers,
             std::str::from_utf8(headers).expect("headers"),
             b"1\r\nx\r\n0\r\nDigest: sha-256=:abc123:\r\n\r\n",
-            None,
+            RelayRequestOptions::default(),
             None,
         )
         .await;
@@ -7052,6 +7403,94 @@ mod tests {
         assert!(receiver.try_recv().is_err(), "one result per exchange");
     }
 
+    fn capture_request_delivery_started(
+        result: TestWriteResult,
+        track_request_span: bool,
+    ) -> String {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let exporter = opentelemetry_sdk::trace::InMemorySpanExporterBuilder::new().build();
+        let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+            .with_simple_exporter(exporter.clone())
+            .build();
+        let subscriber = tracing_subscriber::registry().with(openshell_otel::layer(
+            &provider,
+            "request-delivery-correlation-test",
+        ));
+        let request = L7Request {
+            action: "POST".into(),
+            target: "/v1/action".into(),
+            query_params: HashMap::new(),
+            raw_header:
+                b"POST /v1/action HTTP/1.1\r\nHost: api.example.test\r\nContent-Length: 1\r\n\r\n"
+                    .to_vec(),
+            body_length: BodyLength::ContentLength(1),
+        };
+        let context = crate::l7::relay::L7EvalContext {
+            host: "api.example.test".into(),
+            port: 443,
+            policy_name: "delivery-test".into(),
+            ..Default::default()
+        };
+
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::callsite::rebuild_interest_cache();
+            let correlation = RequestCorrelation::with_request_id(
+                &request,
+                &context,
+                "00000000-0000-4000-8000-000000000013".into(),
+            );
+            let mut writer = TestWriter(result);
+            let mut upstream = ObservedUpstream {
+                upstream: &mut writer,
+                observer: None,
+                correlation: Some(&correlation),
+                request_span: None,
+                track_request_span,
+                delivery_started: false,
+            };
+            let mut context = Context::from_waker(std::task::Waker::noop());
+            let _ = Pin::new(&mut upstream).poll_write(&mut context, b"x");
+            correlation.record_outcome(crate::l7::correlation::HttpOutcome::Allowed);
+        });
+        provider.force_flush().expect("flush spans");
+
+        let attributes = exporter
+            .get_finished_spans()
+            .expect("finished spans")
+            .into_iter()
+            .find(|span| span.name == "openshell.http.request")
+            .expect("HTTP enforcement span")
+            .attributes
+            .into_iter()
+            .map(|attribute| {
+                (
+                    attribute.key.as_str().to_string(),
+                    attribute.value.to_string(),
+                )
+            })
+            .collect::<std::collections::BTreeMap<_, _>>();
+        attributes["openshell.request.delivery_started"].clone()
+    }
+
+    #[test]
+    fn request_delivery_starts_only_after_a_nonzero_upstream_write() {
+        for track_request_span in [true, false] {
+            assert_eq!(
+                capture_request_delivery_started(TestWriteResult::Success, track_request_span),
+                "true"
+            );
+            assert_eq!(
+                capture_request_delivery_started(TestWriteResult::Zero, track_request_span),
+                "false"
+            );
+            assert_eq!(
+                capture_request_delivery_started(TestWriteResult::Failure, track_request_span),
+                "false"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn endpoint_observation_preserves_response_result_after_body_read_error() {
         struct FailedReader;
@@ -7087,6 +7526,7 @@ mod tests {
                 correlation: None,
                 request_span: None,
                 track_request_span: true,
+                delivery_started: false,
             };
             let mut client = Vec::new();
             relay_response(
@@ -11207,6 +11647,164 @@ mod tests {
         (child_env, resolver)
     }
 
+    #[test]
+    fn static_credential_surface_correlation_is_bounded_and_omits_unrelated_requests() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        const MARKER: &str = "openshell:resolve:env:SENTINEL_KEY";
+        let basic = base64::engine::general_purpose::STANDARD.encode(format!("user:{MARKER}"));
+        let selected = L7Request {
+            action: "GET".into(),
+            target: format!("/{MARKER}?token={MARKER}"),
+            query_params: HashMap::new(),
+            raw_header: format!(
+                "GET /{MARKER}?token={MARKER} HTTP/1.1\r\nHost: api.example.test\r\nX-Api-Key: {MARKER}\r\nAuthorization: Basic {basic}\r\n\r\n"
+            )
+            .into_bytes(),
+            body_length: BodyLength::None,
+        };
+        let unrelated = L7Request {
+            action: "GET".into(),
+            target: "/health".into(),
+            query_params: HashMap::new(),
+            raw_header: b"GET /health HTTP/1.1\r\nHost: api.example.test\r\n\r\n".to_vec(),
+            body_length: BodyLength::None,
+        };
+        let ctx = crate::l7::relay::L7EvalContext {
+            host: "api.example.test".into(),
+            port: 443,
+            policy_name: "credential-test".into(),
+            ..Default::default()
+        };
+        let exporter = opentelemetry_sdk::trace::InMemorySpanExporterBuilder::new().build();
+        let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+            .with_simple_exporter(exporter.clone())
+            .build();
+        let subscriber = tracing_subscriber::registry().with(openshell_otel::layer(
+            &provider,
+            "static-credential-correlation-test",
+        ));
+        let (_, resolver) = SecretResolver::from_provider_env(HashMap::from([(
+            "SENTINEL_KEY".to_string(),
+            "synthetic-static-secret".to_string(),
+        )]));
+
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::callsite::rebuild_interest_cache();
+            let correlation = RequestCorrelation::with_request_id(
+                &selected,
+                &ctx,
+                "00000000-0000-4000-8000-000000000011".into(),
+            );
+            rewrite_credential_headers(&selected.raw_header, resolver.as_ref(), Some(&correlation))
+                .expect_err("header credential cannot be used in a path or query");
+            correlation.record_outcome(crate::l7::correlation::HttpOutcome::Allowed);
+
+            let correlation = RequestCorrelation::with_request_id(
+                &unrelated,
+                &ctx,
+                "00000000-0000-4000-8000-000000000012".into(),
+            );
+            rewrite_credential_headers(&unrelated.raw_header, None, Some(&correlation)).unwrap();
+            correlation.record_outcome(crate::l7::correlation::HttpOutcome::Allowed);
+        });
+        provider.force_flush().expect("flush spans");
+
+        let spans = exporter.get_finished_spans().expect("finished spans");
+        let attributes_for = |request_id: &str| {
+            crate::l7::correlation::test_request_attributes(&spans, Some(request_id))
+        };
+        let selected = attributes_for("00000000-0000-4000-8000-000000000011");
+        assert_eq!(selected["openshell.credential.outcome"], "denied");
+        assert_eq!(
+            selected["openshell.credential.mechanisms"],
+            "static_placeholder"
+        );
+        assert_eq!(
+            selected["openshell.credential.surfaces"],
+            "header,path,query"
+        );
+        assert!(!format!("{selected:?}").contains("SENTINEL_KEY"));
+
+        let unrelated = attributes_for("00000000-0000-4000-8000-000000000012");
+        assert!(!unrelated.contains_key("openshell.credential.outcome"));
+        assert!(!unrelated.contains_key("openshell.credential.mechanisms"));
+        assert!(!unrelated.contains_key("openshell.credential.surfaces"));
+    }
+
+    #[tokio::test]
+    async fn invalid_utf8_body_with_placeholder_is_correlated_as_denied() {
+        use tracing::instrument::WithSubscriber as _;
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let request = L7Request {
+            action: "POST".into(),
+            target: "/v1/action".into(),
+            query_params: HashMap::new(),
+            raw_header: b"POST /v1/action HTTP/1.1\r\nHost: api.example.test\r\nContent-Type: application/json\r\nContent-Length: 45\r\n\r\n"
+                .to_vec(),
+            body_length: BodyLength::ContentLength(45),
+        };
+        let context = crate::l7::relay::L7EvalContext {
+            host: "api.example.test".into(),
+            port: 443,
+            policy_name: "credential-test".into(),
+            ..Default::default()
+        };
+        let exporter = opentelemetry_sdk::trace::InMemorySpanExporterBuilder::new().build();
+        let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+            .with_simple_exporter(exporter.clone())
+            .build();
+        let subscriber = tracing_subscriber::registry().with(openshell_otel::layer(
+            &provider,
+            "body-credential-correlation-test",
+        ));
+
+        async {
+            tracing::callsite::rebuild_interest_cache();
+            let correlation = RequestCorrelation::with_request_id(
+                &request,
+                &context,
+                "00000000-0000-4000-8000-000000000014".into(),
+            );
+            let mut body = b"{\"key\":\"openshell:resolve:env:SENTINEL_KEY\"".to_vec();
+            body.push(0xff);
+            let request = L7Request {
+                body_length: BodyLength::ContentLength(body.len() as u64),
+                ..request
+            };
+            let error = collect_and_rewrite_request_body(
+                &request,
+                &mut tokio::io::empty(),
+                &request.raw_header,
+                std::str::from_utf8(&request.raw_header).expect("valid test headers"),
+                &body,
+                RelayRequestOptions::default(),
+                Some(&correlation),
+            )
+            .await
+            .err()
+            .expect("invalid UTF-8 body must fail closed");
+            assert!(error.to_string().contains("UTF-8"));
+            correlation.record_outcome(crate::l7::correlation::HttpOutcome::Denied);
+        }
+        .with_subscriber(subscriber)
+        .await;
+        provider.force_flush().expect("flush spans");
+
+        let attributes = crate::l7::correlation::test_request_attributes(
+            &exporter.get_finished_spans().expect("finished spans"),
+            None,
+        );
+        assert_eq!(attributes["openshell.credential.outcome"], "denied");
+        assert_eq!(
+            attributes["openshell.credential.mechanisms"],
+            "static_placeholder"
+        );
+        assert_eq!(attributes["openshell.credential.surfaces"], "body");
+        assert!(!format!("{attributes:?}").contains("SENTINEL_KEY"));
+    }
+
     /// Helper: run a request through the relay and capture what upstream receives.
     async fn relay_and_capture(
         raw_header: Vec<u8>,
@@ -11603,6 +12201,107 @@ mod tests {
         let mut forwarded = Vec::new();
         upstream_side.read_to_end(&mut forwarded).await.unwrap();
         assert!(!contains_reserved_credential_marker_bytes(&forwarded));
+    }
+
+    #[tokio::test]
+    async fn late_body_credential_denial_preserves_started_delivery_correlation() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        const MARKER: &str = "openshell:resolve:env:LATE_SECRET_SENTINEL";
+        let prefix = vec![b'a'; 256];
+        let body_len = prefix.len() + MARKER.len();
+        let mut raw_header = format!(
+            "POST /api HTTP/1.1\r\nHost: api.example.test\r\nContent-Length: {body_len}\r\n\r\n"
+        )
+        .into_bytes();
+        raw_header.extend_from_slice(&prefix);
+        let request = L7Request {
+            action: "POST".into(),
+            target: "/api".into(),
+            query_params: HashMap::new(),
+            raw_header,
+            body_length: BodyLength::ContentLength(body_len as u64),
+        };
+        let context = crate::l7::relay::L7EvalContext {
+            host: "api.example.test".into(),
+            port: 443,
+            policy_name: "credential-test".into(),
+            ..Default::default()
+        };
+        let exporter = opentelemetry_sdk::trace::InMemorySpanExporterBuilder::new().build();
+        let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+            .with_simple_exporter(exporter.clone())
+            .build();
+        let capture = openshell_ocsf::test_support::OcsfCapture::default();
+        let subscriber = tracing_subscriber::registry()
+            .with(openshell_otel::layer(
+                &provider,
+                "late-body-credential-correlation-test",
+            ))
+            .with(capture.clone());
+        let dispatch = tracing::Dispatch::new(subscriber);
+        let _subscriber = tracing::dispatcher::set_default(&dispatch);
+        tracing::callsite::rebuild_interest_cache();
+        let correlation = RequestCorrelation::with_request_id(
+            &request,
+            &context,
+            "00000000-0000-4000-8000-000000000015".into(),
+        );
+
+        let (mut client_writer, mut proxy_client) = tokio::io::duplex(1024);
+        client_writer.write_all(MARKER.as_bytes()).await.unwrap();
+        drop(client_writer);
+        let (mut proxy_upstream, mut upstream_reader) = tokio::io::duplex(4096);
+
+        let error = relay_http_request_with_response_middleware_guarded_observed_correlated(
+            &request,
+            &mut proxy_client,
+            &mut proxy_upstream,
+            RelayRequestOptions {
+                deny_uninspected_credentials: true,
+                host: "api.example.test",
+                port: 443,
+                ..Default::default()
+            },
+            None,
+            None,
+            Some(&correlation),
+        )
+        .await
+        .expect_err("late body credential marker must fail closed");
+        assert!(error.to_string().contains("rewrite is disabled"));
+        correlation.record_outcome(crate::l7::correlation::HttpOutcome::Denied);
+
+        drop(proxy_upstream);
+        let mut forwarded = Vec::new();
+        upstream_reader.read_to_end(&mut forwarded).await.unwrap();
+        assert!(
+            forwarded.windows(32).any(|window| window == &prefix[..32]),
+            "safe request-body bytes should reach upstream before the late denial"
+        );
+        assert!(!contains_reserved_credential_marker_bytes(&forwarded));
+        assert!(!String::from_utf8_lossy(&forwarded).contains("LATE_SECRET_SENTINEL"));
+
+        drop(correlation);
+        provider.force_flush().expect("flush spans");
+        let attributes = crate::l7::correlation::test_request_attributes(
+            &exporter.get_finished_spans().expect("finished spans"),
+            None,
+        );
+
+        let events = capture.json_events();
+        assert!(
+            events
+                .iter()
+                .any(|event| event["unmapped"]["credential_outcome"] == "denied"),
+            "{events:?}"
+        );
+        assert!(
+            !attributes.contains_key("openshell.credential.outcome"),
+            "late denial must not create a denial-only span"
+        );
+        assert_eq!(attributes["openshell.request.delivery_started"], "true");
+        assert!(!format!("{attributes:?}").contains("LATE_SECRET_SENTINEL"));
     }
 
     #[tokio::test]
@@ -12075,6 +12774,209 @@ mod tests {
             forwarded.contains("authorization:"),
             "forwarded request should have SigV4 authorization header: {forwarded}"
         );
+    }
+
+    #[tokio::test]
+    async fn sigv4_success_correlates_preparation_and_upstream_delivery() {
+        use tracing::instrument::WithSubscriber as _;
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        const REQUEST_ID: &str = "00000000-0000-4000-8000-000000000041";
+        const ACCESS_KEY: &str = "AKIA_CORRELATION_SENTINEL";
+        const SECRET_KEY: &str = "sigv4-correlation-secret-sentinel";
+        const REGION: &str = "us-correlation-1";
+        const SERVICE: &str = "correlation-service";
+
+        let (_, resolver) = SecretResolver::from_provider_env(
+            [
+                ("AWS_ACCESS_KEY_ID".to_string(), ACCESS_KEY.to_string()),
+                ("AWS_SECRET_ACCESS_KEY".to_string(), SECRET_KEY.to_string()),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        let resolver = resolver.expect("resolver");
+        let request = L7Request {
+            action: "GET".into(),
+            target: "/resource".into(),
+            query_params: HashMap::new(),
+            raw_header:
+                b"GET /resource HTTP/1.1\r\nHost: api.example.test\r\nContent-Length: 0\r\n\r\n"
+                    .to_vec(),
+            body_length: BodyLength::ContentLength(0),
+        };
+        let context = crate::l7::relay::L7EvalContext {
+            host: "api.example.test".into(),
+            port: 443,
+            policy_name: "sigv4-policy".into(),
+            ..Default::default()
+        };
+        let exporter = opentelemetry_sdk::trace::InMemorySpanExporterBuilder::new().build();
+        let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+            .with_simple_exporter(exporter.clone())
+            .build();
+        let subscriber = tracing_subscriber::registry().with(openshell_otel::layer(
+            &provider,
+            "sigv4-credential-correlation-test",
+        ));
+        let (mut proxy_to_upstream, mut upstream_side) = tokio::io::duplex(8192);
+        let (mut _app_side, mut proxy_to_client) = tokio::io::duplex(8192);
+
+        let upstream_task = tokio::spawn(async move {
+            let mut forwarded = Vec::new();
+            let mut byte = [0_u8; 1];
+            while !forwarded.ends_with(b"\r\n\r\n") {
+                upstream_side.read_exact(&mut byte).await.unwrap();
+                forwarded.push(byte[0]);
+            }
+            upstream_side
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                .await
+                .unwrap();
+            upstream_side.flush().await.unwrap();
+            forwarded
+        });
+
+        async {
+            tracing::callsite::rebuild_interest_cache();
+            let correlation =
+                RequestCorrelation::with_request_id(&request, &context, REQUEST_ID.to_string());
+            relay_http_request_with_response_middleware_guarded_observed_correlated(
+                &request,
+                &mut proxy_to_client,
+                &mut proxy_to_upstream,
+                RelayRequestOptions {
+                    resolver: Some(&resolver),
+                    credential_signing: crate::l7::CredentialSigning::SigV4NoBody,
+                    signing_service: SERVICE,
+                    signing_region: REGION,
+                    host: "api.example.test",
+                    port: 443,
+                    ..Default::default()
+                },
+                None,
+                None,
+                Some(&correlation),
+            )
+            .await
+            .expect("SigV4 relay succeeds");
+            correlation.record_outcome(crate::l7::correlation::HttpOutcome::Allowed);
+        }
+        .with_subscriber(subscriber)
+        .await;
+        let forwarded = upstream_task.await.expect("upstream task completes");
+        assert!(
+            String::from_utf8_lossy(&forwarded)
+                .to_ascii_lowercase()
+                .contains("authorization: aws4-hmac-sha256"),
+            "request was signed"
+        );
+        provider.force_flush().expect("flush spans");
+
+        let attributes = crate::l7::correlation::test_request_attributes(
+            &exporter.get_finished_spans().expect("finished spans"),
+            None,
+        );
+        assert_eq!(attributes["openshell.credential.outcome"], "prepared");
+        assert_eq!(attributes["openshell.credential.mechanisms"], "sigv4");
+        assert_eq!(attributes["openshell.credential.surfaces"], "signature");
+        assert_eq!(attributes["openshell.credential.sigv4.outcome"], "prepared");
+        assert_eq!(attributes["openshell.request.delivery_started"], "true");
+        assert!(!attributes.contains_key("openshell.credential.static_placeholder.outcome"));
+        let serialized = format!("{attributes:?}");
+        for private_value in [ACCESS_KEY, SECRET_KEY, REGION, SERVICE] {
+            assert!(
+                !serialized.contains(private_value),
+                "leaked {private_value}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn sigv4_missing_material_correlates_unavailable_without_delivery() {
+        use tracing::instrument::WithSubscriber as _;
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        const REQUEST_ID: &str = "00000000-0000-4000-8000-000000000042";
+        const REGION: &str = "us-private-1";
+        const SERVICE: &str = "private-service";
+        let request = L7Request {
+            action: "GET".into(),
+            target: "/resource".into(),
+            query_params: HashMap::new(),
+            raw_header: b"GET /resource HTTP/1.1\r\nHost: api.example.test\r\n\r\n".to_vec(),
+            body_length: BodyLength::None,
+        };
+        let context = crate::l7::relay::L7EvalContext {
+            host: "api.example.test".into(),
+            port: 443,
+            policy_name: "sigv4-policy".into(),
+            ..Default::default()
+        };
+        let exporter = opentelemetry_sdk::trace::InMemorySpanExporterBuilder::new().build();
+        let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+            .with_simple_exporter(exporter.clone())
+            .build();
+        let subscriber = tracing_subscriber::registry().with(openshell_otel::layer(
+            &provider,
+            "sigv4-credential-correlation-test",
+        ));
+        let (mut proxy_to_upstream, mut upstream_side) = tokio::io::duplex(8192);
+        let (mut _app_side, mut proxy_to_client) = tokio::io::duplex(8192);
+
+        async {
+            tracing::callsite::rebuild_interest_cache();
+            let correlation =
+                RequestCorrelation::with_request_id(&request, &context, REQUEST_ID.to_string());
+            let error = relay_http_request_with_response_middleware_guarded_observed_correlated(
+                &request,
+                &mut proxy_to_client,
+                &mut proxy_to_upstream,
+                RelayRequestOptions {
+                    credential_signing: crate::l7::CredentialSigning::SigV4NoBody,
+                    signing_service: SERVICE,
+                    signing_region: REGION,
+                    host: "api.example.test",
+                    port: 443,
+                    ..Default::default()
+                },
+                None,
+                None,
+                Some(&correlation),
+            )
+            .await
+            .expect_err("missing SigV4 material fails closed");
+            assert!(error.downcast_ref::<CredentialUnavailableError>().is_some());
+            correlation.record_outcome(crate::l7::correlation::HttpOutcome::PlatformError);
+        }
+        .with_subscriber(subscriber)
+        .await;
+        drop(proxy_to_upstream);
+        let mut forwarded = Vec::new();
+        upstream_side.read_to_end(&mut forwarded).await.unwrap();
+        assert!(forwarded.is_empty(), "no request bytes reach upstream");
+        provider.force_flush().expect("flush spans");
+
+        let attributes = crate::l7::correlation::test_request_attributes(
+            &exporter.get_finished_spans().expect("finished spans"),
+            None,
+        );
+        assert_eq!(attributes["openshell.credential.outcome"], "unavailable");
+        assert_eq!(attributes["openshell.credential.mechanisms"], "sigv4");
+        assert_eq!(attributes["openshell.credential.surfaces"], "signature");
+        assert_eq!(
+            attributes["openshell.credential.sigv4.outcome"],
+            "unavailable"
+        );
+        assert_eq!(attributes["openshell.request.delivery_started"], "false");
+        assert!(!attributes.contains_key("openshell.credential.static_placeholder.outcome"));
+        let serialized = format!("{attributes:?}");
+        for private_value in [REGION, SERVICE] {
+            assert!(
+                !serialized.contains(private_value),
+                "leaked {private_value}"
+            );
+        }
     }
 
     #[tokio::test]

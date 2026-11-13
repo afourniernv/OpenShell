@@ -860,18 +860,8 @@ where
                         head = require_identity_response_coding(&head)
                             .map_err(LiveWriteError::Failed)?;
                     }
-                    let credential_span = if options.resolver.is_some()
-                        || contains_reserved_credential_marker_bytes(&head)
-                    {
-                        correlation.map_or_else(tracing::Span::none, |correlation| {
-                            correlation.stage(RequestStage::CredentialPrepare)
-                        })
-                    } else {
-                        tracing::Span::none()
-                    };
-                    let rewritten = credential_span
-                        .in_scope(|| rewrite_http_header_block(&head, options.resolver));
-                    drop(credential_span);
+                    let rewritten =
+                        rewrite_credential_headers(&head, options.resolver, correlation);
                     let head = rewritten
                         .map_err(|error| LiveWriteError::Failed(miette::Report::new(error)))?
                         .rewritten;

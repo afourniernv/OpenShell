@@ -3,6 +3,7 @@
 
 //! Per-request receipts and consolidated HTTP audit records.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Mutex;
 use std::{
     pin::Pin,
@@ -61,6 +62,210 @@ struct RequestState {
     failure_reason: Option<&'static str>,
     late_failure_emitted: bool,
     middleware: [Option<MiddlewareState>; 2],
+    credential: CredentialState,
+}
+
+pub struct CredentialPreparation<'a> {
+    correlation: Option<&'a RequestCorrelation>,
+    span: tracing::Span,
+}
+
+impl<'a> CredentialPreparation<'a> {
+    pub(crate) fn new(correlation: Option<&'a RequestCorrelation>, span: tracing::Span) -> Self {
+        Self { correlation, span }
+    }
+
+    pub(crate) fn span(&self) -> &tracing::Span {
+        &self.span
+    }
+}
+
+impl Drop for CredentialPreparation<'_> {
+    fn drop(&mut self) {
+        if let Some(correlation) = self.correlation {
+            correlation.record_credential_span(&self.span);
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum CredentialMechanism {
+    StaticPlaceholder,
+    TokenGrant,
+    SigV4,
+}
+
+impl CredentialMechanism {
+    const ALL: [Self; 3] = [Self::StaticPlaceholder, Self::TokenGrant, Self::SigV4];
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::StaticPlaceholder => "static_placeholder",
+            Self::TokenGrant => "token_grant",
+            Self::SigV4 => "sigv4",
+        }
+    }
+
+    fn span_outcome_field(self) -> &'static str {
+        match self {
+            Self::StaticPlaceholder => "openshell.credential.static_placeholder.outcome",
+            Self::TokenGrant => "openshell.credential.token_grant.outcome",
+            Self::SigV4 => "openshell.credential.sigv4.outcome",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum CredentialSurface {
+    Path,
+    Query,
+    Header,
+    Body,
+    Signature,
+}
+
+impl CredentialSurface {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Path => "path",
+            Self::Query => "query",
+            Self::Header => "header",
+            Self::Body => "body",
+            Self::Signature => "signature",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CredentialOutcome {
+    Prepared,
+    Withheld,
+    Denied,
+    Unavailable,
+    Stale,
+    Incomplete,
+}
+
+impl CredentialOutcome {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Prepared => "prepared",
+            Self::Withheld => "withheld",
+            Self::Denied => "denied",
+            Self::Unavailable => "unavailable",
+            Self::Stale => "stale",
+            Self::Incomplete => "incomplete",
+        }
+    }
+
+    fn precedence(self) -> u8 {
+        match self {
+            Self::Incomplete => 0,
+            Self::Withheld => 1,
+            Self::Prepared => 2,
+            Self::Unavailable => 3,
+            Self::Stale => 4,
+            Self::Denied => 5,
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct CredentialState {
+    selected: bool,
+    mechanisms: BTreeMap<CredentialMechanism, CredentialOutcome>,
+    surfaces: BTreeSet<CredentialSurface>,
+    outcome: Option<CredentialOutcome>,
+}
+
+impl CredentialState {
+    fn observe(&mut self, mechanism: CredentialMechanism, surface: CredentialSurface) {
+        self.selected = true;
+        self.mechanisms
+            .entry(mechanism)
+            .or_insert(CredentialOutcome::Incomplete);
+        self.surfaces.insert(surface);
+    }
+
+    fn complete(&mut self, outcome: CredentialOutcome) {
+        if !self.selected && outcome != CredentialOutcome::Stale {
+            return;
+        }
+        self.selected = true;
+
+        merge_optional_credential_outcome(&mut self.outcome, outcome);
+        if outcome == CredentialOutcome::Stale {
+            for current in self.mechanisms.values_mut() {
+                merge_credential_outcome(current, outcome);
+            }
+        }
+    }
+
+    fn complete_mechanism(&mut self, mechanism: CredentialMechanism, outcome: CredentialOutcome) {
+        let Some(current) = self.mechanisms.get_mut(&mechanism) else {
+            return;
+        };
+
+        merge_optional_credential_outcome(&mut self.outcome, outcome);
+        merge_credential_outcome(current, outcome);
+    }
+
+    fn effective_outcome(&self) -> Option<CredentialOutcome> {
+        self.selected.then(|| {
+            let has_incomplete = self
+                .mechanisms
+                .values()
+                .any(|outcome| *outcome == CredentialOutcome::Incomplete);
+            match self.outcome {
+                Some(
+                    outcome @ (CredentialOutcome::Denied
+                    | CredentialOutcome::Stale
+                    | CredentialOutcome::Unavailable),
+                ) => outcome,
+                _ if has_incomplete => CredentialOutcome::Incomplete,
+                Some(outcome) => outcome,
+                None => CredentialOutcome::Incomplete,
+            }
+        })
+    }
+
+    fn snapshot(&self) -> Option<CredentialSnapshot> {
+        self.effective_outcome().map(|outcome| CredentialSnapshot {
+            mechanisms: sorted_values(self.mechanisms.keys().map(|value| value.as_str())),
+            surfaces: sorted_values(self.surfaces.iter().map(|value| value.as_str())),
+            outcome,
+            mechanism_outcomes: self.mechanisms.clone(),
+        })
+    }
+}
+
+fn merge_credential_outcome(current: &mut CredentialOutcome, outcome: CredentialOutcome) {
+    if outcome.precedence() > current.precedence() {
+        *current = outcome;
+    }
+}
+
+fn merge_optional_credential_outcome(
+    current: &mut Option<CredentialOutcome>,
+    outcome: CredentialOutcome,
+) {
+    if current.is_none_or(|current| outcome.precedence() > current.precedence()) {
+        *current = Some(outcome);
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct CredentialSnapshot {
+    mechanisms: String,
+    surfaces: String,
+    outcome: CredentialOutcome,
+    mechanism_outcomes: BTreeMap<CredentialMechanism, CredentialOutcome>,
+}
+
+fn sorted_values(values: impl Iterator<Item = &'static str>) -> String {
+    let mut values = values.collect::<Vec<_>>();
+    values.sort_unstable();
+    values.join(",")
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -276,6 +481,88 @@ impl RequestCorrelation {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .record_outcome(outcome);
+    }
+
+    pub(crate) fn record_request_delivery_started(&self) {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(trace) = &state.trace {
+            trace.record_delivery_started();
+        }
+    }
+
+    pub(crate) fn observe_credential(
+        &self,
+        mechanism: CredentialMechanism,
+        surface: CredentialSurface,
+    ) {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .credential
+            .observe(mechanism, surface);
+    }
+
+    pub(crate) fn has_credential_mechanism(&self, mechanism: CredentialMechanism) -> bool {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .credential
+            .mechanisms
+            .contains_key(&mechanism)
+    }
+
+    pub(crate) fn complete_credential(&self, outcome: CredentialOutcome) {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .credential
+            .complete(outcome);
+    }
+
+    pub(crate) fn complete_credential_mechanism(
+        &self,
+        mechanism: CredentialMechanism,
+        outcome: CredentialOutcome,
+    ) {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .credential
+            .complete_mechanism(mechanism, outcome);
+    }
+
+    fn record_credential_span(&self, span: &tracing::Span) {
+        if span.is_disabled() {
+            return;
+        }
+        let snapshot = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .credential
+            .snapshot();
+        if let Some(snapshot) = snapshot {
+            span.record("openshell.credential.outcome", snapshot.outcome.as_str());
+            span.record(
+                "openshell.credential.mechanisms",
+                snapshot.mechanisms.as_str(),
+            );
+            span.record("openshell.credential.surfaces", snapshot.surfaces.as_str());
+            for mechanism in CredentialMechanism::ALL {
+                if let Some(outcome) = snapshot.mechanism_outcomes.get(&mechanism) {
+                    span.record(mechanism.span_outcome_field(), outcome.as_str());
+                }
+            }
+            if !matches!(
+                snapshot.outcome,
+                CredentialOutcome::Prepared | CredentialOutcome::Withheld
+            ) {
+                span.record("otel.status_code", "ERROR");
+            }
+        }
     }
 
     pub(crate) fn record_response_status(&self, status: u16) {
@@ -588,9 +875,18 @@ impl RequestCorrelation {
                 .state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let Some(primary) = state.primary.take() else {
+            let Some(mut primary) = state.primary.take() else {
                 return;
             };
+            if let Some(outcome) = state.credential.effective_outcome()
+                && outcome != CredentialOutcome::Prepared
+                && let OcsfEvent::HttpActivity(http) = &mut primary
+            {
+                http.base
+                    .unmapped
+                    .get_or_insert_with(|| serde_json::json!({}))["credential_outcome"] =
+                    outcome.as_str().into();
+            }
             (
                 primary,
                 state.status,
@@ -814,6 +1110,49 @@ pub fn emit_ocsf(correlation: Option<&RequestCorrelation>, event: OcsfEvent) {
     } else {
         crate::telemetry::egress_emit!(event);
     }
+}
+
+#[cfg(test)]
+pub fn test_request_attributes(
+    spans: &[opentelemetry_sdk::trace::SpanData],
+    request_id: Option<&str>,
+) -> BTreeMap<String, String> {
+    let root = spans
+        .iter()
+        .find(|span| {
+            span.name == "openshell.http.request"
+                && request_id.is_none_or(|id| {
+                    span.attributes.iter().any(|attribute| {
+                        attribute.key.as_str() == "openshell.request.id"
+                            && attribute.value.to_string() == id
+                    })
+                })
+        })
+        .expect("request root");
+    assert!(
+        root.attributes
+            .iter()
+            .all(|attribute| !attribute.key.as_str().starts_with("openshell.credential.")),
+        "credential detail belongs on a child span"
+    );
+    let mut attributes = root
+        .attributes
+        .iter()
+        .map(|attribute| (attribute.key.to_string(), attribute.value.to_string()))
+        .collect::<BTreeMap<_, _>>();
+    for child in spans.iter().filter(|span| {
+        span.name == "openshell.credential.prepare"
+            && span.parent_span_id == root.span_context.span_id()
+    }) {
+        assert_eq!(child.span_context.trace_id(), root.span_context.trace_id());
+        attributes.extend(
+            child
+                .attributes
+                .iter()
+                .map(|attribute| (attribute.key.to_string(), attribute.value.to_string())),
+        );
+    }
+    attributes
 }
 
 pub fn emit_phase_events(

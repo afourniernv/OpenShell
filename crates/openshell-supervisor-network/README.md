@@ -90,3 +90,8 @@ Legacy and current HTTP hooks share this reporting path. Current streamed
 request phases remain open through body processing or cancellation; response
 phases include finalization. Remote RPC transport status is separate from a
 middleware decision. Findings retain the request UUID even without trace export.
+
+Credential preparation enriches operation-owned child spans with the mechanism,
+placement and bounded outcome, never secret material. The primary audit record
+includes notable credential outcomes; successful preparation does not create an
+extra routine record or establish that the target received the request.

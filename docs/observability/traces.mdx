@@ -89,6 +89,10 @@ handle, not authorization or proof of delivery. Match it to trusted OpenShell
 output for the same sandbox. L4 and uninspected passthrough traffic do not provide
 this receipt guarantee.
 
+When credential handling runs, an `openshell.credential.prepare` child span records
+the mechanism, placement and outcome without credential values. The primary
+OCSF record includes notable withholding, denial, unavailability or stale state.
+
 The primary HTTP Activity record describes the final response headers accepted
 by the client connection. A successful header write does not establish complete
 body delivery or that the external service committed an operation. Middleware

@@ -66,6 +66,7 @@ impl RequestTrace {
             server.address = host,
             server.port = i64::from(port),
             openshell.request.outcome = tracing::field::Empty,
+            openshell.request.delivery_started = false,
             openshell.request.failure_reason = tracing::field::Empty,
             http.response.status_code = tracing::field::Empty,
             otel.kind = "server",
@@ -113,6 +114,20 @@ impl RequestTrace {
                 openshell.response.partial_delivery = false,
             );
         }
+        if matches!(stage, RequestStage::CredentialPrepare) {
+            return tracing::info_span!(
+                parent: &self.span,
+                "openshell.http.stage",
+                otel.name = stage.name(),
+                otel.status_code = tracing::field::Empty,
+                openshell.credential.outcome = tracing::field::Empty,
+                openshell.credential.mechanisms = tracing::field::Empty,
+                openshell.credential.surfaces = tracing::field::Empty,
+                openshell.credential.static_placeholder.outcome = tracing::field::Empty,
+                openshell.credential.token_grant.outcome = tracing::field::Empty,
+                openshell.credential.sigv4.outcome = tracing::field::Empty,
+            );
+        }
         tracing::info_span!(
             parent: &self.span,
             "openshell.http.stage",
@@ -124,6 +139,10 @@ impl RequestTrace {
     pub(super) fn record_status(&self, status: u16) {
         self.span
             .record("http.response.status_code", i64::from(status));
+    }
+
+    pub(super) fn record_delivery_started(&self) {
+        self.span.record("openshell.request.delivery_started", true);
     }
 
     pub(super) fn record_outcome(&mut self, outcome: HttpOutcome) {

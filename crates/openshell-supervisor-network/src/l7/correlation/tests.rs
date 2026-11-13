@@ -6,6 +6,41 @@ use crate::test_support::request_tracing::RequestTracing;
 use openshell_ocsf::{ActivityId, NetworkActivityBuilder, Process};
 use tokio::io::AsyncWriteExt as _;
 
+#[test]
+fn effective_credential_outcome_preserves_selection_and_failure_precedence() {
+    let mut state = CredentialState::default();
+    assert_eq!(state.effective_outcome(), None);
+    state.observe(
+        CredentialMechanism::StaticPlaceholder,
+        CredentialSurface::Header,
+    );
+    assert_eq!(
+        state.effective_outcome(),
+        Some(CredentialOutcome::Incomplete)
+    );
+    state.complete_mechanism(
+        CredentialMechanism::StaticPlaceholder,
+        CredentialOutcome::Prepared,
+    );
+    assert_eq!(state.effective_outcome(), Some(CredentialOutcome::Prepared));
+    state.observe(CredentialMechanism::TokenGrant, CredentialSurface::Header);
+    assert_eq!(
+        state.effective_outcome(),
+        Some(CredentialOutcome::Incomplete)
+    );
+    state.complete_mechanism(CredentialMechanism::TokenGrant, CredentialOutcome::Withheld);
+    assert_eq!(state.effective_outcome(), Some(CredentialOutcome::Prepared));
+    for outcome in [
+        CredentialOutcome::Unavailable,
+        CredentialOutcome::Stale,
+        CredentialOutcome::Denied,
+    ] {
+        state.complete(outcome);
+        assert_eq!(state.effective_outcome(), Some(outcome));
+        assert_eq!(state.snapshot().unwrap().outcome, outcome);
+    }
+}
+
 fn request() -> L7Request {
     L7Request {
         action: "GET".into(),
@@ -159,7 +194,7 @@ fn middleware_invocations_are_retained_without_seeding_or_poisoning_the_request(
             let spans = capture.spans();
             assert_eq!(spans.len(), usize::from(sampled));
             if sampled {
-                let fields: std::collections::BTreeMap<_, _> = spans[0]
+                let fields: BTreeMap<_, _> = spans[0]
                     .attributes
                     .iter()
                     .map(|attribute| (attribute.key.as_str(), attribute.value.to_string()))
@@ -398,7 +433,7 @@ fn late_middleware_invocations_do_not_consume_the_late_failure_budget() {
             let spans = capture.spans();
             assert_eq!(spans.len(), usize::from(sampled));
             if sampled {
-                let fields: std::collections::BTreeMap<_, _> = spans[0]
+                let fields: BTreeMap<_, _> = spans[0]
                     .attributes
                     .iter()
                     .map(|attribute| (attribute.key.as_str(), attribute.value.to_string()))
