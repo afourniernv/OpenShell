@@ -812,7 +812,6 @@ where
             &middleware.target,
             status_code,
             &preflight.invocations,
-            response_correlation.is_none(),
         ));
         if preflight.denial.is_none() {
             preflight_events.push(http_response_middleware_failure_event(
@@ -1430,15 +1429,9 @@ fn http_response_decision_events(
     target: &HttpRequestTarget,
     status_code: u16,
     invocations: &[openshell_supervisor_middleware::HttpResponseInvocation],
-    include_routine: bool,
 ) -> Vec<openshell_ocsf::OcsfEvent> {
-    let mut events = http_response_middleware_invocation_events(
-        policy_name,
-        target,
-        status_code,
-        invocations,
-        include_routine,
-    );
+    let mut events =
+        http_response_middleware_invocation_events(policy_name, target, status_code, invocations);
     for invocation in invocations {
         events.extend(http_response_middleware_fail_open_finding_event(
             policy_name,
@@ -1580,13 +1573,7 @@ fn emit_http_response_middleware_invocations(
     emit_phase_events(
         correlation,
         MiddlewarePhase::Response,
-        http_response_decision_events(
-            policy_name,
-            target,
-            status_code,
-            invocations,
-            correlation.is_none(),
-        ),
+        http_response_decision_events(policy_name, target, status_code, invocations),
     );
 }
 
@@ -1610,13 +1597,8 @@ fn emit_http_response_diagnostics(
     terminal_failure: Option<bool>,
     correlation: Option<&RequestCorrelation>,
 ) {
-    let mut events = http_response_decision_events(
-        policy_name,
-        target,
-        status_code,
-        &diagnostics.invocations,
-        correlation.is_none(),
-    );
+    let mut events =
+        http_response_decision_events(policy_name, target, status_code, &diagnostics.invocations);
     events.extend(crate::l7::middleware::middleware_finding_events(
         &diagnostics.findings,
     ));
@@ -1678,19 +1660,9 @@ pub(super) fn http_response_middleware_invocation_events(
     target: &HttpRequestTarget,
     status_code: u16,
     invocations: &[openshell_supervisor_middleware::HttpResponseInvocation],
-    include_routine: bool,
 ) -> Vec<openshell_ocsf::OcsfEvent> {
     invocations
         .iter()
-        .filter(|invocation| {
-            include_routine
-                || invocation.failed
-                || matches!(
-                    invocation.outcome,
-                    openshell_supervisor_middleware::HttpResponseInvocationOutcome::BlockDelivery
-                        | openshell_supervisor_middleware::HttpResponseInvocationOutcome::FailClosed
-                )
-        })
         .map(|invocation| {
             let outcome = format!("{:?}", invocation.outcome).to_ascii_lowercase();
             let failed = invocation.failed;
@@ -1740,6 +1712,8 @@ pub(super) fn http_response_middleware_invocation_events(
                 u16::try_from(target.port).unwrap_or_default(),
             ))
             .firewall_rule(policy_name, "supervisor-middleware")
+            .unmapped("http_event_kind", "middleware_invocation")
+            .unmapped("middleware_phase", "response")
             .unmapped("middleware_config", invocation.config_name.as_str())
             .unmapped(
                 "middleware_implementation",
@@ -3102,21 +3076,20 @@ mod tests {
                 &target,
                 200,
                 &[invocation(outcome, failed)],
-                true,
             );
+            assert_eq!(events.len(), 1);
             assert_eq!(
                 events[0].to_json().unwrap()["action_id"],
                 action_id,
                 "{outcome:?}"
             );
-            let notable = super::http_response_middleware_invocation_events(
-                "p",
-                &target,
-                200,
-                &[invocation(outcome, failed)],
-                false,
+            let event = events[0].to_json().unwrap();
+            assert_eq!(
+                event["unmapped"]["http_event_kind"],
+                "middleware_invocation"
             );
-            assert_eq!(notable.len(), usize::from(failed || action_id == 2));
+            assert_eq!(event["unmapped"]["middleware_phase"], "response");
+            assert_eq!(event["unmapped"]["failed"], failed);
         }
         for denied in [false, true] {
             let failure =
@@ -3157,7 +3130,6 @@ mod tests {
                 &target,
                 200,
                 &[invocation(outcome, failed)],
-                true,
             ) {
                 correlation.emit(event);
             }
@@ -3168,16 +3140,31 @@ mod tests {
             .into_iter()
             .filter(|event| event["class_uid"] == 4002)
             .collect();
-        assert_eq!(events.len(), 2);
-        assert_eq!(events[1]["action"], "Denied");
-        assert_eq!(events[1]["http_response"]["code"], 200);
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[0]["unmapped"]["http_event_kind"], "request");
+        assert_eq!(events[0]["action"], "Allowed");
+        assert_eq!(events[1]["action"], "Other");
         assert_eq!(
             events[1]["unmapped"]["response_middleware_outcome"],
+            "failopen"
+        );
+        assert_eq!(events[2]["action"], "Denied");
+        for event in &events[1..] {
+            assert_eq!(
+                event["unmapped"]["http_event_kind"],
+                "middleware_invocation"
+            );
+            assert_eq!(event["unmapped"]["middleware_phase"], "response");
+            assert_eq!(event["http_response"]["code"], 200);
+        }
+        assert_eq!(
+            events[2]["unmapped"]["response_middleware_outcome"],
             "blockdelivery"
         );
-        assert_eq!(
-            events[1]["metadata"]["correlation_uid"],
-            "late-response-receipt"
+        assert!(
+            events
+                .iter()
+                .all(|event| event["metadata"]["correlation_uid"] == "late-response-receipt")
         );
     }
 
@@ -3933,9 +3920,32 @@ mod tests {
     }
 
     fn assert_response_middleware_block_record(records: &[serde_json::Value], traced: bool) {
-        let primary: Vec<_> = records
+        let http: Vec<_> = records
             .iter()
             .filter(|event| event["class_uid"] == 4002)
+            .collect();
+        assert_eq!(http.len(), 2);
+        let companions: Vec<_> = http
+            .iter()
+            .filter(|event| event["unmapped"]["http_event_kind"] == "middleware_invocation")
+            .collect();
+        assert_eq!(companions.len(), 1);
+        assert_eq!(companions[0]["http_response"]["code"], 200);
+        assert_eq!(companions[0]["unmapped"]["middleware_phase"], "response");
+        assert_eq!(
+            companions[0]["unmapped"]["response_middleware_outcome"],
+            "blockdelivery"
+        );
+        assert_eq!(companions[0]["action"], "Denied");
+        assert_eq!(
+            companions[0]["metadata"]["correlation_uid"],
+            "response-denied"
+        );
+        let primary: Vec<_> = records
+            .iter()
+            .filter(|event| {
+                event["class_uid"] == 4002 && event["unmapped"]["http_event_kind"] == "request"
+            })
             .collect();
         assert_eq!(primary.len(), 1, "{records:?}");
         assert_eq!(primary[0]["action"], "Denied");

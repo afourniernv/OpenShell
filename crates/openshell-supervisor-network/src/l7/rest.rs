@@ -9209,9 +9209,14 @@ mod tests {
                 reason_code: Some("stable_reason".into()),
                 failure_category: Some("timeout".into()),
             }],
-            true,
         );
-        let json = events[0].to_json().unwrap().to_string();
+        let event = events[0].to_json().unwrap();
+        assert_eq!(
+            event["unmapped"]["http_event_kind"],
+            "middleware_invocation"
+        );
+        assert_eq!(event["unmapped"]["middleware_phase"], "response");
+        let json = event.to_string();
         for forbidden in [
             "secret-response-body",
             "authorization",
@@ -9264,7 +9269,6 @@ mod tests {
                     &target,
                     200,
                     std::slice::from_ref(&invocation),
-                    true,
                 )
                 .len(),
                 1

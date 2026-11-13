@@ -1800,7 +1800,6 @@ impl RequestEvents {
             reason,
             denial,
             &diagnostics,
-            correlation.is_none(),
         );
         let span = self.span.take().unwrap_or_else(tracing::Span::none);
         span.in_scope(|| emit_phase_events(correlation, MiddlewarePhase::Request, events));
@@ -2015,7 +2014,6 @@ pub(super) fn request_middleware_events(
     reason: &str,
     denial: Option<&openshell_supervisor_middleware::MiddlewareDenial>,
     diagnostics: &HttpStageDiagnostics,
-    include_routine: bool,
 ) -> Vec<openshell_ocsf::OcsfEvent> {
     let applied = diagnostics.applied();
     let req = crate::l7::provider::L7Request {
@@ -2039,7 +2037,6 @@ pub(super) fn request_middleware_events(
             denial: denial.cloned(),
             termination: openshell_supervisor_middleware::ChainTermination::Completed,
         },
-        include_routine,
     )
 }
 
@@ -2118,7 +2115,6 @@ pub(super) fn mixed_protocol_events(
         ),
         None,
         &diagnostics,
-        true,
     )
 }
 
@@ -2469,15 +2465,11 @@ pub(super) fn middleware_events(
     ctx: &L7EvalContext,
     req: &crate::l7::provider::L7Request,
     outcome: &openshell_supervisor_middleware::ChainOutcome,
-    include_routine: bool,
 ) -> Vec<openshell_ocsf::OcsfEvent> {
     let mut events = Vec::new();
     for invocation in &outcome.applied {
         let allowed = invocation.decision == openshell_core::proto::Decision::Allow;
         let failed = invocation.failed;
-        if !include_routine && allowed && !failed {
-            continue;
-        }
         let status_detail = if failed {
             Some(if allowed {
                 "middleware_failed_open".to_string()
@@ -2514,6 +2506,8 @@ pub(super) fn middleware_events(
             .http_request(HttpRequest::new(&req.action, ctx.ocsf_url(&req.target)))
             .dst_endpoint(Endpoint::from_domain(&ctx.host, ctx.port))
             .firewall_rule(&ctx.policy_name, "middleware")
+            .unmapped("http_event_kind", "middleware_invocation")
+            .unmapped("middleware_phase", "request")
             .unmapped("transformed", invocation.transformed)
             .unmapped("failed", invocation.failed)
             .message(format!(
@@ -2605,7 +2599,7 @@ fn emit_middleware_events(
     emit_phase_events(
         correlation,
         MiddlewarePhase::Request,
-        middleware_events(ctx, req, outcome, correlation.is_none()),
+        middleware_events(ctx, req, outcome),
     );
 }
 
@@ -2704,13 +2698,40 @@ mod trace_tests {
                 &L7EvalContext::default(),
                 &request(),
                 &outcome(false, reason, vec![], vec![]),
-                true,
             );
             assert_eq!(events.len(), 1, "{reason}");
             let finding = events[0].to_json().unwrap();
             assert_eq!(finding["class_uid"], 2004);
             assert_eq!(finding["action_id"], 2, "{reason}");
         }
+    }
+
+    #[test]
+    fn request_invocation_records_are_explicitly_tagged() {
+        let events = middleware_events(
+            &L7EvalContext::default(),
+            &request(),
+            &outcome(
+                true,
+                "",
+                vec![MiddlewareInvocation {
+                    name: "redact".into(),
+                    implementation: "test/redact".into(),
+                    decision: openshell_core::proto::Decision::Allow,
+                    transformed: true,
+                    failed: false,
+                }],
+                vec![],
+            ),
+        );
+        assert_eq!(events.len(), 1);
+        let event = events[0].to_json().unwrap();
+        assert_eq!(
+            event["unmapped"]["http_event_kind"],
+            "middleware_invocation"
+        );
+        assert_eq!(event["unmapped"]["middleware_phase"], "request");
+        assert_eq!(event["unmapped"]["transformed"], true);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3682,13 +3703,35 @@ mod tests {
             .into_iter()
             .filter(|event| event["class_uid"] == 4002)
             .collect::<Vec<_>>();
-        assert_eq!(events.len(), 1);
+        let primary: Vec<_> = events
+            .iter()
+            .filter(|event| event["unmapped"]["http_event_kind"] == "request")
+            .collect();
+        let companions: Vec<_> = events
+            .iter()
+            .filter(|event| event["unmapped"]["http_event_kind"] == "middleware_invocation")
+            .collect();
+        assert_eq!(primary.len(), 1);
+        assert_eq!(companions.len(), 2);
+        assert_eq!(events.len(), primary.len() + companions.len());
+        assert_eq!(primary[0]["action"], "Denied");
+        assert_eq!(primary[0]["http_response"]["code"], 403);
+        for (event, action, transformed) in [
+            (companions[0], "Allowed", true),
+            (companions[1], "Denied", false),
+        ] {
+            assert_eq!(event["action"], action);
+            assert_eq!(event["unmapped"]["middleware_phase"], "request");
+            assert_eq!(event["unmapped"]["transformed"], transformed);
+            assert_eq!(event["unmapped"]["failed"], false);
+            assert_eq!(event["firewall_rule"]["type"], "middleware");
+            assert_eq!(event["http_request"]["url"]["path"], "/v1/search");
+        }
         assert!(
             events
                 .iter()
                 .all(|event| { event["metadata"]["correlation_uid"] == REQUEST_ID })
         );
-        assert!(events.iter().any(|event| event["action"] == "Denied"));
         assert!(!serde_json::to_string(&events).unwrap().contains(SENTINEL));
     }
 

@@ -8552,11 +8552,26 @@ network_policies:
                 })
                 .expect("inspected response receipt");
             let events = capture.json_events();
-            let primary: Vec<_> = events
+            let http: Vec<_> = events
                 .iter()
                 .filter(|event| event["class_uid"] == 4002)
                 .collect();
+            let primary: Vec<_> = events
+                .iter()
+                .filter(|event| {
+                    event["class_uid"] == 4002 && event["unmapped"]["http_event_kind"] == "request"
+                })
+                .collect();
             assert_eq!(primary.len(), 1, "{enforcement}: {events:?}");
+            let companions: Vec<_> = http
+                .iter()
+                .filter(|event| event["unmapped"]["http_event_kind"] == "middleware_invocation")
+                .collect();
+            assert_eq!(companions.len(), 1);
+            assert_eq!(http.len(), primary.len() + companions.len());
+            assert_eq!(companions[0]["unmapped"]["middleware_phase"], "request");
+            assert_eq!(companions[0]["unmapped"]["transformed"], true);
+            assert_eq!(companions[0]["metadata"]["correlation_uid"], request_id);
             assert_eq!(primary[0]["metadata"]["correlation_uid"], request_id);
             assert_eq!(primary[0]["http_request"]["url"]["path"], "/rpc");
             assert_eq!(primary[0]["firewall_rule"]["type"], "l7-jsonrpc");
@@ -9367,7 +9382,7 @@ network_policies:
         // tracing pipeline: its callsite-interest cache is process-global, so a
         // parallel test that emits OCSF with no subscriber installed can cache
         // the callsite as disabled and make captured-event assertions flaky.
-        let events = middleware_events(&ctx, &req, &outcome, true);
+        let events = middleware_events(&ctx, &req, &outcome);
 
         // Per-invocation decisions are HTTP Activity (class 4002).
         assert!(
@@ -9380,9 +9395,19 @@ network_policies:
             .find(|e| e.class_uid() == 2004)
             .expect("expected a Detection Finding event");
         assert_eq!(finding_event.base().severity, SeverityId::Medium);
-        let notable = middleware_events(&ctx, &req, &outcome, false);
-        assert_eq!(notable.len(), 1);
-        assert_eq!(notable[0].class_uid(), 2004);
+        assert_eq!(events.len(), 2);
+        let invocation = events
+            .iter()
+            .find(|event| event.class_uid() == 4002)
+            .unwrap()
+            .to_json()
+            .unwrap();
+        assert_eq!(
+            invocation["unmapped"]["http_event_kind"],
+            "middleware_invocation"
+        );
+        assert_eq!(invocation["unmapped"]["middleware_phase"], "request");
+        assert_eq!(invocation["unmapped"]["transformed"], true);
 
         // No raw payload material may appear in any emitted event.
         let serialized = serde_json::to_string(&events).expect("serialize events");
@@ -9421,7 +9446,7 @@ network_policies:
                 },
             }))
             .collect();
-        let bounded_events = middleware_events(&ctx, &req, &bounded_outcome, true);
+        let bounded_events = middleware_events(&ctx, &req, &bounded_outcome);
         assert_eq!(
             bounded_events
                 .iter()
@@ -9451,7 +9476,7 @@ network_policies:
             }),
             termination: ChainTermination::MiddlewareDenied,
         };
-        let denied_events = middleware_events(&ctx, &req, &denied_outcome, true);
+        let denied_events = middleware_events(&ctx, &req, &denied_outcome);
         let denied_http = denied_events
             .iter()
             .find(|event| event.class_uid() == 4002)
@@ -9467,7 +9492,7 @@ network_policies:
             denied_http.format_shorthand(),
             "HTTP:POST [MED] DENIED POST https://api.example.test/v1/messages \
              [policy:rest_api engine:middleware] \
-             [failed:false transformed:false \
+             [failed:false http_event_kind:middleware_invocation middleware_phase:request transformed:false \
              reason:middleware_denied:content-guard:content_match]"
         );
 
@@ -9481,7 +9506,7 @@ network_policies:
             }],
             ..denied_outcome
         };
-        let failure_events = middleware_events(&ctx, &req, &external_failure_outcome, true);
+        let failure_events = middleware_events(&ctx, &req, &external_failure_outcome);
         let serialized = serde_json::to_string(&failure_events).expect("serialize failure events");
         assert!(serialized.contains("middleware_failed_closed"));
         assert!(!serialized.contains("header_mutation_invalid_name"));
@@ -9504,7 +9529,7 @@ network_policies:
             denial: None,
             termination: ChainTermination::Completed,
         };
-        let fail_open_events = middleware_events(&ctx, &req, &fail_open_outcome, true);
+        let fail_open_events = middleware_events(&ctx, &req, &fail_open_outcome);
         let fail_open_http = fail_open_events
             .iter()
             .find(|event| event.class_uid() == 4002)
@@ -9622,11 +9647,36 @@ network_policies:
                 "{forwarded}"
             );
             let records = capture.json_events();
-            let primary: Vec<_> = records
+            let http: Vec<_> = records
                 .iter()
                 .filter(|event| event["class_uid"] == 4002)
                 .collect();
+            let primary: Vec<_> = records
+                .iter()
+                .filter(|event| {
+                    event["class_uid"] == 4002
+                        && if selected {
+                            event["unmapped"]["http_event_kind"] == "request"
+                        } else {
+                            event["unmapped"].get("http_event_kind").is_none()
+                        }
+                })
+                .collect();
             assert_eq!(primary.len(), 1, "selected={selected}: {records:?}");
+            let companions: Vec<_> = http
+                .iter()
+                .filter(|event| event["unmapped"]["http_event_kind"] == "middleware_invocation")
+                .collect();
+            assert_eq!(companions.len(), usize::from(selected));
+            assert_eq!(http.len(), primary.len() + companions.len());
+            if selected {
+                assert_eq!(companions[0]["unmapped"]["middleware_phase"], "request");
+                assert_eq!(companions[0]["unmapped"]["failed"], false);
+                assert_eq!(
+                    companions[0]["metadata"]["correlation_uid"],
+                    primary[0]["metadata"]["correlation_uid"]
+                );
+            }
             assert_eq!(primary[0]["action"], "Allowed");
             assert_eq!(primary[0]["http_request"]["url"]["path"], "/v1/messages");
             assert!(
@@ -13951,13 +14001,33 @@ network_policies:
                     drop(correlation);
                 }.with_subscriber(capture.subscriber()).await;
                 let events = capture.events.json_events();
+                let http: Vec<_> = events
+                    .iter()
+                    .filter(|event| event["class_uid"] == 4002)
+                    .collect();
+                let primary: Vec<_> = http
+                    .iter()
+                    .filter(|event| event["unmapped"]["http_event_kind"] == "request")
+                    .collect();
+                let companions: Vec<_> = http
+                    .iter()
+                    .filter(|event| event["unmapped"]["http_event_kind"] == "middleware_invocation")
+                    .collect();
+                assert_eq!(primary.len(), 1, "invalid={invalid}: {events:?}");
                 assert_eq!(
-                    events
-                        .iter()
-                        .filter(|event| event["class_uid"] == 4002)
-                        .count(),
-                    1
+                    companions.len(),
+                    usize::from(!invalid),
+                    "invalid={invalid}: {events:?}"
                 );
+                assert_eq!(http.len(), primary.len() + companions.len());
+                if let Some(companion) = companions.first() {
+                    assert_eq!(companion["unmapped"]["middleware_phase"], "request");
+                    assert_eq!(companion["unmapped"]["failed"], false);
+                    assert_eq!(companion["unmapped"]["transformed"], false);
+                    assert_eq!(companion["action"], "Allowed");
+                    assert_eq!(companion["firewall_rule"]["type"], "middleware");
+                    assert_eq!(companion["http_request"]["url"]["path"], "/v1/items");
+                }
                 assert!(events.iter().filter(|event| event["class_uid"] == 4002).all(|event| event["metadata"]["correlation_uid"] == "request-cancellation"));
                 assert!(
                     !capture
@@ -14126,11 +14196,29 @@ network_policies:
                 request_id
             );
             let events = capture.events.json_events();
-            let primary: Vec<_> = events
+            let http: Vec<_> = events
                 .iter()
                 .filter(|event| event["class_uid"] == 4002)
                 .collect();
+            let primary: Vec<_> = events
+                .iter()
+                .filter(|event| {
+                    event["class_uid"] == 4002 && event["unmapped"]["http_event_kind"] == "request"
+                })
+                .collect();
             assert_eq!(primary.len(), 1, "{name}: {events:?}");
+            let companions: Vec<_> = http
+                .iter()
+                .filter(|event| event["unmapped"]["http_event_kind"] == "middleware_invocation")
+                .collect();
+            assert_eq!(companions.len(), 1, "{name}");
+            assert_eq!(http.len(), primary.len() + companions.len());
+            assert_eq!(companions[0]["unmapped"]["middleware_phase"], "request");
+            assert_eq!(companions[0]["metadata"]["correlation_uid"], request_id);
+            assert_eq!(
+                companions[0]["action"],
+                if reject { "Denied" } else { "Allowed" }
+            );
             assert_eq!(primary[0]["metadata"]["correlation_uid"], request_id);
             let spans = capture.spans();
             let stage = |stage_name: &str| {
