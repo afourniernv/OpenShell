@@ -21,6 +21,9 @@ use crate::l7::relay::L7EvalContext;
 pub use crate::l7::request_trace::RequestStage;
 use crate::l7::request_trace::RequestTrace;
 
+mod resources;
+use resources::RequestResources;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HttpOutcome {
     Allowed,
@@ -63,6 +66,7 @@ struct RequestState {
     late_failure_emitted: bool,
     middleware: [Option<MiddlewareState>; 2],
     credential: CredentialState,
+    resources: RequestResources,
 }
 
 pub struct CredentialPreparation<'a> {
@@ -424,6 +428,33 @@ impl RequestCorrelation {
     #[must_use]
     pub(crate) fn request_id(&self) -> &str {
         &self.request_id
+    }
+
+    pub(crate) fn record_policy_runtime_generation(&self, generation: u64) {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .resources
+            .record_policy_generation(generation);
+    }
+
+    pub(crate) fn record_selected_policy_endpoint(&self, policy_hash: &str, endpoint_id: &str) {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .resources
+            .record_endpoint(policy_hash, endpoint_id);
+    }
+
+    pub(crate) fn record_provider_credential_snapshot(
+        &self,
+        snapshot: &openshell_core::provider_credentials::ProviderCredentialSnapshot,
+    ) {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .resources
+            .record_provider(snapshot);
     }
 
     pub(crate) fn stage(&self, stage: RequestStage) -> tracing::Span {
@@ -945,6 +976,7 @@ impl RequestCorrelation {
                 .state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.resources.enrich(&mut event);
             state.trace.as_mut().map(|trace| {
                 if let OcsfEvent::HttpActivity(http) = &event {
                     trace.observe_http(http);
@@ -1149,6 +1181,12 @@ pub fn emit_phase_events(
                 continue;
             }
         }
+        correlation
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .resources
+            .enrich(&mut event);
         event.set_correlation_uid(correlation.request_id.clone());
         span.in_scope(|| crate::telemetry::emit_inspected_decision([event], Some(&span)));
     }
