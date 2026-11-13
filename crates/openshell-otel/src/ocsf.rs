@@ -799,19 +799,26 @@ mod tests {
                 .build();
             let subscriber = tracing_subscriber::registry()
                 .with(crate::layer(&tracer, "ocsf-test"))
-                .with(
-                    Some(otlp.layer()).with_filter(tracing_subscriber::filter::filter_fn(
-                        |metadata| metadata.target() == OCSF_TARGET,
-                    )),
-                );
+                .with(otlp.layer());
             let span_context = tracing::subscriber::with_default(subscriber, || {
                 let span = tracing::info_span!("decision");
-                span.in_scope(|| ocsf_emit!(event("sandbox-1", SeverityId::Medium)));
+                let mut event = event("sandbox-1", SeverityId::Medium);
+                event.set_correlation_uid("request-with-or-without-sampling");
+                span.in_scope(|| ocsf_emit!(event));
                 span.context().span().span_context().clone()
             });
             otlp.shutdown().await;
 
             let records = exporter.exported();
+            assert_eq!(records.len(), 1);
+            assert_eq!(
+                attribute(&records[0].record, CORRELATION_UID_ATTRIBUTE),
+                Some(AnyValue::String("request-with-or-without-sampling".into()))
+            );
+            assert_eq!(
+                body(&records[0].record)["metadata"]["correlation_uid"],
+                "request-with-or-without-sampling"
+            );
             let trace = records[0].record.trace_context();
             if span_context.is_sampled() {
                 let trace = trace.expect("sampled span context is attached");

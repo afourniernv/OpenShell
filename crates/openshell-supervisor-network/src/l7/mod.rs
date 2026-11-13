@@ -17,6 +17,7 @@ pub(crate) mod middleware;
 pub mod path;
 pub mod provider;
 pub mod relay;
+mod request_trace;
 pub mod rest;
 pub mod tls;
 pub(crate) mod token_grant_injection;
@@ -380,6 +381,9 @@ pub fn parse_l7_config(val: &regorus::Value) -> Option<L7EndpointConfig> {
     let allow_encoded_slash = get_object_bool(val, "allow_encoded_slash").unwrap_or(false);
     let websocket_credential_rewrite =
         get_object_bool(val, "websocket_credential_rewrite").unwrap_or(false);
+    if protocol == L7Protocol::Rest && websocket_credential_rewrite {
+        return None;
+    }
     let request_body_credential_rewrite =
         get_object_bool(val, "request_body_credential_rewrite").unwrap_or(false);
     let allow_uninspected_credentials =
@@ -1394,6 +1398,10 @@ pub fn validate_l7_policies(data_json: &serde_json::Value) -> (Vec<String>, Vec<
                 .and_then(serde_json::Value::as_bool)
                 .unwrap_or(false);
             let l7_fields = L7EndpointFields {
+                websocket_credential_rewrite: ep
+                    .get("websocket_credential_rewrite")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false),
                 protocol,
                 access,
                 has_rules,
@@ -1505,7 +1513,7 @@ pub fn validate_l7_policies(data_json: &serde_json::Value) -> (Vec<String>, Vec<
                 && protocol != "websocket"
             {
                 warnings.push(format!(
-                    "{loc}: websocket_credential_rewrite is ignored unless protocol is rest or websocket"
+                    "{loc}: websocket_credential_rewrite is ignored unless protocol is websocket"
                 ));
             }
 
@@ -2472,9 +2480,23 @@ mod tests {
     }
 
     #[test]
+    fn rest_websocket_credential_rewrite_fails_validation_and_materialization() {
+        let endpoint = serde_json::json!({
+            "protocol": "rest", "host": "gateway.example.com", "port": 443,
+            "access": "read-only", "websocket_credential_rewrite": true
+        });
+        let val = regorus::Value::from_json_str(&endpoint.to_string()).unwrap();
+        assert!(parse_l7_config(&val).is_none());
+        let (errors, _) = validate_l7_policies(&serde_json::json!({
+            "network_policies": {"test": {"endpoints": [endpoint], "binaries": []}}
+        }));
+        assert!(errors.iter().any(|e| e.contains("use protocol: websocket")));
+    }
+
+    #[test]
     fn parse_l7_config_websocket_credential_rewrite_opt_in() {
         let val = regorus::Value::from_json_str(
-            r#"{"protocol": "rest", "host": "gateway.example.com", "port": 443, "websocket_credential_rewrite": true}"#,
+            r#"{"protocol": "websocket", "host": "gateway.example.com", "port": 443, "websocket_credential_rewrite": true}"#,
         )
         .unwrap();
         let config = parse_l7_config(&val).unwrap();
@@ -2522,7 +2544,7 @@ mod tests {
     }
 
     #[test]
-    fn validate_websocket_credential_rewrite_warns_unless_rest_or_websocket() {
+    fn validate_websocket_credential_rewrite_warns_without_inspected_protocol() {
         let data = serde_json::json!({
             "network_policies": {
                 "test": {

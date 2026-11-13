@@ -268,7 +268,7 @@ service:
   port: 8080
   # -- Gateway health service port.
   healthPort: 8081
-  # -- Gateway metrics service port.
+  # -- Gateway metrics service port (1-65535). Disable the endpoint with metrics.enabled, not port 0 or false.
   metricsPort: 9090
 
 # Optional TLS and mTLS configuration for the dedicated metrics listener.
@@ -276,6 +276,8 @@ service:
 # Prometheus deployments. Secrets are supplied by the operator; the chart does
 # not generate metrics-specific PKI in this initial integration.
 metrics:
+  # -- Enable the dedicated Prometheus metrics listener and its container and Service ports.
+  enabled: true
   tls:
     # -- Enable TLS for the dedicated metrics listener.
     enabled: false
@@ -388,6 +390,15 @@ tolerations: []
 
 # -- Affinity rules for the gateway pod.
 affinity: {}
+
+# -- PriorityClass for the gateway pod. The gateway is a control-plane
+# component; when it shares nodes with the workloads it serves, the default
+# priority gives it no advantage under node pressure. Empty = omit the field.
+priorityClassName: ""
+
+# -- Topology spread constraints for the gateway pod, used to spread replicas
+# across zones or nodes. Empty = omit the field.
+topologySpreadConstraints: []
 
 # -- Non-secret gateway application configuration. Top-level keys name TOML
 # tables and are rendered into the mounted gateway.toml file. Kubernetes

@@ -234,7 +234,7 @@ spec:
         - name: health
           containerPort: {{ .Values.service.healthPort }}
           protocol: TCP
-        {{- if .Values.service.metricsPort }}
+        {{- if include "openshell.metricsEnabled" . }}
         - name: metrics
           containerPort: {{ .Values.service.metricsPort }}
           protocol: TCP
@@ -358,6 +358,9 @@ spec:
     {{- end }}
     - name: gateway-state
       emptyDir: {}
+  {{- with .Values.priorityClassName }}
+  priorityClassName: {{ . }}
+  {{- end }}
   {{- with .Values.nodeSelector }}
   nodeSelector:
     {{- toYaml . | nindent 4 }}
@@ -368,6 +371,10 @@ spec:
   {{- end }}
   {{- with .Values.tolerations }}
   tolerations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  {{- with .Values.topologySpreadConstraints }}
+  topologySpreadConstraints:
     {{- toYaml . | nindent 4 }}
   {{- end }}
 {{- end }}

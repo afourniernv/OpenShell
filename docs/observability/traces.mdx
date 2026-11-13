@@ -71,15 +71,17 @@ Give each installation that reports to the same collector its own name, includin
 
 The gateway continues a valid W3C `traceparent` sent by the caller, so a client's trace can include the gateway's spans for its requests. Without one, the gateway starts a new trace.
 
+The CLI forwards `TRACEPARENT` and `TRACESTATE` from its environment on gateway requests from its standard commands. A CI pipeline instrumented with an OpenTelemetry integration that exports these variables (for example the Jenkins OpenTelemetry plugin or an OpenTelemetry GitHub Action) therefore parents the gateway's spans for the commands it runs, with no collector or provider configuration on the CI runner.
+
 The gateway also passes its trace context to compute drivers, so driver spans appear in the same trace as the gateway request that caused them. Built-in drivers export their spans through the gateway's process. Managed external drivers receive the trace endpoint, gateway name, and compute driver from the gateway. Drivers that you run yourself own their telemetry configuration.
 
 ### HTTP Enforcement Correlation
 
 Inspected HTTP requests create an `openshell.http.request` span. Policy evaluation
-and selected request and response middleware phases appear as children. A valid,
-sampled W3C `traceparent` links the request to the caller's trace. Malformed or
-duplicate headers are ignored; an unsampled context becomes a link rather than
-disabling local enforcement telemetry. OpenShell does not adopt `tracestate`.
+and selected request and response middleware phases appear as children. Valid W3C
+`traceparent` context is an untrusted link, never the supervisor span's parent.
+Malformed or duplicate headers are ignored. Caller sampling flags do not control
+local enforcement telemetry. OpenShell does not adopt `tracestate`.
 
 OpenShell assigns its own request ID, includes it in the span and related OCSF
 records, and returns it as `X-OpenShell-Request-ID`. This header is a correlation
@@ -92,11 +94,13 @@ the mechanism, placement and outcome without credential values. The primary
 OCSF record includes notable withholding, denial, unavailability or stale state.
 
 The primary HTTP Activity record describes the final response headers accepted
-by the client connection. Response-body completion is recorded separately in the
-trace. A
-successful header write does not establish that the caller received a complete
-body or that the external service committed an operation. Correlation attributes
-exclude credentials, query values, bodies and MCP arguments.
+by the client connection. A successful header write does not establish complete
+body delivery or that the external service committed an operation. Middleware
+phase spans summarize mutations, policy blocks, failures and admission limits;
+remote RPC spans measure transport separately from middleware decisions.
+Correlation attributes exclude credentials, query values, bodies and MCP
+arguments. Truncated legacy diagnostics describe retained evidence; a false
+mutation flag does not guarantee that no later mutation occurred.
 
 ## Next Steps
 

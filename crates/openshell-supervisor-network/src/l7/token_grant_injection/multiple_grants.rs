@@ -326,13 +326,12 @@ async fn admitted_owners_select_grants_independently_per_header() {
             .map(|owner| (*owner).to_string())
             .collect::<HashSet<_>>();
 
-        let rewritten = inject_for_admitted_owners(
+        let (rewritten, _) = inject_for_admitted_owners(
             request(),
             &ctx,
             &state.snapshot(),
             &owners,
             REQUEST_ID,
-            None,
             None,
         )
         .await

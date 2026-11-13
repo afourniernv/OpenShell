@@ -1,45 +1,91 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Per-request correlation for HTTP enforcement events.
+//! Per-request receipts and consolidated HTTP audit records.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Mutex;
 use std::{
-    future::Future,
     pin::Pin,
     task::{Context, Poll},
 };
 
-use http::{HeaderMap, HeaderValue};
 use openshell_ocsf::{
-    ActionId, Endpoint, HttpActivityBuilder, HttpRequest, HttpResponse, OcsfEvent, SeverityId,
-    StatusId,
+    ActionId, DispositionId, Endpoint, HttpActivityBuilder, HttpActivityEvent, HttpRequest,
+    HttpResponse, OcsfEvent, SeverityId, StatusId,
 };
-use tracing::Instrument as _;
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 use crate::l7::provider::L7Request;
 use crate::l7::relay::L7EvalContext;
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+pub use crate::l7::request_trace::RequestStage;
+use crate::l7::request_trace::RequestTrace;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HttpOutcome {
+    Allowed,
+    Denied,
+    PlatformError,
+    UpstreamError,
+    Upgraded,
+}
+
+impl HttpOutcome {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Allowed => "allowed",
+            Self::Denied => "denied",
+            Self::PlatformError => "platform_error",
+            Self::UpstreamError => "upstream_error",
+            Self::Upgraded => "upgraded",
+        }
+    }
+}
 
 #[derive(Debug)]
 pub struct RequestCorrelation {
     request_id: String,
-    span: tracing::Span,
+    inspected: bool,
     // Keep the audit payload off the async state machine.
     state: Box<Mutex<RequestState>>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 struct RequestState {
+    trace: Option<RequestTrace>,
     primary: Option<OcsfEvent>,
+    seeded: bool,
     status: Option<u16>,
     upstream_status: Option<u16>,
-    outcome: Option<&'static str>,
-    policy_span: Option<tracing::Span>,
+    outcome: Option<HttpOutcome>,
+    blocked: bool,
+    failure_reason: Option<&'static str>,
+    late_failure_emitted: bool,
     middleware: [Option<MiddlewareState>; 2],
     credential: CredentialState,
-    credential_span: Option<tracing::Span>,
+}
+
+pub struct CredentialPreparation<'a> {
+    correlation: Option<&'a RequestCorrelation>,
+    span: tracing::Span,
+}
+
+impl<'a> CredentialPreparation<'a> {
+    pub(crate) fn new(correlation: Option<&'a RequestCorrelation>, span: tracing::Span) -> Self {
+        Self { correlation, span }
+    }
+
+    pub(crate) fn span(&self) -> &tracing::Span {
+        &self.span
+    }
+}
+
+impl Drop for CredentialPreparation<'_> {
+    fn drop(&mut self) {
+        if let Some(correlation) = self.correlation {
+            correlation.record_credential_span(&self.span);
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -277,29 +323,19 @@ struct MiddlewareState {
 pub struct MiddlewarePhaseGuard<'a> {
     correlation: &'a RequestCorrelation,
     phase: MiddlewarePhase,
+    active: bool,
+}
+
+impl MiddlewarePhaseGuard<'_> {
+    pub(crate) fn retain_for_stream(mut self) {
+        self.active = false;
+    }
 }
 
 impl Drop for MiddlewarePhaseGuard<'_> {
     fn drop(&mut self) {
-        let span = {
-            let mut state = self
-                .correlation
-                .state
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let Some(middleware) = &mut state.middleware[self.phase.index()] else {
-                return;
-            };
-            let span = middleware.span.take();
-            if !middleware.completed
-                && let Some(span) = &span
-            {
-                openshell_otel::mark_error(span);
-            }
-            span
-        };
-        if let Some(span) = span {
-            close_span(span);
+        if self.active {
+            self.correlation.finish_middleware(self.phase);
         }
     }
 }
@@ -310,10 +346,41 @@ fn close_span(span: tracing::Span) {
     }
 }
 
+impl RequestState {
+    fn record_outcome(&mut self, outcome: HttpOutcome) {
+        self.outcome = Some(outcome);
+        if let Some(trace) = &mut self.trace {
+            trace.record_outcome(outcome);
+        }
+    }
+
+    fn record_status(&mut self, status: u16) {
+        self.status = Some(status);
+        if let Some(trace) = &self.trace {
+            trace.record_status(status);
+        }
+    }
+
+    fn record_failure_reason(&mut self, reason: &'static str) {
+        self.failure_reason = Some(reason);
+        if let Some(trace) = &self.trace {
+            trace.record_failure_reason(reason);
+        }
+    }
+}
+
 impl RequestCorrelation {
     #[must_use]
     pub(crate) fn new(request: &L7Request, ctx: &L7EvalContext) -> Self {
         Self::build(request, ctx, uuid::Uuid::new_v4().to_string())
+    }
+
+    pub(crate) fn uninspected() -> Self {
+        Self {
+            request_id: uuid::Uuid::new_v4().to_string(),
+            inspected: false,
+            state: Box::default(),
+        }
     }
 
     #[cfg(test)]
@@ -327,43 +394,29 @@ impl RequestCorrelation {
     }
 
     fn build(request: &L7Request, ctx: &L7EvalContext, request_id: String) -> Self {
-        let method = bounded_http_method(&request.action);
-        let span = tracing::info_span!(
-            "openshell.http.request",
-            otel.kind = "server",
-            otel.status_code = tracing::field::Empty,
-            "openshell.request.id" = %request_id,
-            "http.request.method" = method,
-            "server.address" = %ctx.host,
-            "server.port" = ctx.port,
-            "openshell.policy.name" = %ctx.policy_name,
-            "openshell.target.reached" = false,
-            "openshell.request.delivery_started" = false,
-            "openshell.policy.decision" = tracing::field::Empty,
-            "openshell.enforcement.action" = tracing::field::Empty,
-            "openshell.http.outcome" = tracing::field::Empty,
-            "http.response.status_code" = tracing::field::Empty,
-        );
-        let headers = trace_headers(&request.raw_header);
-        let _ = openshell_otel::set_parent_from_headers(&span, &headers);
+        let target = request.target.split(['?', '#']).next().unwrap_or("/");
+        let target = if target.starts_with('/') { target } else { "/" };
+        let path = openshell_core::secrets::redact_target_for_policy(target)
+            .unwrap_or_else(|_| "/".to_string());
         let fallback = HttpActivityBuilder::new(openshell_ocsf::ctx::ctx())
-            .http_request(HttpRequest::new(method, ctx.ocsf_url("/")))
+            .http_request(HttpRequest::new(&request.action, ctx.ocsf_url(&path)))
             .dst_endpoint(Endpoint::from_domain(&ctx.host, ctx.port))
-            .firewall_rule(&ctx.policy_name, "l7")
             .message("HTTP request ended before a response was selected")
             .build();
+        let trace = RequestTrace::new(
+            &request_id,
+            &request.action,
+            &ctx.host,
+            ctx.port,
+            &request.raw_header,
+        );
         Self {
             request_id,
-            span,
+            inspected: true,
             state: Box::new(Mutex::new(RequestState {
+                trace: Some(trace),
                 primary: Some(fallback),
-                status: None,
-                upstream_status: None,
-                outcome: None,
-                policy_span: None,
-                middleware: [None, None],
-                credential: CredentialState::default(),
-                credential_span: None,
+                ..RequestState::default()
             })),
         }
     }
@@ -371,6 +424,41 @@ impl RequestCorrelation {
     #[must_use]
     pub(crate) fn request_id(&self) -> &str {
         &self.request_id
+    }
+
+    pub(crate) fn stage(&self, stage: RequestStage) -> tracing::Span {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .trace
+            .as_ref()
+            .map_or_else(tracing::Span::none, |trace| trace.stage(stage))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn trace_span(&self) -> tracing::Span {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .trace
+            .as_ref()
+            .map_or_else(tracing::Span::none, RequestTrace::span)
+    }
+
+    pub(crate) fn finish_http_trace(&self) {
+        let (mut trace, status) = {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            (state.trace.take(), state.status)
+        };
+        if status == Some(101)
+            && let Some(trace) = &mut trace
+        {
+            trace.record_outcome(HttpOutcome::Upgraded);
+        }
+        drop(trace);
     }
 
     pub(crate) fn observe_response<'a, C>(&'a self, client: &'a mut C) -> AuditedClient<'a, C> {
@@ -381,101 +469,28 @@ impl RequestCorrelation {
         }
     }
 
-    pub(crate) async fn within_span<F>(&self, future: F) -> F::Output
-    where
-        F: Future,
-    {
-        future.instrument(self.span.clone()).await
-    }
-
-    pub(crate) async fn within_middleware<F: Future>(
-        &self,
-        phase: MiddlewarePhase,
-        future: F,
-    ) -> F::Output {
-        future.instrument(self.middleware_span(phase)).await
-    }
-
-    pub(crate) fn record_policy_decision(&self, decision: &str) {
-        self.span.record("openshell.policy.decision", decision);
-        let policy_span = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .policy_span
-            .take();
-        if let Some(span) = policy_span {
-            span.record("openshell.policy.decision", decision);
-        }
-    }
-
-    pub(crate) fn evaluate_policy<T>(&self, operation: impl FnOnce() -> T) -> T {
-        let span = tracing::info_span!(
-            parent: &self.span,
-            "openshell.policy.evaluate",
-            "openshell.policy.decision" = tracing::field::Empty,
-        );
-        let result = span.in_scope(operation);
+    pub(crate) fn record_enforcement_block(&self) {
         self.state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .policy_span = Some(span);
-        result
+            .blocked = true;
     }
 
-    pub(crate) fn record_enforcement_action(&self, action: &str) {
-        self.span.record("openshell.enforcement.action", action);
-    }
-
-    pub(crate) fn record_final_http_outcome(&self, outcome: &'static str) {
-        self.span.record("openshell.http.outcome", outcome);
+    pub(crate) fn record_outcome(&self, outcome: HttpOutcome) {
         self.state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .outcome = Some(outcome);
-    }
-
-    pub(crate) fn record_response_status(&self, status: u16) {
-        self.span.record("http.response.status_code", status);
-        self.state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .status = Some(status);
-    }
-
-    pub(crate) fn record_upstream_status(&self, status: u16) {
-        self.state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .upstream_status = Some(status);
-    }
-
-    pub(crate) fn record_target_reached(&self) {
-        self.span.record("openshell.target.reached", true);
+            .record_outcome(outcome);
     }
 
     pub(crate) fn record_request_delivery_started(&self) {
-        self.span.record("openshell.request.delivery_started", true);
-        self.finish_credential_span();
-    }
-
-    fn credential_span(&self, state: &mut RequestState) {
-        state.credential_span.get_or_insert_with(|| {
-            self.span
-                .with_subscriber(|(_, dispatch)| {
-                    tracing::dispatcher::with_default(dispatch, || {
-                        tracing::info_span!(parent: &self.span, "openshell.credential.prepare",
-                    otel.status_code = tracing::field::Empty,
-                    "openshell.credential.outcome" = tracing::field::Empty,
-                    "openshell.credential.mechanisms" = tracing::field::Empty,
-                    "openshell.credential.surfaces" = tracing::field::Empty,
-                    "openshell.credential.static_placeholder.outcome" = tracing::field::Empty,
-                    "openshell.credential.token_grant.outcome" = tracing::field::Empty,
-                    "openshell.credential.sigv4.outcome" = tracing::field::Empty)
-                    })
-                })
-                .unwrap_or_else(tracing::Span::none)
-        });
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(trace) = &state.trace {
+            trace.record_delivery_started();
+        }
     }
 
     pub(crate) fn observe_credential(
@@ -483,12 +498,11 @@ impl RequestCorrelation {
         mechanism: CredentialMechanism,
         surface: CredentialSurface,
     ) {
-        let mut state = self
-            .state
+        self.state
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        state.credential.observe(mechanism, surface);
-        self.credential_span(&mut state);
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .credential
+            .observe(mechanism, surface);
     }
 
     pub(crate) fn has_credential_mechanism(&self, mechanism: CredentialMechanism) -> bool {
@@ -501,14 +515,11 @@ impl RequestCorrelation {
     }
 
     pub(crate) fn complete_credential(&self, outcome: CredentialOutcome) {
-        let mut state = self
-            .state
+        self.state
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        state.credential.complete(outcome);
-        if state.credential.selected {
-            self.credential_span(&mut state);
-        }
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .credential
+            .complete(outcome);
     }
 
     pub(crate) fn complete_credential_mechanism(
@@ -523,28 +534,16 @@ impl RequestCorrelation {
             .complete_mechanism(mechanism, outcome);
     }
 
-    pub(crate) async fn within_credential<F: Future>(&self, future: F) -> F::Output {
-        let span = self
+    fn record_credential_span(&self, span: &tracing::Span) {
+        if span.is_disabled() {
+            return;
+        }
+        let snapshot = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .credential_span
-            .clone()
-            .unwrap_or_else(tracing::Span::none);
-        future.instrument(span).await
-    }
-
-    fn finish_credential_span(&self) {
-        let (span, snapshot) = {
-            let mut state = self
-                .state
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let Some(span) = state.credential_span.take() else {
-                return;
-            };
-            (span, state.credential.snapshot())
-        };
+            .credential
+            .snapshot();
         if let Some(snapshot) = snapshot {
             span.record("openshell.credential.outcome", snapshot.outcome.as_str());
             span.record(
@@ -561,65 +560,104 @@ impl RequestCorrelation {
                 snapshot.outcome,
                 CredentialOutcome::Prepared | CredentialOutcome::Withheld
             ) {
-                openshell_otel::mark_error(&span);
+                span.record("otel.status_code", "ERROR");
             }
         }
     }
 
-    pub(crate) fn record_error_stage(&self, _stage: &str) {
-        openshell_otel::mark_error(&self.span);
+    pub(crate) fn record_response_status(&self, status: u16) {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .record_status(status);
     }
 
-    pub(crate) fn middleware_span(&self, phase: MiddlewarePhase) -> tracing::Span {
+    pub(crate) fn record_upstream_status(&self, status: u16) {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .upstream_status = Some(status);
+    }
+
+    pub(crate) fn record_rejection(
+        &self,
+        status: u16,
+        outcome: HttpOutcome,
+        reason: Option<&'static str>,
+    ) {
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        state.middleware[phase.index()]
-            .get_or_insert_with(|| MiddlewareState {
-                span: Some(
-                    self.span
-                        .with_subscriber(|(_, dispatch)| {
-                            tracing::dispatcher::with_default(dispatch, || match phase {
-                                MiddlewarePhase::Request => tracing::info_span!(parent: &self.span,
-                    "openshell.middleware.request", otel.status_code = tracing::field::Empty,
-                    "openshell.middleware.outcome" = "incomplete",
-                    "openshell.middleware.mutated" = false,
-                    "openshell.middleware.fail_open" = false,
-                    "openshell.middleware.fail_closed" = false,
-                    "openshell.middleware.admission_exhausted" = false,
-                    "openshell.middleware.diagnostics_truncated" = false,
-                    "openshell.response.delivery_started" = false,
-                    "openshell.response.partial_delivery" = false),
-                                MiddlewarePhase::Response => {
-                                    tracing::info_span!(parent: &self.span,
-                    "openshell.middleware.response", otel.status_code = tracing::field::Empty,
-                    "openshell.middleware.outcome" = "incomplete",
-                    "openshell.middleware.mutated" = false,
-                    "openshell.middleware.fail_open" = false,
-                    "openshell.middleware.fail_closed" = false,
-                    "openshell.middleware.admission_exhausted" = false,
-                    "openshell.middleware.diagnostics_truncated" = false,
-                    "openshell.response.delivery_started" = false,
-                    "openshell.response.partial_delivery" = false)
-                                }
-                            })
-                        })
-                        .unwrap_or_else(tracing::Span::none),
-                ),
-                observation: MiddlewareObservation::default(),
-                completed: false,
-            })
-            .span
-            .clone()
-            .unwrap_or_else(tracing::Span::none)
+        state.blocked = true;
+        state.record_outcome(outcome);
+        state.record_status(status);
+        if let Some(reason) = reason {
+            state.record_failure_reason(reason);
+        }
     }
 
-    pub(crate) fn begin_middleware(&self, phase: MiddlewarePhase) -> MiddlewarePhaseGuard<'_> {
-        drop(self.middleware_span(phase));
+    pub(crate) fn record_failure(&self, outcome: HttpOutcome, reason: &'static str) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.record_outcome(outcome);
+        state.record_failure_reason(reason);
+    }
+
+    pub(crate) fn middleware_span(&self, phase: MiddlewarePhase) -> tracing::Span {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .middleware[phase.index()]
+        .as_ref()
+        .and_then(|middleware| middleware.span.clone())
+        .unwrap_or_else(tracing::Span::none)
+    }
+
+    pub(crate) fn begin_middleware(
+        &self,
+        phase: MiddlewarePhase,
+        span: tracing::Span,
+    ) -> MiddlewarePhaseGuard<'_> {
+        self.register_middleware(phase, span);
         MiddlewarePhaseGuard {
             correlation: self,
             phase,
+            active: true,
+        }
+    }
+
+    pub(crate) fn register_middleware(&self, phase: MiddlewarePhase, span: tracing::Span) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.middleware[phase.index()] = Some(MiddlewareState {
+            span: Some(span),
+            observation: MiddlewareObservation::default(),
+            completed: false,
+        });
+    }
+
+    pub(crate) fn finish_middleware(&self, phase: MiddlewarePhase) {
+        let span = {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.middleware[phase.index()].as_mut().and_then(|phase| {
+                if !phase.completed
+                    && let Some(span) = &phase.span
+                {
+                    span.record("otel.status_code", "ERROR");
+                }
+                phase.span.take()
+            })
+        };
+        if let Some(span) = span {
+            close_span(span);
         }
     }
 
@@ -647,7 +685,7 @@ impl RequestCorrelation {
         merged.admission_exhausted |= observation.admission_exhausted;
         merged.diagnostics_truncated |= observation.diagnostics_truncated;
         merged.delivery_started |= observation.delivery_started;
-        merged.partial_delivery |= observation.partial_delivery;
+        merged.partial_delivery |= observation.partial_delivery && merged.delivery_started;
         // Repeated SDK attribute writes consume the span limit, even for the same key.
         for (field, before, after) in [
             (
@@ -722,7 +760,7 @@ impl RequestCorrelation {
             middleware.completed = true;
             span.record("openshell.middleware.outcome", outcome.as_str());
             if outcome != MiddlewareOutcome::Allowed {
-                openshell_otel::mark_error(&span);
+                span.record("otel.status_code", "ERROR");
             }
         }
     }
@@ -741,7 +779,6 @@ impl RequestCorrelation {
         self.observe_middleware(
             MiddlewarePhase::Response,
             MiddlewareObservation {
-                delivery_started: true,
                 partial_delivery: true,
                 ..Default::default()
             },
@@ -749,15 +786,67 @@ impl RequestCorrelation {
     }
 
     pub(crate) fn emit(&self, event: OcsfEvent) {
-        if matches!(event, OcsfEvent::HttpActivity(_)) {
+        if !self.inspected {
+            crate::telemetry::emit_decision([event], None);
+            return;
+        }
+        if let OcsfEvent::HttpActivity(mut incoming) = event {
             let mut state = self
                 .state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if let Some(primary) = &mut state.primary {
-                *primary = event;
+            if !state.seeded && state.primary.is_some() {
+                state.primary = Some(OcsfEvent::HttpActivity(incoming));
+                state.seeded = true;
+                return;
             }
+            if let Some(OcsfEvent::HttpActivity(primary)) = &mut state.primary {
+                merge_http_outcome(primary, incoming);
+                return;
+            }
+            let fail_open = incoming.action == Some(ActionId::Other)
+                && (incoming.disposition == Some(DispositionId::Allowed)
+                    || incoming
+                        .base
+                        .unmapped
+                        .as_ref()
+                        .and_then(|fields| fields.get("response_middleware_outcome"))
+                        .and_then(serde_json::Value::as_str)
+                        == Some("failopen"));
+            if !is_failure(&incoming) || fail_open || state.late_failure_emitted {
+                return;
+            }
+            state.late_failure_emitted = true;
+            if let Some(code) = state.status {
+                incoming.http_response = Some(HttpResponse { code });
+            }
+            drop(state);
+            self.emit_correlated(OcsfEvent::HttpActivity(incoming));
         } else {
+            if let OcsfEvent::NetworkActivity(network) = &event {
+                let mut state = self
+                    .state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if !state.seeded
+                    && (network.action == Some(ActionId::Denied)
+                        || network.base.status == Some(StatusId::Failure))
+                    && let Some(OcsfEvent::HttpActivity(primary)) = &mut state.primary
+                {
+                    primary.action = network.action;
+                    primary.disposition = network.disposition;
+                    primary.base.status = Some(StatusId::Failure);
+                    primary
+                        .base
+                        .status_detail
+                        .clone_from(&network.base.status_detail);
+                    primary.base.severity = network.base.severity;
+                    primary.base.message =
+                        Some("HTTP request rejected before policy evaluation".into());
+                    primary.src_endpoint.clone_from(&network.src_endpoint);
+                    primary.actor.clone_from(&network.actor);
+                }
+            }
             self.emit_correlated(event);
         }
     }
@@ -768,16 +857,17 @@ impl RequestCorrelation {
     }
 
     fn emit_primary(&self, incomplete: bool) {
-        self.finish_credential_span();
-        let (mut event, status, upstream_status, outcome) = {
+        if !self.inspected {
+            return;
+        }
+        let (mut event, status, upstream_status, outcome, blocked, failure_reason) = {
             let mut state = self
                 .state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let Some(primary) = state.primary.take() else {
+            let Some(mut primary) = state.primary.take() else {
                 return;
             };
-            let mut primary = primary;
             if let Some(outcome) = state.credential.effective_outcome()
                 && outcome != CredentialOutcome::Prepared
                 && let OcsfEvent::HttpActivity(http) = &mut primary
@@ -787,34 +877,62 @@ impl RequestCorrelation {
                     .get_or_insert_with(|| serde_json::json!({}))["credential_outcome"] =
                     outcome.as_str().into();
             }
-            (primary, state.status, state.upstream_status, state.outcome)
+            (
+                primary,
+                state.status,
+                state.upstream_status,
+                state.outcome,
+                state.blocked,
+                state.failure_reason,
+            )
         };
         if let OcsfEvent::HttpActivity(http) = &mut event {
-            http.http_response = status.map(|code| HttpResponse { code });
-            if let Some(upstream) = upstream_status.filter(|upstream| Some(*upstream) != status) {
-                let unmapped = http
+            let has_failure_reason = is_failure(http) && http.base.status_detail.is_some();
+            if let Some(code) = status {
+                http.http_response = Some(HttpResponse { code });
+            }
+            if let Some(upstream) = upstream_status.filter(|upstream| Some(*upstream) != status)
+                && let serde_json::Value::Object(unmapped) = http
                     .base
                     .unmapped
-                    .get_or_insert_with(|| serde_json::json!({}));
-                unmapped["upstream_response_code"] = serde_json::json!(upstream);
+                    .get_or_insert_with(|| serde_json::json!({}))
+            {
+                unmapped.insert("upstream_response_code".into(), serde_json::json!(upstream));
+            }
+            if blocked || outcome == Some(HttpOutcome::Denied) {
+                if http.action != Some(ActionId::Denied) {
+                    http.base.message = Some("HTTP request blocked by supervisor".into());
+                }
+                http.action = Some(ActionId::Denied);
+                http.disposition = Some(DispositionId::Blocked);
+                http.base.status = Some(StatusId::Failure);
+                raise_severity(http, SeverityId::Medium);
+                if !has_failure_reason {
+                    http.base.status_detail = Some(
+                        failure_reason
+                            .or_else(|| outcome.map(HttpOutcome::as_str))
+                            .unwrap_or("supervisor_blocked")
+                            .into(),
+                    );
+                }
+            } else if matches!(
+                outcome,
+                Some(HttpOutcome::PlatformError | HttpOutcome::UpstreamError)
+            ) {
+                http.base.status = Some(StatusId::Failure);
+                raise_severity(http, SeverityId::Low);
+                if !has_failure_reason {
+                    http.base.status_detail = failure_reason
+                        .or_else(|| outcome.map(HttpOutcome::as_str))
+                        .map(str::to_string);
+                }
             }
             if incomplete && outcome.is_none() {
                 http.base.status = Some(StatusId::Failure);
-                http.base.status_detail = Some("request_incomplete".into());
-                http.base.severity = SeverityId::Low;
-            }
-            if outcome == Some("denied") {
-                if http.action != Some(ActionId::Denied) {
-                    http.base.message = Some("HTTP request blocked after policy admission".into());
+                if !has_failure_reason {
+                    http.base.status_detail = Some("request_incomplete".into());
                 }
-                http.action = Some(ActionId::Denied);
-                http.disposition = Some(openshell_ocsf::DispositionId::Blocked);
-                http.base.status = Some(StatusId::Failure);
-                http.base.severity = SeverityId::Medium;
-            } else if matches!(outcome, Some("platform_error" | "upstream_error")) {
-                http.base.status = Some(StatusId::Failure);
-                http.base.status_detail = outcome.map(str::to_owned);
-                http.base.severity = SeverityId::Low;
+                raise_severity(http, SeverityId::Low);
             }
         }
         self.emit_correlated(event);
@@ -822,8 +940,126 @@ impl RequestCorrelation {
 
     fn emit_correlated(&self, mut event: OcsfEvent) {
         event.set_correlation_uid(self.request_id.clone());
-        self.span
-            .in_scope(|| crate::telemetry::emit_correlated(event));
+        let parent = {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.trace.as_mut().map(|trace| {
+                if let OcsfEvent::HttpActivity(http) = &event {
+                    trace.observe_http(http);
+                }
+                trace.span()
+            })
+        };
+        crate::telemetry::emit_inspected_decision([event], parent.as_ref());
+    }
+}
+
+pub fn emit_request_events(
+    correlation: Option<&RequestCorrelation>,
+    events: impl IntoIterator<Item = OcsfEvent>,
+) {
+    if let Some(correlation) = correlation {
+        for event in events {
+            correlation.emit(event);
+        }
+    } else {
+        crate::telemetry::emit_decision(events, None);
+    }
+}
+
+fn is_failure(event: &HttpActivityEvent) -> bool {
+    event.action == Some(ActionId::Denied) || event.base.status == Some(StatusId::Failure)
+}
+
+fn raise_severity(event: &mut HttpActivityEvent, severity: SeverityId) {
+    if event.base.severity.as_u8() < severity.as_u8() {
+        event.base.severity = severity;
+    }
+}
+
+fn merge_http_outcome(primary: &mut HttpActivityEvent, incoming: HttpActivityEvent) {
+    let failed = is_failure(&incoming);
+    if primary.actor.is_none() {
+        primary.actor = incoming.actor;
+    }
+    if primary.src_endpoint.is_none() {
+        primary.src_endpoint = incoming.src_endpoint;
+    }
+    if primary.dst_endpoint.is_none() {
+        primary.dst_endpoint = incoming.dst_endpoint;
+    }
+    if primary.firewall_rule.is_none() {
+        primary.firewall_rule = incoming.firewall_rule;
+    }
+    if primary
+        .http_request
+        .as_ref()
+        .and_then(|request| request.url.as_ref())
+        .is_none()
+        && incoming
+            .http_request
+            .as_ref()
+            .and_then(|request| request.url.as_ref())
+            .is_some()
+    {
+        primary.http_request = incoming.http_request;
+    }
+    if !failed {
+        if incoming
+            .base
+            .unmapped
+            .as_ref()
+            .and_then(|fields| fields.get("transformed_body_policy"))
+            .and_then(serde_json::Value::as_str)
+            == Some("audit")
+        {
+            if let serde_json::Value::Object(fields) = primary
+                .base
+                .unmapped
+                .get_or_insert_with(|| serde_json::json!({}))
+            {
+                fields.insert("transformed_body_policy".into(), "audit".into());
+            }
+            if !is_failure(primary) && incoming.base.status_detail.is_some() {
+                primary
+                    .base
+                    .status_detail
+                    .clone_from(&incoming.base.status_detail);
+            }
+        }
+        if primary.action.is_none() {
+            primary.action = incoming.action;
+            primary.disposition = incoming.disposition;
+            primary.base.status = incoming.base.status;
+            primary.base.message = incoming.base.message;
+            primary.base.status_detail = incoming.base.status_detail;
+        }
+        return;
+    }
+    if incoming.action == Some(ActionId::Denied) {
+        primary.action = incoming.action;
+        primary.disposition = incoming.disposition;
+    }
+    primary.base.status = Some(StatusId::Failure);
+    raise_severity(primary, incoming.base.severity);
+    if incoming.base.message.is_some() {
+        primary.base.message = incoming.base.message;
+    }
+    if incoming.base.status_detail.is_some() {
+        primary.base.status_detail = incoming.base.status_detail;
+    }
+    if incoming.http_response.is_some() {
+        primary.http_response = incoming.http_response;
+    }
+    if let Some(serde_json::Value::Object(fields)) = incoming.base.unmapped
+        && let serde_json::Value::Object(existing) = primary
+            .base
+            .unmapped
+            .get_or_insert_with(|| serde_json::json!({}))
+    {
+        existing.extend(fields);
     }
 }
 
@@ -888,6 +1124,17 @@ pub fn emit_phase_events(
         return;
     };
     let span = correlation.middleware_span(phase);
+    let span = if span.is_disabled() {
+        correlation
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .trace
+            .as_ref()
+            .map_or_else(tracing::Span::none, RequestTrace::span)
+    } else {
+        span
+    };
     for mut event in events {
         if let OcsfEvent::HttpActivity(http) = &event {
             // Routine invocation records belong to the phase span. A late
@@ -903,7 +1150,7 @@ pub fn emit_phase_events(
             }
         }
         event.set_correlation_uid(correlation.request_id.clone());
-        span.in_scope(|| crate::telemetry::emit_correlated(event));
+        span.in_scope(|| crate::telemetry::emit_inspected_decision([event], Some(&span)));
     }
 }
 
@@ -969,7 +1216,9 @@ impl<C: AsyncWrite + Unpin> AsyncWrite for AuditedClient<'_, C> {
     ) -> Poll<std::io::Result<usize>> {
         let this = self.get_mut();
         let result = Pin::new(&mut *this.inner).poll_write(cx, bytes);
-        if let Poll::Ready(Ok(accepted)) = result {
+        if let Poll::Ready(Ok(accepted)) = result
+            && this.correlation.inspected
+        {
             this.head.accept(&bytes[..accepted], this.correlation);
         }
         result
@@ -984,493 +1233,14 @@ impl<C: AsyncWrite + Unpin> AsyncWrite for AuditedClient<'_, C> {
     }
 }
 
-fn bounded_http_method(method: &str) -> &'static str {
-    [
-        "CONNECT", "DELETE", "GET", "HEAD", "OPTIONS", "PATCH", "POST", "PUT", "TRACE",
-    ]
-    .into_iter()
-    .find(|known| method.eq_ignore_ascii_case(known))
-    .unwrap_or("OTHER")
-}
-
 impl Drop for RequestCorrelation {
     fn drop(&mut self) {
-        if self
-            .state
-            .get_mut()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .outcome
-            .is_none()
-        {
-            self.span.record("openshell.http.outcome", "incomplete");
-            openshell_otel::mark_error(&self.span);
-        }
         self.emit_primary(true);
+        self.finish_middleware(MiddlewarePhase::Request);
+        self.finish_middleware(MiddlewarePhase::Response);
+        self.finish_http_trace();
     }
-}
-
-fn trace_headers(raw_header: &[u8]) -> HeaderMap {
-    let Some(header_end) = raw_header
-        .windows(4)
-        .position(|window| window == b"\r\n\r\n")
-        .map(|position| position + 2)
-    else {
-        return HeaderMap::new();
-    };
-
-    let mut headers = HeaderMap::new();
-    for line in raw_header[..header_end]
-        .split(|byte| *byte == b'\n')
-        .skip(1)
-    {
-        let line = line.strip_suffix(b"\r").unwrap_or(line);
-        let Some(separator) = line.iter().position(|byte| *byte == b':') else {
-            continue;
-        };
-        let name = trim_optional_whitespace(&line[..separator]);
-        if !name.eq_ignore_ascii_case(b"traceparent") {
-            continue;
-        }
-        let Ok(name) = http::HeaderName::from_bytes(name) else {
-            continue;
-        };
-        let Ok(value) = HeaderValue::from_bytes(trim_optional_whitespace(&line[separator + 1..]))
-        else {
-            continue;
-        };
-        if value.to_str().is_err() {
-            continue;
-        }
-        headers.append(name, value);
-    }
-    headers
-}
-
-fn trim_optional_whitespace(mut value: &[u8]) -> &[u8] {
-    while matches!(value.first(), Some(b' ' | b'\t')) {
-        value = &value[1..];
-    }
-    while matches!(value.last(), Some(b' ' | b'\t')) {
-        value = &value[..value.len() - 1];
-    }
-    value
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn effective_credential_outcome_preserves_selection_and_failure_precedence() {
-        let mut state = CredentialState::default();
-        assert_eq!(state.effective_outcome(), None);
-        state.observe(
-            CredentialMechanism::StaticPlaceholder,
-            CredentialSurface::Header,
-        );
-        assert_eq!(
-            state.effective_outcome(),
-            Some(CredentialOutcome::Incomplete)
-        );
-        state.complete_mechanism(
-            CredentialMechanism::StaticPlaceholder,
-            CredentialOutcome::Prepared,
-        );
-        assert_eq!(state.effective_outcome(), Some(CredentialOutcome::Prepared));
-        state.observe(CredentialMechanism::TokenGrant, CredentialSurface::Header);
-        assert_eq!(
-            state.effective_outcome(),
-            Some(CredentialOutcome::Incomplete)
-        );
-        state.complete_mechanism(CredentialMechanism::TokenGrant, CredentialOutcome::Withheld);
-        assert_eq!(state.effective_outcome(), Some(CredentialOutcome::Prepared));
-        for outcome in [
-            CredentialOutcome::Unavailable,
-            CredentialOutcome::Stale,
-            CredentialOutcome::Denied,
-        ] {
-            state.complete(outcome);
-            assert_eq!(state.effective_outcome(), Some(outcome));
-            assert_eq!(state.snapshot().unwrap().outcome, outcome);
-        }
-    }
-
-    fn request() -> L7Request {
-        L7Request {
-            action: "GET".into(),
-            target: "/data".into(),
-            query_params: std::collections::HashMap::new(),
-            raw_header: b"GET /data HTTP/1.1\r\nHost: example.test\r\n\r\n".to_vec(),
-            body_length: crate::l7::provider::BodyLength::None,
-        }
-    }
-
-    #[test]
-    fn request_ids_are_unique_canonical_uuids() {
-        let ctx = L7EvalContext {
-            host: "example.test".into(),
-            port: 443,
-            ..Default::default()
-        };
-        let first = RequestCorrelation::new(&request(), &ctx);
-        let second = RequestCorrelation::new(&request(), &ctx);
-
-        assert_ne!(first.request_id(), second.request_id());
-        assert!(uuid::Uuid::parse_str(first.request_id()).is_ok());
-        assert!(uuid::Uuid::parse_str(second.request_id()).is_ok());
-    }
-
-    #[test]
-    fn request_span_stays_current_across_future_yields() {
-        tracing::subscriber::with_default(tracing_subscriber::registry(), || {
-            let correlation = RequestCorrelation::new(
-                &request(),
-                &L7EvalContext {
-                    host: "example.test".into(),
-                    port: 443,
-                    ..Default::default()
-                },
-            );
-            let expected = correlation.span.id().expect("request span has an id");
-            let mut yielded = false;
-            let current = futures::executor::block_on(correlation.within_span(
-                futures::future::poll_fn(|cx| {
-                    if yielded {
-                        Poll::Ready(tracing::Span::current().id())
-                    } else {
-                        yielded = true;
-                        cx.waker().wake_by_ref();
-                        Poll::Pending
-                    }
-                }),
-            ));
-
-            assert_eq!(current, Some(expected));
-        });
-    }
-
-    #[test]
-    fn middleware_phases_end_before_the_request_and_report_cancellation() {
-        use tracing_subscriber::layer::SubscriberExt as _;
-
-        let exporter = opentelemetry_sdk::trace::InMemorySpanExporterBuilder::new().build();
-        let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
-            .with_simple_exporter(exporter.clone())
-            .build();
-        let subscriber = tracing_subscriber::registry()
-            .with(openshell_otel::layer(&provider, "middleware-lifetime"));
-        tracing::subscriber::with_default(subscriber, || {
-            let correlation = RequestCorrelation::new(&request(), &L7EvalContext::default());
-            {
-                let _phase = correlation.begin_middleware(MiddlewarePhase::Request);
-                correlation
-                    .complete_middleware(MiddlewarePhase::Request, MiddlewareOutcome::Allowed);
-            }
-            {
-                let _cancelled = correlation.begin_middleware(MiddlewarePhase::Response);
-            }
-            let spans = exporter.get_finished_spans().unwrap();
-            assert_eq!(spans.len(), 2, "only the phases have ended");
-            let completed = spans
-                .iter()
-                .find(|span| span.name == "openshell.middleware.request")
-                .unwrap();
-            assert!(!matches!(
-                completed.status,
-                opentelemetry::trace::Status::Error { .. }
-            ));
-            let cancelled = spans
-                .iter()
-                .find(|span| span.name == "openshell.middleware.response")
-                .unwrap();
-            assert!(matches!(
-                cancelled.status,
-                opentelemetry::trace::Status::Error { .. }
-            ));
-            assert!(
-                correlation
-                    .middleware_span(MiddlewarePhase::Response)
-                    .is_disabled()
-            );
-        });
-        assert_eq!(exporter.get_finished_spans().unwrap().len(), 3);
-    }
-
-    #[test]
-    fn repeated_middleware_observations_preserve_the_terminal_verdict() {
-        use tracing_subscriber::layer::SubscriberExt as _;
-
-        let exporter = opentelemetry_sdk::trace::InMemorySpanExporterBuilder::new().build();
-        let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
-            .with_max_attributes_per_span(48)
-            .with_simple_exporter(exporter.clone())
-            .build();
-        let subscriber = tracing_subscriber::registry()
-            .with(openshell_otel::layer(&provider, "middleware-attributes"));
-        tracing::subscriber::with_default(subscriber, || {
-            let correlation = RequestCorrelation::new(&request(), &L7EvalContext::default());
-            for phase in [MiddlewarePhase::Request, MiddlewarePhase::Response] {
-                let _phase = correlation.begin_middleware(phase);
-                // OCSF correlation and remote RPCs can materialize the SDK span early.
-                assert!(
-                    correlation
-                        .middleware_span(phase)
-                        .in_scope(openshell_otel::current_ocsf_trace_correlation)
-                        .is_some()
-                );
-                for _ in 0..1000 {
-                    correlation.observe_middleware(phase, MiddlewareObservation::default());
-                }
-                correlation.observe_middleware(
-                    phase,
-                    MiddlewareObservation {
-                        diagnostics_truncated: true,
-                        partial_delivery: true,
-                        ..Default::default()
-                    },
-                );
-                correlation.complete_middleware(phase, MiddlewareOutcome::Denied);
-            }
-        });
-        let spans = exporter.get_finished_spans().unwrap();
-        let phases = spans
-            .iter()
-            .filter(|span| span.name.starts_with("openshell.middleware."))
-            .collect::<Vec<_>>();
-        assert_eq!(phases.len(), 2);
-        for span in phases {
-            let attributes = span
-                .attributes
-                .iter()
-                .map(|attribute| (attribute.key.as_str(), attribute.value.to_string()))
-                .collect::<BTreeMap<_, _>>();
-            assert_eq!(attributes["openshell.middleware.outcome"], "denied");
-            assert_eq!(
-                attributes["openshell.middleware.diagnostics_truncated"],
-                "true"
-            );
-            assert_eq!(attributes["openshell.response.partial_delivery"], "true");
-            assert_eq!(span.dropped_attributes_count, 0);
-        }
-    }
-
-    #[test]
-    fn extracts_only_traceparent_and_preserves_duplicates() {
-        let headers = trace_headers(
-            b"GET / HTTP/1.1\r\nHost: example.com\r\nX-OpenShell-Request-ID: forged\r\ntraceparent: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01\r\nTraceParent: 00-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-bbbbbbbbbbbbbbbb-01\r\ntracestate: vendor=value\r\n\r\n",
-        );
-        assert_eq!(headers.get_all("traceparent").iter().count(), 2);
-        assert!(headers.get("tracestate").is_none());
-        assert!(headers.get("x-openshell-request-id").is_none());
-    }
-
-    #[test]
-    fn unrelated_obs_text_does_not_discard_valid_trace_context() {
-        let headers = trace_headers(
-            b"GET / HTTP/1.1\r\ntraceparent: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01\r\nx-observation-note: contains traceparent: but is not a field\r\n\r\n",
-        );
-
-        assert_eq!(headers.get_all("traceparent").iter().count(), 1);
-    }
-
-    #[test]
-    fn non_ascii_traceparent_is_rejected_and_tracestate_is_ignored() {
-        let headers = trace_headers(
-            b"GET / HTTP/1.1\r\ntraceparent: \xff\r\ntracestate: vendor=value\r\n\r\n",
-        );
-
-        assert!(headers.get("traceparent").is_none());
-        assert!(headers.get("tracestate").is_none());
-    }
-
-    #[test]
-    fn records_only_bounded_enforcement_outcome_fields() {
-        use tracing_subscriber::layer::SubscriberExt as _;
-
-        let exporter = opentelemetry_sdk::trace::InMemorySpanExporterBuilder::new().build();
-        let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
-            .with_simple_exporter(exporter.clone())
-            .build();
-        let subscriber = tracing_subscriber::registry()
-            .with(openshell_otel::layer(&provider, "correlation-test"));
-        let ctx = L7EvalContext {
-            host: "example.test".into(),
-            port: 443,
-            ..Default::default()
-        };
-
-        tracing::subscriber::with_default(subscriber, || {
-            let correlation = RequestCorrelation::with_request_id(
-                &request(),
-                &ctx,
-                "00000000-0000-4000-8000-000000000001".into(),
-            );
-            assert!(!correlation.evaluate_policy(|| false));
-            correlation.record_policy_decision("deny");
-            correlation.record_enforcement_action("block");
-            correlation.record_final_http_outcome("denied");
-            correlation.record_response_status(403);
-            correlation.record_error_stage("policy");
-            correlation.record_target_reached();
-        });
-
-        let spans = exporter.get_finished_spans().unwrap();
-        let span = spans
-            .iter()
-            .find(|span| span.name == "openshell.http.request")
-            .unwrap();
-        let policy = spans
-            .iter()
-            .find(|span| span.name == "openshell.policy.evaluate")
-            .unwrap();
-        assert_eq!(policy.parent_span_id, span.span_context.span_id());
-        assert_eq!(span.span_kind, opentelemetry::trace::SpanKind::Server);
-        let attributes = span
-            .attributes
-            .iter()
-            .map(|kv| (kv.key.as_str().to_string(), kv.value.to_string()))
-            .collect::<BTreeMap<_, _>>();
-        assert_eq!(attributes["openshell.policy.decision"], "deny");
-        assert_eq!(attributes["openshell.enforcement.action"], "block");
-        assert_eq!(attributes["openshell.http.outcome"], "denied");
-        assert_eq!(attributes["http.response.status_code"], "403");
-        assert!(!attributes.contains_key("openshell.error.stage"));
-        assert_eq!(attributes["openshell.target.reached"], "true");
-    }
-
-    #[test]
-    fn custom_method_is_bounded_in_telemetry() {
-        use tracing_subscriber::layer::SubscriberExt as _;
-
-        let exporter = opentelemetry_sdk::trace::InMemorySpanExporterBuilder::new().build();
-        let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
-            .with_simple_exporter(exporter.clone())
-            .build();
-        let subscriber = tracing_subscriber::registry()
-            .with(openshell_otel::layer(&provider, "correlation-test"));
-        let ctx = L7EvalContext {
-            host: "example.test".into(),
-            port: 443,
-            ..Default::default()
-        };
-        let mut custom = request();
-        custom.action = "SENTINEL-UNTRUSTED-METHOD".into();
-
-        tracing::subscriber::with_default(subscriber, || {
-            let correlation = RequestCorrelation::with_request_id(
-                &custom,
-                &ctx,
-                "00000000-0000-4000-8000-000000000002".into(),
-            );
-            correlation.record_final_http_outcome("denied");
-        });
-
-        let span = exporter
-            .get_finished_spans()
-            .unwrap()
-            .into_iter()
-            .find(|span| span.name == "openshell.http.request")
-            .unwrap();
-        let method = span
-            .attributes
-            .iter()
-            .find(|attribute| attribute.key.as_str() == "http.request.method")
-            .expect("method attribute");
-        assert_eq!(method.value.to_string(), "OTHER");
-    }
-
-    #[test]
-    fn unfinished_request_is_recorded_as_incomplete() {
-        use tracing_subscriber::layer::SubscriberExt as _;
-
-        let exporter = opentelemetry_sdk::trace::InMemorySpanExporterBuilder::new().build();
-        let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
-            .with_simple_exporter(exporter.clone())
-            .build();
-        let subscriber = tracing_subscriber::registry()
-            .with(openshell_otel::layer(&provider, "correlation-test"));
-        let ctx = L7EvalContext {
-            host: "example.test".into(),
-            port: 443,
-            ..Default::default()
-        };
-
-        tracing::subscriber::with_default(subscriber, || {
-            let _correlation = RequestCorrelation::with_request_id(
-                &request(),
-                &ctx,
-                "00000000-0000-4000-8000-000000000002".into(),
-            );
-        });
-
-        let span = exporter
-            .get_finished_spans()
-            .unwrap()
-            .into_iter()
-            .find(|span| span.name == "openshell.http.request")
-            .unwrap();
-        let attributes = span
-            .attributes
-            .into_iter()
-            .map(|kv| (kv.key.as_str().to_string(), kv.value.to_string()))
-            .collect::<BTreeMap<_, _>>();
-        assert_eq!(attributes["openshell.http.outcome"], "incomplete");
-        assert!(!attributes.contains_key("openshell.error.stage"));
-    }
-
-    #[test]
-    fn malformed_or_incomplete_header_block_has_no_trace_context() {
-        assert!(trace_headers(b"GET / HTTP/1.1\r\ntraceparent: value").is_empty());
-        assert!(trace_headers(&[0xff, b'\r', b'\n', b'\r', b'\n']).is_empty());
-    }
-
-    #[tokio::test]
-    async fn primary_record_waits_for_the_final_response_head_and_is_emitted_once() {
-        use tokio::io::AsyncWriteExt as _;
-        let capture = openshell_ocsf::test_support::OcsfCapture::default();
-        let _subscriber = capture.install();
-        let ctx = L7EvalContext::default();
-        let correlation = RequestCorrelation::new(&request(), &ctx);
-        let id = correlation.request_id().to_string();
-        correlation.emit(
-            HttpActivityBuilder::new(openshell_ocsf::ctx::ctx())
-                .http_request(HttpRequest::new("GET", ctx.ocsf_url("/data")))
-                .action(ActionId::Allowed)
-                .build(),
-        );
-        let mut output = Vec::new();
-        {
-            let mut client = correlation.observe_response(&mut output);
-            client
-                .write_all(b"HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 4\r\n")
-                .await
-                .unwrap();
-            assert!(capture.events().is_empty());
-            client.write_all(b"\r\nbody").await.unwrap();
-            let events = capture.json_events();
-            assert_eq!(events.len(), 1);
-            assert_eq!(events[0]["http_response"]["code"], 200);
-            assert_eq!(events[0]["metadata"]["correlation_uid"], id);
-        }
-        drop(correlation);
-        assert_eq!(capture.events().len(), 1);
-        assert!(output.ends_with(b"\r\n\r\nbody"));
-    }
-
-    #[test]
-    fn request_ending_before_response_headers_still_has_one_primary_record() {
-        let capture = openshell_ocsf::test_support::OcsfCapture::default();
-        let _subscriber = capture.install();
-        let correlation = RequestCorrelation::new(&request(), &L7EvalContext::default());
-        let id = correlation.request_id().to_string();
-        let mut head = ResponseHead::default();
-        head.accept(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n", &correlation);
-        assert!(capture.events().is_empty());
-        drop(correlation);
-        let events = capture.json_events();
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0]["metadata"]["correlation_uid"], id);
-        assert_eq!(events[0]["status_detail"], "request_incomplete");
-        assert!(events[0].get("http_response").is_none());
-    }
-}
+mod tests;
