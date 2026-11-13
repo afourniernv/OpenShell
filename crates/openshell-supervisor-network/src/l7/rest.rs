@@ -9089,7 +9089,13 @@ mod tests {
                 failure_category: Some("timeout".into()),
             }],
         );
-        let json = events[0].to_json().unwrap().to_string();
+        let event = events[0].to_json().unwrap();
+        assert_eq!(
+            event["unmapped"]["http_event_kind"],
+            "middleware_invocation"
+        );
+        assert_eq!(event["unmapped"]["middleware_phase"], "response");
+        let json = event.to_string();
         for forbidden in [
             "secret-response-body",
             "authorization",

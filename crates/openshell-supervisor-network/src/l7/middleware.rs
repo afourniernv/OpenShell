@@ -2261,6 +2261,8 @@ pub(super) fn middleware_events(
             .http_request(HttpRequest::new(&req.action, ctx.ocsf_url(&req.target)))
             .dst_endpoint(Endpoint::from_domain(&ctx.host, ctx.port))
             .firewall_rule(&ctx.policy_name, "middleware")
+            .unmapped("http_event_kind", "middleware_invocation")
+            .unmapped("middleware_phase", "request")
             .unmapped("transformed", invocation.transformed)
             .unmapped("failed", invocation.failed)
             .message(format!(
@@ -2446,6 +2448,34 @@ mod trace_tests {
             assert_eq!(finding["class_uid"], 2004);
             assert_eq!(finding["action_id"], 2, "{reason}");
         }
+    }
+
+    #[test]
+    fn request_invocation_records_are_explicitly_tagged() {
+        let events = middleware_events(
+            &L7EvalContext::default(),
+            &request(),
+            &outcome(
+                true,
+                "",
+                vec![MiddlewareInvocation {
+                    name: "redact".into(),
+                    implementation: "test/redact".into(),
+                    decision: openshell_core::proto::Decision::Allow,
+                    transformed: true,
+                    failed: false,
+                }],
+                vec![],
+            ),
+        );
+        assert_eq!(events.len(), 1);
+        let event = events[0].to_json().unwrap();
+        assert_eq!(
+            event["unmapped"]["http_event_kind"],
+            "middleware_invocation"
+        );
+        assert_eq!(event["unmapped"]["middleware_phase"], "request");
+        assert_eq!(event["unmapped"]["transformed"], true);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

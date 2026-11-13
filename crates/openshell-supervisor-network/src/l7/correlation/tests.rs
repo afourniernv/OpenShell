@@ -63,6 +63,226 @@ fn http_events(capture: &openshell_ocsf::test_support::OcsfCapture) -> Vec<serde
         .collect()
 }
 
+#[derive(Clone, Copy)]
+enum InvocationOutcome {
+    Pass,
+    Transform,
+    FailOpen,
+    Deny,
+}
+
+fn invocation(name: &str, phase: &str, outcome: InvocationOutcome) -> OcsfEvent {
+    let (action, disposition, status) = match outcome {
+        InvocationOutcome::Pass | InvocationOutcome::Transform => {
+            (ActionId::Allowed, DispositionId::Allowed, StatusId::Success)
+        }
+        InvocationOutcome::FailOpen => (ActionId::Other, DispositionId::Error, StatusId::Failure),
+        InvocationOutcome::Deny => (ActionId::Denied, DispositionId::Blocked, StatusId::Failure),
+    };
+    HttpActivityBuilder::new(openshell_ocsf::ctx::ctx())
+        .http_request(HttpRequest::new("POST", context().ocsf_url("/observed")))
+        .http_response(HttpResponse { code: 200 })
+        .firewall_rule("middleware-policy", "supervisor-middleware")
+        .action(action)
+        .disposition(disposition)
+        .status(status)
+        .severity(SeverityId::Medium)
+        .status_detail(name)
+        .message(format!("middleware invocation {name}"))
+        .unmapped("http_event_kind", "middleware_invocation")
+        .unmapped("middleware_phase", phase)
+        .unmapped("middleware_config", name)
+        .unmapped(
+            "transformed",
+            matches!(outcome, InvocationOutcome::Transform),
+        )
+        .unmapped("failed", matches!(outcome, InvocationOutcome::FailOpen))
+        .build()
+}
+
+#[test]
+fn middleware_invocations_are_retained_without_seeding_or_poisoning_the_request() {
+    use opentelemetry_sdk::trace::Sampler;
+
+    for sampler in [Some(Sampler::AlwaysOn), Some(Sampler::AlwaysOff), None] {
+        let sampled = matches!(sampler, Some(Sampler::AlwaysOn));
+        for phase in ["request", "response"] {
+            let capture = RequestTracing::new(sampler.clone());
+            let mut expected = Vec::new();
+            tracing::subscriber::with_default(capture.subscriber(), || {
+                let correlation = RequestCorrelation::new(&request(), &context());
+                for (name, outcome) in [
+                    ("pass", InvocationOutcome::Pass),
+                    ("redact", InvocationOutcome::Transform),
+                    ("optional", InvocationOutcome::FailOpen),
+                ] {
+                    let event = invocation(name, phase, outcome);
+                    expected.push(event.to_json().unwrap());
+                    correlation.emit(event);
+                }
+                correlation.emit(allowed());
+                correlation.response_selected(200);
+            });
+            let events = http_events(&capture.events);
+            assert_eq!(events.len(), 4);
+            for (event, expected) in events[..3].iter().zip(&expected) {
+                for field in [
+                    "action",
+                    "disposition",
+                    "status",
+                    "message",
+                    "status_detail",
+                    "http_request",
+                    "http_response",
+                    "firewall_rule",
+                    "unmapped",
+                ] {
+                    assert_eq!(event[field], expected[field], "{field}");
+                }
+                assert_eq!(event["trace"]["uid"].is_string(), sampled);
+            }
+            let primary = &events[3];
+            assert_eq!(primary["unmapped"]["http_event_kind"], "request");
+            assert_eq!(primary["action"], "Allowed");
+            assert_eq!(primary["status"], "Success");
+            assert_eq!(primary["http_request"]["url"]["path"], "/data");
+            assert_eq!(primary["actor"]["process"]["pid"], 42);
+            assert_eq!(primary["firewall_rule"]["type"], "l7");
+            assert!(events.iter().all(|event| {
+                event["metadata"]["correlation_uid"] == primary["metadata"]["correlation_uid"]
+            }));
+            assert!(
+                !capture
+                    .created_span_names()
+                    .contains(&"supervisor.egress.deny")
+            );
+            let spans = capture.spans();
+            assert_eq!(spans.len(), usize::from(sampled));
+            if sampled {
+                let fields: std::collections::BTreeMap<_, _> = spans[0]
+                    .attributes
+                    .iter()
+                    .map(|attribute| (attribute.key.as_str(), attribute.value.to_string()))
+                    .collect();
+                assert_eq!(fields["openshell.request.outcome"], "allowed");
+                assert_eq!(fields["http.response.status_code"], "200");
+            }
+            capture.shutdown();
+        }
+    }
+}
+
+#[test]
+fn denied_middleware_invocation_only_overlays_the_preheader_denial_summary() {
+    for seeded in [false, true] {
+        let capture = openshell_ocsf::test_support::OcsfCapture::default();
+        let _subscriber = capture.install();
+        let correlation = RequestCorrelation::new(&request(), &context());
+        if seeded {
+            correlation.emit(allowed());
+        }
+        correlation.record_upstream_status(200);
+        correlation.emit(invocation("guard", "response", InvocationOutcome::Deny));
+        correlation.response_selected(403);
+        drop(correlation);
+        let events = http_events(&capture);
+        assert_eq!(events.len(), 2);
+        let observation = &events[0];
+        let primary = &events[1];
+        assert_eq!(
+            observation["unmapped"]["http_event_kind"],
+            "middleware_invocation"
+        );
+        assert_eq!(observation["http_response"]["code"], 200);
+        assert_eq!(observation["http_request"]["url"]["path"], "/observed");
+        assert_eq!(primary["unmapped"]["http_event_kind"], "request");
+        assert_eq!(primary["http_response"]["code"], 403);
+        assert_eq!(primary["unmapped"]["upstream_response_code"], 200);
+        assert_eq!(primary["http_request"]["url"]["path"], "/data");
+        assert_eq!(primary["action"], "Denied");
+        assert_eq!(primary["status"], "Failure");
+        assert_eq!(primary["message"], "middleware invocation guard");
+        assert_eq!(primary["status_detail"], "guard");
+        if seeded {
+            assert_eq!(primary["firewall_rule"]["type"], "l7");
+            assert_eq!(primary["actor"]["process"]["pid"], 42);
+        } else {
+            assert!(primary.get("firewall_rule").is_none());
+            assert!(primary.get("actor").is_none());
+        }
+    }
+}
+
+#[test]
+fn late_middleware_invocations_do_not_consume_the_late_failure_budget() {
+    use opentelemetry_sdk::trace::Sampler;
+
+    for sampler in [Some(Sampler::AlwaysOn), Some(Sampler::AlwaysOff), None] {
+        let sampled = matches!(sampler, Some(Sampler::AlwaysOn));
+        for late_failure in [false, true] {
+            let capture = RequestTracing::new(sampler.clone());
+            tracing::subscriber::with_default(capture.subscriber(), || {
+                let correlation = RequestCorrelation::new(&request(), &context());
+                correlation.emit(allowed());
+                correlation.response_selected(200);
+                for (name, outcome) in [
+                    ("optional", InvocationOutcome::FailOpen),
+                    ("guard", InvocationOutcome::Deny),
+                    ("pass", InvocationOutcome::Pass),
+                ] {
+                    correlation.emit(invocation(name, "response", outcome));
+                }
+                if late_failure {
+                    correlation.emit(denied());
+                    correlation.emit(denied());
+                }
+            });
+            let events = http_events(&capture.events);
+            assert_eq!(events.len(), 4 + usize::from(late_failure));
+            assert_eq!(events[0]["unmapped"]["http_event_kind"], "request");
+            assert_eq!(events[0]["action"], "Allowed");
+            for event in &events[1..4] {
+                assert_eq!(
+                    event["unmapped"]["http_event_kind"],
+                    "middleware_invocation"
+                );
+                assert_eq!(event["http_response"]["code"], 200);
+            }
+            if late_failure {
+                assert!(events[4]["unmapped"].get("http_event_kind").is_none());
+                assert_eq!(events[4]["status_detail"], "credential_endpoint_mismatch");
+                assert_eq!(events[4]["http_response"]["code"], 200);
+            }
+            assert!(
+                events
+                    .iter()
+                    .all(|event| event["metadata"]["correlation_uid"]
+                        == events[0]["metadata"]["correlation_uid"])
+            );
+            assert!(
+                !capture
+                    .created_span_names()
+                    .contains(&"supervisor.egress.deny")
+            );
+            let spans = capture.spans();
+            assert_eq!(spans.len(), usize::from(sampled));
+            if sampled {
+                let fields: std::collections::BTreeMap<_, _> = spans[0]
+                    .attributes
+                    .iter()
+                    .map(|attribute| (attribute.key.as_str(), attribute.value.to_string()))
+                    .collect();
+                assert_eq!(
+                    fields["openshell.request.outcome"],
+                    if late_failure { "denied" } else { "allowed" }
+                );
+                assert_eq!(fields["http.response.status_code"], "200");
+            }
+            capture.shutdown();
+        }
+    }
+}
+
 #[test]
 fn audit_receipt_and_denial_are_independent_of_sampling_or_exporter() {
     use opentelemetry_sdk::trace::Sampler;

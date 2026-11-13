@@ -1435,6 +1435,8 @@ pub(super) fn http_response_middleware_invocation_events(
                 u16::try_from(target.port).unwrap_or_default(),
             ))
             .firewall_rule(policy_name, "supervisor-middleware")
+            .unmapped("http_event_kind", "middleware_invocation")
+            .unmapped("middleware_phase", "response")
             .unmapped("middleware_config", invocation.config_name.as_str())
             .unmapped(
                 "middleware_implementation",
@@ -2801,16 +2803,31 @@ mod tests {
             .into_iter()
             .filter(|event| event["class_uid"] == 4002)
             .collect();
-        assert_eq!(events.len(), 2);
-        assert_eq!(events[1]["action"], "Denied");
-        assert_eq!(events[1]["http_response"]["code"], 200);
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[0]["unmapped"]["http_event_kind"], "request");
+        assert_eq!(events[0]["action"], "Allowed");
+        assert_eq!(events[1]["action"], "Other");
         assert_eq!(
             events[1]["unmapped"]["response_middleware_outcome"],
+            "failopen"
+        );
+        assert_eq!(events[2]["action"], "Denied");
+        for event in &events[1..] {
+            assert_eq!(
+                event["unmapped"]["http_event_kind"],
+                "middleware_invocation"
+            );
+            assert_eq!(event["unmapped"]["middleware_phase"], "response");
+            assert_eq!(event["http_response"]["code"], 200);
+        }
+        assert_eq!(
+            events[2]["unmapped"]["response_middleware_outcome"],
             "blockdelivery"
         );
-        assert_eq!(
-            events[1]["metadata"]["correlation_uid"],
-            "late-response-receipt"
+        assert!(
+            events
+                .iter()
+                .all(|event| event["metadata"]["correlation_uid"] == "late-response-receipt")
         );
     }
 
@@ -3312,9 +3329,32 @@ mod tests {
     }
 
     fn assert_response_middleware_block_record(records: &[serde_json::Value], traced: bool) {
-        let primary: Vec<_> = records
+        let http: Vec<_> = records
             .iter()
             .filter(|event| event["class_uid"] == 4002)
+            .collect();
+        assert_eq!(http.len(), 2);
+        let companions: Vec<_> = http
+            .iter()
+            .filter(|event| event["unmapped"]["http_event_kind"] == "middleware_invocation")
+            .collect();
+        assert_eq!(companions.len(), 1);
+        assert_eq!(companions[0]["http_response"]["code"], 200);
+        assert_eq!(companions[0]["unmapped"]["middleware_phase"], "response");
+        assert_eq!(
+            companions[0]["unmapped"]["response_middleware_outcome"],
+            "blockdelivery"
+        );
+        assert_eq!(companions[0]["action"], "Denied");
+        assert_eq!(
+            companions[0]["metadata"]["correlation_uid"],
+            "response-denied"
+        );
+        let primary: Vec<_> = records
+            .iter()
+            .filter(|event| {
+                event["class_uid"] == 4002 && event["unmapped"]["http_event_kind"] == "request"
+            })
             .collect();
         assert_eq!(primary.len(), 1, "{records:?}");
         assert_eq!(primary[0]["action"], "Denied");
