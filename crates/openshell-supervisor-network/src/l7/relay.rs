@@ -165,6 +165,70 @@ fn credential_generation_guard(
     )
 }
 
+pub(crate) async fn inspect_jsonrpc_request_correlated<C>(
+    config: &L7EndpointConfig,
+    client: &mut C,
+    request: &mut crate::l7::provider::L7Request,
+    correlation: Option<&RequestCorrelation>,
+) -> Result<crate::l7::jsonrpc::JsonRpcRequestInfo>
+where
+    C: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    let span = correlation.map_or_else(tracing::Span::none, |correlation| {
+        correlation.stage(RequestStage::McpInspect)
+    });
+    let result = crate::l7::jsonrpc::inspect_jsonrpc_http_request(
+        client,
+        request,
+        config.json_rpc_max_body_bytes,
+        crate::l7::jsonrpc::JsonRpcInspectionOptions::for_config(config),
+    )
+    .instrument(span.clone())
+    .await;
+    record_jsonrpc_inspection(correlation, &span, config.protocol, &result);
+    result
+}
+
+fn inspect_buffered_jsonrpc_request_correlated(
+    request: &crate::l7::provider::L7Request,
+    options: crate::l7::jsonrpc::JsonRpcInspectionOptions,
+    correlation: Option<&RequestCorrelation>,
+    protocol: L7Protocol,
+) -> Result<crate::l7::jsonrpc::JsonRpcRequestInfo> {
+    let span = correlation.map_or_else(tracing::Span::none, |correlation| {
+        correlation.stage(RequestStage::McpInspect)
+    });
+    let result = span
+        .in_scope(|| crate::l7::jsonrpc::inspect_buffered_jsonrpc_http_request(request, options))
+        .map(|mut info| {
+            if info.receive_stream {
+                info.mcp_revision = options.mcp_revision;
+            }
+            info
+        });
+    record_jsonrpc_inspection(correlation, &span, protocol, &result);
+    result
+}
+
+fn record_jsonrpc_inspection(
+    correlation: Option<&RequestCorrelation>,
+    span: &tracing::Span,
+    protocol: L7Protocol,
+    result: &Result<crate::l7::jsonrpc::JsonRpcRequestInfo>,
+) {
+    if let Ok(info) = result {
+        if let Some(correlation) = correlation {
+            correlation.record_jsonrpc_summary(span, protocol, info);
+        }
+    } else {
+        span.record(
+            "openshell.jsonrpc.effective.inspection_outcome",
+            "http_body_error",
+        );
+        span.record("otel.status_code", "ERROR");
+    }
+}
+
 /// Resolve a grant from the provider installation and policy owners admitted
 /// for this request. Provider refresh is independent of tunnel lifetime: each
 /// request reads the live installation.
@@ -223,9 +287,12 @@ pub(crate) async fn prepare_inspected_request(
                 {
                     options = options.with_mcp_revision(revision);
                 }
-                current_info.jsonrpc = Some(
-                    crate::l7::jsonrpc::inspect_buffered_jsonrpc_http_request(&req, options)?,
-                );
+                current_info.jsonrpc = Some(inspect_buffered_jsonrpc_request_correlated(
+                    &req,
+                    options,
+                    correlation,
+                    config.protocol,
+                )?);
             }
             L7Protocol::Rest | L7Protocol::Websocket | L7Protocol::Sql => {}
         }
@@ -359,12 +426,14 @@ where
         Ok(crate::l7::mcp::McpRequestProtocolVersion::Initialization) => Ok(Some(info)),
         Ok(crate::l7::mcp::McpRequestProtocolVersion::Selected(version)) => {
             debug!(mcp_protocol_version = %version, "Selected MCP request protocol version");
-            info = crate::l7::jsonrpc::inspect_buffered_jsonrpc_http_request(
+            info = inspect_buffered_jsonrpc_request_correlated(
                 request,
                 crate::l7::jsonrpc::JsonRpcInspectionOptions::mcp_selected(
                     version,
                     config.mcp_strict_tool_names,
                 ),
+                correlation,
+                config.protocol,
             )?;
             // A bodyless receive stream has nothing for the JSON-RPC parser to
             // classify, but later middleware re-evaluation must still retain
@@ -590,9 +659,11 @@ where
     if config.protocol != L7Protocol::Mcp {
         return Ok(true);
     }
-    let info = crate::l7::jsonrpc::inspect_buffered_jsonrpc_http_request(
+    let info = inspect_buffered_jsonrpc_request_correlated(
         request,
         crate::l7::jsonrpc::JsonRpcInspectionOptions::for_config(config),
+        correlation,
+        config.protocol,
     )?;
     Ok(enforce_mcp_protocol_version_correlated(
         config,
@@ -1749,46 +1820,33 @@ where
             None
         };
         let mut jsonrpc_info = if config.protocol.is_jsonrpc_family() {
-            if crate::l7::jsonrpc::jsonrpc_receive_stream_request(&req) {
-                Some(crate::l7::jsonrpc::JsonRpcRequestInfo::receive_stream())
-            } else {
-                match crate::l7::http::read_body_for_inspection(
-                    client,
-                    &mut req,
-                    config.json_rpc_max_body_bytes,
-                )
+            match inspect_jsonrpc_request_correlated(config, client, &mut req, Some(&correlation))
                 .await
-                {
-                    Ok(body) => Some(crate::l7::jsonrpc::parse_jsonrpc_body_with_options(
-                        &body,
-                        crate::l7::jsonrpc::JsonRpcInspectionOptions::for_config(config),
-                    )),
-                    Err(e) => {
-                        if is_benign_connection_error(&e) {
-                            debug!(
-                                host = %ctx.host,
-                                port = ctx.port,
-                                error = %e,
-                                "JSON-RPC L7 connection closed"
-                            );
-                        } else {
-                            let detail = parse_rejection_detail(
-                                &e.to_string(),
-                                ParseRejectionMode::L7Endpoint,
-                            );
-                            {
-                                correlation.record_enforcement_block();
-                                correlation.record_outcome(HttpOutcome::Denied);
-                            }
-                            emit_parse_rejection_correlated(
-                                ctx,
-                                &detail,
-                                "l7-jsonrpc",
-                                Some(&correlation),
-                            );
+            {
+                Ok(info) => Some(info),
+                Err(e) => {
+                    if is_benign_connection_error(&e) {
+                        debug!(
+                            host = %ctx.host,
+                            port = ctx.port,
+                            error = %e,
+                            "JSON-RPC L7 connection closed"
+                        );
+                    } else {
+                        let detail =
+                            parse_rejection_detail(&e.to_string(), ParseRejectionMode::L7Endpoint);
+                        {
+                            correlation.record_enforcement_block();
+                            correlation.record_outcome(HttpOutcome::Denied);
                         }
-                        return Ok(());
+                        emit_parse_rejection_correlated(
+                            ctx,
+                            &detail,
+                            "l7-jsonrpc",
+                            Some(&correlation),
+                        );
                     }
+                    return Ok(());
                 }
             }
         } else {
@@ -3122,17 +3180,12 @@ where
             .endpoint_observation_tx
             .as_ref()
             .and_then(EndpointObservationSender::capture);
-        let parsed = match crate::l7::jsonrpc::parse_jsonrpc_http_request(
-            client,
-            config.json_rpc_max_body_bytes,
-            crate::l7::path::CanonicalizeOptions {
+        let provider =
+            crate::l7::rest::RestProvider::with_options(crate::l7::path::CanonicalizeOptions {
                 allow_encoded_slash: config.allow_encoded_slash,
                 ..Default::default()
-            },
-            crate::l7::jsonrpc::JsonRpcInspectionOptions::for_config(config),
-        )
-        .await
-        {
+            });
+        let mut req = match provider.parse_request(client).await {
             Ok(Some(parsed)) => parsed,
             Ok(None) => return Ok(()),
             Err(e) => {
@@ -3152,14 +3205,39 @@ where
             }
         };
 
-        let req = parsed.request;
-        let jsonrpc_info = parsed.info;
         let correlation = RequestCorrelation::new(&req, ctx);
         let mut audited_client = correlation.observe_response(client);
         let client = &mut audited_client;
         correlation
             .record_policy_runtime_generation(engine.generation_guard().captured_generation());
         correlation.record_selected_policy_endpoint(&config.policy_hash, &config.endpoint_id);
+        let jsonrpc_info = match inspect_jsonrpc_request_correlated(
+            config,
+            client,
+            &mut req,
+            Some(&correlation),
+        )
+        .await
+        {
+            Ok(info) => info,
+            Err(error) => {
+                if is_benign_connection_error(&error) {
+                    debug!(host = %ctx.host, port = ctx.port, error = %error, "JSON-RPC L7 connection closed");
+                } else {
+                    let detail =
+                        parse_rejection_detail(&error.to_string(), ParseRejectionMode::L7Endpoint);
+                    correlation.record_enforcement_block();
+                    correlation.record_outcome(HttpOutcome::Denied);
+                    emit_parse_rejection_correlated(
+                        ctx,
+                        &detail,
+                        jsonrpc_engine_type(config.protocol),
+                        Some(&correlation),
+                    );
+                }
+                return Ok(());
+            }
+        };
         let observer = EndpointObserver::begin_captured(
             ctx.endpoint_observation_tx.as_ref(),
             config,
@@ -4052,8 +4130,15 @@ fn reevaluate_transformed_body(
                 // profile and body/header mirrors after any header mutations.
                 inspection_options = inspection_options.with_mcp_revision(revision);
             }
-            let info =
-                crate::l7::jsonrpc::parse_jsonrpc_body_with_options(body, inspection_options);
+            let span = correlation.map_or_else(tracing::Span::none, |correlation| {
+                correlation.stage(RequestStage::McpInspect)
+            });
+            let info = span.in_scope(|| {
+                crate::l7::jsonrpc::parse_jsonrpc_body_with_options(body, inspection_options)
+            });
+            if let Some(correlation) = correlation {
+                correlation.record_jsonrpc_summary(&span, config.protocol, &info);
+            }
             let mut transformed_info = request_info.clone();
             transformed_info.jsonrpc = Some(info);
             (jsonrpc_engine_type(config.protocol), transformed_info)
@@ -13485,6 +13570,213 @@ network_policies:
         serde_json::json!({"jsonrpc":"2.0", "id":1, "method":method, "params":params}).to_string()
     }
 
+    #[tokio::test]
+    async fn mcp_inspection_spans_follow_real_passes_and_hide_payloads() {
+        use crate::test_support::request_tracing::RequestTracing;
+        use opentelemetry_sdk::trace::Sampler;
+        use tracing::instrument::WithSubscriber as _;
+
+        for route_selected in [false, true] {
+            let capture = RequestTracing::new(Some(Sampler::AlwaysOn));
+            let body = sessionless_mcp_body(
+                "tools/call",
+                serde_json::json!({"name": "SENTINEL_PRIVATE_TOOL", "arguments": {"secret": "SENTINEL_PRIVATE_TOOL"}}),
+            );
+            let (response, forwarded) = run_sessionless_mcp_relay(
+                route_selected,
+                "MCP-Protocol-Version: 2026-07-28\r\nMcp-Method: tools/call\r\nMcp-Name: SENTINEL_PRIVATE_TOOL\r\n",
+                &body,
+                "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            ).with_subscriber(capture.subscriber()).await;
+            assert!(response.starts_with("HTTP/1.1 204"), "{response}");
+            assert!(!forwarded.is_empty());
+            let spans = capture.spans();
+            let root = spans
+                .iter()
+                .find(|span| span.name == "openshell.http.request")
+                .unwrap();
+            let inspection: Vec<_> = spans
+                .iter()
+                .filter(|span| span.name == "openshell.mcp.inspect")
+                .collect();
+            // Initial inspection and the transport-selected schema are distinct operations.
+            assert!(inspection.len() >= 2, "{spans:?}");
+            assert!(
+                inspection
+                    .iter()
+                    .all(|span| span.parent_span_id == root.span_context.span_id()
+                        && span.end_time <= root.end_time)
+            );
+            assert!(
+                inspection
+                    .iter()
+                    .any(|span| span.attributes.iter().any(|field| field.key.as_str()
+                        == "openshell.mcp.selected_protocol_revision"
+                        && field.value.as_str() == "2026-07-28"))
+            );
+            assert!(
+                inspection
+                    .iter()
+                    .all(|span| span.dropped_attributes_count == 0
+                        && span.status == opentelemetry::trace::Status::Unset)
+            );
+            assert!(!format!("{spans:?}").contains("SENTINEL_PRIVATE_TOOL"));
+            capture.shutdown();
+        }
+    }
+
+    #[tokio::test]
+    async fn mcp_body_errors_keep_request_identity_and_resources() {
+        use crate::test_support::request_tracing::RequestTracing;
+        use opentelemetry_sdk::trace::Sampler;
+
+        for route_selected in [false, true] {
+            let capture = RequestTracing::new(Some(Sampler::AlwaysOn));
+            let (mut config, engine, ctx) = mcp_sessionless_test_relay_context();
+            config.json_rpc_max_body_bytes = 8;
+            config.policy_hash = "a".repeat(64);
+            config.endpoint_id = format!("endpoint:v1:{}", "b".repeat(64));
+            let body = sessionless_mcp_body("tools/list", serde_json::json!({}));
+            let (_, forwarded) = run_mcp_relay_case(
+                (config, engine, ctx),
+                route_selected,
+                "MCP-Protocol-Version: 2026-07-28\r\n",
+                &body,
+                "",
+            )
+            .with_subscriber(capture.subscriber())
+            .await;
+            assert!(forwarded.is_empty());
+            let events = capture.events.json_events();
+            let primary = events
+                .iter()
+                .find(|event| event["class_uid"] == 4002)
+                .unwrap();
+            assert_eq!(primary["action"], "Denied");
+            let request_id = &primary["metadata"]["correlation_uid"];
+            assert!(request_id.is_string());
+            assert!(primary["unmapped"]["policy_hash"].is_string());
+            assert!(
+                events
+                    .iter()
+                    .all(|event| event["metadata"]["correlation_uid"] == *request_id),
+                "{events:?}"
+            );
+            let spans = capture.spans();
+            assert!(spans.iter().any(|span| span.name == "openshell.mcp.inspect"
+                && span.attributes.iter().any(|field| field.key.as_str()
+                    == "openshell.jsonrpc.effective.inspection_outcome"
+                    && field.value.as_str() == "http_body_error")));
+            assert!(
+                !capture
+                    .created_span_names()
+                    .contains(&"supervisor.egress.deny")
+            );
+            capture.shutdown();
+        }
+    }
+
+    #[tokio::test]
+    async fn mcp_receive_stream_inspection_retains_selected_revision() {
+        use crate::test_support::request_tracing::RequestTracing;
+        use opentelemetry_sdk::trace::Sampler;
+
+        let capture = RequestTracing::new(Some(Sampler::AlwaysOn));
+        async {
+            let (mut config, _, ctx) = mcp_sessionless_test_relay_context();
+            config.mcp_versions = vec!["2025-11-25".parse().unwrap()];
+            let request = crate::l7::provider::L7Request {
+                action: "GET".into(), target: "/mcp".into(), query_params: std::collections::HashMap::new(),
+                raw_header: b"GET /mcp HTTP/1.1\r\nHost: mcp.example.test:8000\r\nAccept: text/event-stream\r\nMCP-Protocol-Version: 2025-11-25\r\n\r\n".to_vec(),
+                body_length: crate::l7::provider::BodyLength::None,
+            };
+            let correlation = RequestCorrelation::new(&request, &ctx);
+            let mut client = Vec::new();
+            let inspected = enforce_mcp_protocol_version_correlated(&config, &request,
+                crate::l7::jsonrpc::JsonRpcRequestInfo::receive_stream(), &mut client, &ctx, "/mcp", None, Some(&correlation)).await.unwrap().unwrap();
+            assert_eq!(inspected.mcp_revision.unwrap().as_str(), "2025-11-25");
+        }.with_subscriber(capture.subscriber()).await;
+        let spans = capture.spans();
+        let inspection = spans
+            .iter()
+            .find(|span| span.name == "openshell.mcp.inspect")
+            .unwrap();
+        assert!(inspection.attributes.iter().any(|field| field.key.as_str()
+            == "openshell.mcp.selected_protocol_revision"
+            && field.value.as_str() == "2025-11-25"));
+        capture.shutdown();
+    }
+
+    #[tokio::test]
+    async fn mcp_body_disconnect_is_not_an_enforcement_denial() {
+        use crate::test_support::request_tracing::RequestTracing;
+        use opentelemetry_sdk::trace::Sampler;
+        use std::pin::Pin;
+        use std::task::{Context, Poll};
+
+        struct ResetAfterHeaders(&'static [u8]);
+        impl AsyncRead for ResetAfterHeaders {
+            fn poll_read(
+                mut self: Pin<&mut Self>,
+                cx: &mut Context<'_>,
+                buf: &mut tokio::io::ReadBuf<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                if self.0.is_empty() {
+                    Poll::Ready(Err(std::io::Error::from(
+                        std::io::ErrorKind::ConnectionReset,
+                    )))
+                } else {
+                    Pin::new(&mut self.0).poll_read(cx, buf)
+                }
+            }
+        }
+        impl AsyncWrite for ResetAfterHeaders {
+            fn poll_write(
+                self: Pin<&mut Self>,
+                _: &mut Context<'_>,
+                bytes: &[u8],
+            ) -> Poll<std::io::Result<usize>> {
+                Poll::Ready(Ok(bytes.len()))
+            }
+            fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+            fn poll_shutdown(
+                self: Pin<&mut Self>,
+                _: &mut Context<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+        }
+
+        let capture = RequestTracing::new(Some(Sampler::AlwaysOn));
+        let (config, engine, ctx) = mcp_sessionless_test_relay_context();
+        let mut client = ResetAfterHeaders(
+            b"POST /mcp HTTP/1.1\r\nHost: mcp.example.test:8000\r\nContent-Length: 100\r\n\r\n",
+        );
+        let (mut upstream, mut peer) = tokio::io::duplex(1024);
+        async {
+            relay_jsonrpc(&config, &engine, &mut client, &mut upstream, &ctx)
+                .await
+                .unwrap();
+        }
+        .with_subscriber(capture.subscriber())
+        .await;
+        drop(upstream);
+        let mut forwarded = Vec::new();
+        peer.read_to_end(&mut forwarded).await.unwrap();
+        assert!(forwarded.is_empty());
+        let events = capture.events.json_events();
+        let primary = events
+            .iter()
+            .find(|event| event["class_uid"] == 4002)
+            .unwrap();
+        assert_ne!(primary["action"], "Denied", "{events:?}");
+        assert_eq!(primary["status_detail"], "request_incomplete");
+        assert!(primary["metadata"]["correlation_uid"].is_string());
+        capture.shutdown();
+    }
+
     async fn run_sessionless_mcp_relay(
         route_selected: bool,
         headers: &str,
@@ -13701,27 +13993,30 @@ network_policies:
     ) -> (String, Vec<u8>) {
         let (mut app, mut relay_client) = tokio::io::duplex(8192);
         let (mut relay_upstream, mut upstream) = tokio::io::duplex(8192);
-        let relay = tokio::spawn(async move {
-            if route_selected {
-                relay_with_route_selection(
-                    &[config],
-                    tunnel_engine,
-                    &mut relay_client,
-                    &mut relay_upstream,
-                    &ctx,
-                )
-                .await
-            } else {
-                relay_with_inspection(
-                    &config,
-                    tunnel_engine,
-                    &mut relay_client,
-                    &mut relay_upstream,
-                    &ctx,
-                )
-                .await
+        let relay = tokio::spawn(
+            async move {
+                if route_selected {
+                    relay_with_route_selection(
+                        &[config],
+                        tunnel_engine,
+                        &mut relay_client,
+                        &mut relay_upstream,
+                        &ctx,
+                    )
+                    .await
+                } else {
+                    relay_with_inspection(
+                        &config,
+                        tunnel_engine,
+                        &mut relay_client,
+                        &mut relay_upstream,
+                        &ctx,
+                    )
+                    .await
+                }
             }
-        });
+            .with_current_subscriber(),
+        );
         let upstream_response = upstream_response.to_string();
         let server = tokio::spawn(async move {
             let mut forwarded = Vec::new();
