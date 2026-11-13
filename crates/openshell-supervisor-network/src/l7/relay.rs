@@ -172,7 +172,7 @@ pub(crate) async fn inspect_jsonrpc_request_correlated<C>(
     correlation: Option<&RequestCorrelation>,
 ) -> Result<crate::l7::jsonrpc::JsonRpcRequestInfo>
 where
-    C: AsyncRead + AsyncWrite + Unpin + Send,
+    C: AsyncRead + Unpin,
 {
     let span = correlation.map_or_else(tracing::Span::none, |correlation| {
         correlation.stage(RequestStage::McpInspect)
@@ -13568,6 +13568,34 @@ network_policies:
             "io.modelcontextprotocol/clientCapabilities": {}
         });
         serde_json::json!({"jsonrpc":"2.0", "id":1, "method":method, "params":params}).to_string()
+    }
+
+    #[tokio::test]
+    async fn jsonrpc_inspection_accepts_a_read_only_stream() {
+        let (config, _, _) = jsonrpc_test_relay_context();
+        let body = br#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#;
+        let mut request = crate::l7::provider::L7Request {
+            action: "POST".into(),
+            target: "/rpc".into(),
+            query_params: std::collections::HashMap::new(),
+            raw_header: format!(
+                "POST /rpc HTTP/1.1\r\nHost: jsonrpc.example.test:8000\r\nContent-Length: {}\r\n\r\n",
+                body.len()
+            )
+            .into_bytes(),
+            body_length: crate::l7::provider::BodyLength::ContentLength(
+                u64::try_from(body.len()).unwrap(),
+            ),
+        };
+        let mut reader = body.as_slice();
+        let info = inspect_jsonrpc_request_correlated(&config, &mut reader, &mut request, None)
+            .await
+            .unwrap();
+
+        assert!(info.error.is_none());
+        assert_eq!(info.calls[0].method, "initialize");
+        assert!(reader.is_empty());
+        assert!(request.raw_header.ends_with(body));
     }
 
     #[tokio::test]
