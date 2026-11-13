@@ -174,6 +174,11 @@ impl OcsfEvent {
         self.base_mut().metadata.correlation_uid = Some(uid.into());
     }
 
+    /// Add an extension field without repurposing the event class's typed fields.
+    pub fn add_unmapped(&mut self, key: &str, value: impl Into<serde_json::Value>) {
+        self.base_mut().add_unmapped(key, value);
+    }
+
     /// Returns mutable base data common to all event classes.
     pub(crate) fn base_mut(&mut self) -> &mut BaseEventData {
         match self {
@@ -306,6 +311,25 @@ mod tests {
         assert_eq!(
             serde_json::to_value(&event).unwrap()["metadata"]["correlation_uid"],
             "request-123"
+        );
+    }
+
+    #[test]
+    fn add_unmapped_preserves_existing_fields_and_full_width_revisions() {
+        let ctx = test_sandbox_context();
+        let mut event = HttpActivityBuilder::new(&ctx)
+            .http_request(HttpRequest::new(
+                "GET",
+                Url::new("https", "example.test", "/", 443),
+            ))
+            .unmapped("existing", "value")
+            .build();
+        event.add_unmapped("provider_environment_revision", u64::MAX.to_string());
+        let json = serde_json::to_value(event).unwrap();
+        assert_eq!(json["unmapped"]["existing"], "value");
+        assert_eq!(
+            json["unmapped"]["provider_environment_revision"],
+            u64::MAX.to_string()
         );
     }
 

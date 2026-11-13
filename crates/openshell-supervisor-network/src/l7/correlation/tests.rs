@@ -882,3 +882,110 @@ fn late_fail_open_does_not_hide_a_later_blocking_failure() {
     assert_eq!(events[1]["metadata"]["correlation_uid"], id);
     assert_eq!(events[1]["http_response"]["code"], 200);
 }
+
+#[test]
+fn resource_revisions_keep_first_valid_identities_on_primary_and_late_records() {
+    let capture = openshell_ocsf::test_support::OcsfCapture::default();
+    let _subscriber = capture.install();
+    let correlation = RequestCorrelation::new(&request(), &context());
+    correlation.record_policy_runtime_generation(u64::MAX);
+    correlation.record_policy_runtime_generation(1);
+    correlation.record_selected_policy_endpoint("SENTINEL-INVALID", "endpoint:v1:invalid");
+    let hash = "a".repeat(64);
+    let endpoint = format!("endpoint:v1:{}", "b".repeat(64));
+    correlation.record_selected_policy_endpoint(&hash, &endpoint);
+    let mut snapshot = openshell_core::provider_credentials::ProviderCredentialSnapshot {
+        installation_id: "SENTINEL-INVALID".into(),
+        revision: u64::MAX,
+        child_env: std::collections::HashMap::from([("KEY".into(), "SENTINEL-SECRET".into())]),
+        dynamic_credentials: std::collections::HashMap::new(),
+    };
+    correlation.record_provider_credential_snapshot(&snapshot);
+    snapshot.installation_id = "00000000-0000-4000-8000-000000000041".into();
+    correlation.record_provider_credential_snapshot(&snapshot);
+    correlation.emit(allowed());
+    correlation.response_selected(200);
+
+    correlation.record_selected_policy_endpoint(&"c".repeat(64), &endpoint);
+    snapshot.revision = 1;
+    snapshot.installation_id = "00000000-0000-4000-8000-000000000042".into();
+    correlation.record_provider_credential_snapshot(&snapshot);
+    correlation.emit(denied());
+    emit_phase_events(
+        Some(&correlation),
+        MiddlewarePhase::Response,
+        [
+            invocation("redact", "response", InvocationOutcome::Transform),
+            openshell_ocsf::DetectionFindingBuilder::new(openshell_ocsf::ctx::ctx())
+                .finding_info(openshell_ocsf::FindingInfo::new(
+                    "MIDDLEWARE_FAILURE",
+                    "Middleware failed",
+                ))
+                .build(),
+        ],
+    );
+    drop(correlation);
+
+    let events = http_events(&capture);
+    let primary: Vec<_> = events
+        .iter()
+        .filter(|event| event["unmapped"]["http_event_kind"] == "request")
+        .collect();
+    let companions: Vec<_> = events
+        .iter()
+        .filter(|event| event["unmapped"]["http_event_kind"] == "middleware_invocation")
+        .collect();
+    let late: Vec<_> = events
+        .iter()
+        .filter(|event| event["unmapped"].get("http_event_kind").is_none())
+        .collect();
+    assert_eq!(primary.len(), 1);
+    assert_eq!(companions.len(), 1);
+    assert_eq!(late.len(), 1);
+    assert_eq!(events.len(), primary.len() + companions.len() + late.len());
+    assert_eq!(companions[0]["unmapped"]["middleware_phase"], "response");
+    assert_eq!(companions[0]["unmapped"]["transformed"], true);
+    assert_eq!(companions[0]["action"], "Allowed");
+    let all_events = capture.json_events();
+    assert_eq!(all_events.len(), events.len() + 1);
+    for event in &all_events {
+        assert_eq!(
+            event["unmapped"]["policy_runtime_generation"],
+            u64::MAX.to_string()
+        );
+        assert_eq!(
+            event["unmapped"]["provider_environment_revision"],
+            u64::MAX.to_string()
+        );
+        assert_eq!(event["unmapped"]["policy_hash"], hash);
+        assert_eq!(event["unmapped"]["endpoint_id"], endpoint);
+        assert_eq!(
+            event["unmapped"]["provider_credential_installation_id"],
+            "00000000-0000-4000-8000-000000000041"
+        );
+        assert!(event.get("trace").is_none());
+    }
+    assert!(
+        !serde_json::to_string(&all_events)
+            .unwrap()
+            .contains("SENTINEL")
+    );
+    assert_eq!(events[0]["firewall_rule"]["type"], "l7");
+}
+
+#[test]
+fn unknown_resource_identities_are_omitted() {
+    let capture = openshell_ocsf::test_support::OcsfCapture::default();
+    let _subscriber = capture.install();
+    let correlation = RequestCorrelation::new(&request(), &context());
+    correlation.record_selected_policy_endpoint(&"A".repeat(64), &"endpoint:v1:".repeat(20));
+    correlation.emit(allowed());
+    correlation.response_selected(200);
+    drop(correlation);
+    let events = http_events(&capture);
+    assert_eq!(events.len(), 1);
+    assert_eq!(
+        events[0]["unmapped"],
+        serde_json::json!({"http_event_kind": "request"})
+    );
+}

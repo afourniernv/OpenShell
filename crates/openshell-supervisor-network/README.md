@@ -80,6 +80,12 @@ only as an untrusted link. Their records never create an extra denial-only span,
 even if the request span is disabled or unsampled. Other egress paths retain the
 legacy bounded deny-span behavior. End HTTP tracing before an upgraded session.
 The request span ends after its owned stages, not when response headers are logged.
+
+Inspected request records retain the policy generation/hash, selected endpoint
+identity and pinned provider installation/revision under OCSF `unmapped`.
+Identities are captured at selection, not looked up when the record is emitted;
+later reloads and rotations cannot rewrite historical records. Numeric revisions
+are decimal strings to preserve their full width. Unknown identities are omitted.
 The `openshell.upstream.send` stage measures request writes and flush; response
 handling is measured separately. Receipt filtering preserves raw HTTP bytes
 and borrows unchanged header blocks.
