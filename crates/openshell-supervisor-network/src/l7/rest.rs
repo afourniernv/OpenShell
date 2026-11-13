@@ -107,6 +107,38 @@ const MIN_HTTP2_PREFACE_DETECTION_BYTES: usize = 8;
 /// the TCP connection alive after the response body (common with CDN keep-alive).
 const RELAY_EOF_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
+#[derive(Debug, thiserror::Error)]
+enum RelayError {
+    #[error("HTTP relay read failed: {0}")]
+    Read(#[source] std::io::Error),
+    #[error("{0}")]
+    Truncated(&'static str),
+    #[error("{0}")]
+    Protocol(String),
+    #[error("{0}")]
+    PolicyReloaded(String),
+}
+
+impl miette::Diagnostic for RelayError {}
+
+async fn guarded_relay_read<T>(
+    guard: Option<&PolicyGenerationGuard>,
+    read: impl Future<Output = Result<T>>,
+) -> Result<T> {
+    let Some(guard) = guard else {
+        return read.await;
+    };
+    let mut read = std::pin::pin!(read);
+    tokio::select! {
+        result = &mut read => result,
+        () = guard.wait_until_stale() => {
+            if guard.is_stale() {
+                Err(RelayError::PolicyReloaded("policy generation changed".into()).into())
+            } else { read.await }
+        }
+    }
+}
+
 /// HTTP/1.1 REST protocol provider.
 ///
 /// Carries the path-canonicalization options derived from the endpoint
@@ -1677,9 +1709,6 @@ where
     upstream.flush().await.into_diagnostic()?;
     upstream.request_span.take();
 
-    let response_span = correlation.map_or_else(tracing::Span::none, |correlation| {
-        correlation.stage(RequestStage::Response)
-    });
     let outcome = relay_response(
         &req.action,
         upstream,
@@ -1693,7 +1722,6 @@ where
         },
         response_middleware,
     )
-    .instrument(response_span)
     .await?;
 
     Ok(outcome)
@@ -4011,11 +4039,18 @@ where
         let to_read = usize::try_from(remaining)
             .unwrap_or(buf.len())
             .min(buf.len());
-        let n = reader.read(&mut buf[..to_read]).await.into_diagnostic()?;
+        let n = guarded_relay_read(generation_guard, async {
+            reader
+                .read(&mut buf[..to_read])
+                .await
+                .map_err(RelayError::Read)
+                .map_err(miette::Report::new)
+        })
+        .await?;
         if n == 0 {
-            return Err(miette!(
-                "Connection closed with {remaining} bytes remaining"
-            ));
+            return Err(
+                RelayError::Truncated("Connection closed before the complete HTTP body").into(),
+            );
         }
         if let Some(guard) = generation_guard {
             guard.ensure_current()?;
@@ -4047,7 +4082,7 @@ where
     W: AsyncWrite + Unpin,
 {
     let started_at = std::time::Instant::now();
-    let mut input = ChunkedRelayInput::new(already_read);
+    let mut input = ChunkedRelayInput::new(already_read, generation_guard);
     let mut chunk_count = 0usize;
     let mut chunk_payload_bytes = 0usize;
 
@@ -4141,14 +4176,16 @@ struct ChunkedRelayInput<'a> {
     already_read: &'a [u8],
     already_read_pos: usize,
     pending: Vec<u8>,
+    generation_guard: Option<&'a PolicyGenerationGuard>,
 }
 
 impl<'a> ChunkedRelayInput<'a> {
-    fn new(already_read: &'a [u8]) -> Self {
+    fn new(already_read: &'a [u8], generation_guard: Option<&'a PolicyGenerationGuard>) -> Self {
         Self {
             already_read,
             already_read_pos: 0,
             pending: Vec::with_capacity(RELAY_BUF_SIZE),
+            generation_guard,
         }
     }
 
@@ -4207,13 +4244,17 @@ impl<'a> ChunkedRelayInput<'a> {
             }
             let start = self.pending.len();
             self.pending.resize(start + to_read, 0);
-            let read = reader
-                .read(&mut self.pending[start..])
-                .await
-                .into_diagnostic()?;
+            let read = guarded_relay_read(self.generation_guard, async {
+                reader
+                    .read(&mut self.pending[start..])
+                    .await
+                    .map_err(RelayError::Read)
+                    .map_err(miette::Report::new)
+            })
+            .await?;
             if read == 0 {
                 self.pending.truncate(start);
-                return Err(miette!(eof_message));
+                return Err(RelayError::Truncated(eof_message).into());
             }
             self.pending.truncate(start + read);
             if let Some(guard) = generation_guard {
@@ -4234,13 +4275,16 @@ impl<'a> ChunkedRelayInput<'a> {
             self.pending.push(byte);
             return Ok(byte);
         }
-        let byte = match reader.read_u8().await {
-            Ok(byte) => byte,
-            Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => {
-                return Err(miette!(eof_message));
-            }
-            Err(error) => return Err(error).into_diagnostic(),
-        };
+        let byte = guarded_relay_read(self.generation_guard, async {
+            Ok(match reader.read_u8().await {
+                Ok(byte) => byte,
+                Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => {
+                    return Err(RelayError::Truncated(eof_message).into());
+                }
+                Err(error) => return Err(RelayError::Read(error).into()),
+            })
+        })
+        .await?;
         self.pending.push(byte);
         Ok(byte)
     }
@@ -4463,26 +4507,47 @@ fn is_bodiless_response(request_method: &str, status_code: u16) -> bool {
 /// no Transfer-Encoding) where the body is delimited by connection close.
 /// An idle timeout prevents blocking when servers keep the TCP connection
 /// alive longer than expected (e.g. CDN keep-alive timers).
-async fn relay_until_eof<R, W>(reader: &mut R, writer: &mut W) -> Result<()>
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RelayUntilEofOutcome {
+    Complete,
+    IdleTimeout,
+}
+
+async fn relay_until_eof<R, W>(
+    reader: &mut R,
+    writer: &mut W,
+    generation_guard: Option<&PolicyGenerationGuard>,
+) -> Result<RelayUntilEofOutcome>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
     let mut buf = [0u8; RELAY_BUF_SIZE];
     loop {
-        match tokio::time::timeout(RELAY_EOF_IDLE_TIMEOUT, reader.read(&mut buf)).await {
-            Ok(Ok(0)) => return Ok(()),
+        match tokio::time::timeout(
+            RELAY_EOF_IDLE_TIMEOUT,
+            guarded_relay_read(generation_guard, async {
+                reader
+                    .read(&mut buf)
+                    .await
+                    .map_err(RelayError::Read)
+                    .map_err(miette::Report::new)
+            }),
+        )
+        .await
+        {
+            Ok(Ok(0)) => return Ok(RelayUntilEofOutcome::Complete),
             Ok(Ok(n)) => {
                 writer.write_all(&buf[..n]).await.into_diagnostic()?;
                 writer.flush().await.into_diagnostic()?;
             }
-            Ok(Err(e)) => return Err(miette::miette!("{e}")),
+            Ok(Err(error)) => return Err(error),
             Err(_) => {
                 debug!(
                     "relay_until_eof idle timeout after {:?}",
                     RELAY_EOF_IDLE_TIMEOUT
                 );
-                return Ok(());
+                return Ok(RelayUntilEofOutcome::IdleTimeout);
             }
         }
     }
@@ -4492,14 +4557,25 @@ where
 ///
 /// Used for server-sent events, where long idle gaps are part of the protocol
 /// and do not mean the response body is complete.
-async fn relay_until_eof_without_idle_timeout<R, W>(reader: &mut R, writer: &mut W) -> Result<()>
+async fn relay_until_eof_without_idle_timeout<R, W>(
+    reader: &mut R,
+    writer: &mut W,
+    generation_guard: Option<&PolicyGenerationGuard>,
+) -> Result<()>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
     let mut buf = [0u8; RELAY_BUF_SIZE];
     loop {
-        let n = reader.read(&mut buf).await.into_diagnostic()?;
+        let n = guarded_relay_read(generation_guard, async {
+            reader
+                .read(&mut buf)
+                .await
+                .map_err(RelayError::Read)
+                .map_err(miette::Report::new)
+        })
+        .await?;
         if n == 0 {
             return Ok(());
         }
@@ -8707,6 +8783,7 @@ mod tests {
             (5, false, "allowed"),
             (5, true, "denied"),
             (4, false, "platform_error"),
+            (0, true, "denied"),
         ] {
             for sampler in [None, Some(Sampler::AlwaysOff), Some(Sampler::AlwaysOn)] {
                 let sampled = matches!(sampler, Some(Sampler::AlwaysOn));
@@ -8747,7 +8824,7 @@ mod tests {
                     let result = relay_response(
                         "GET",
                         &mut upstream,
-                        &mut delivered,
+                        &mut correlation.observe_response(&mut delivered),
                         RelayResponseOptions {
                             correlation: Some(&correlation),
                             ..Default::default()
@@ -8757,7 +8834,7 @@ mod tests {
                     .await;
                     assert_eq!(
                         result.is_ok(),
-                        expected == "allowed",
+                        expected == "allowed" || declared == 0,
                         "{expected}: {result:?}"
                     );
                     assert!(
@@ -8768,6 +8845,26 @@ mod tests {
                 .with_subscriber(capture.subscriber())
                 .await;
                 let events = capture.events.json_events();
+                let terminal: Vec<_> = events
+                    .iter()
+                    .filter(|event| event["firewall_rule"]["type"] == "response-correlation")
+                    .collect();
+                assert_eq!(
+                    terminal.len(),
+                    usize::from(expected != "allowed" && declared != 0),
+                    "{expected}: {events:?}"
+                );
+                if let Some(event) = terminal.first() {
+                    assert_eq!(event["http_response"]["code"], 200);
+                    assert_eq!(
+                        event["unmapped"]["response_selection_cause"],
+                        if expected == "denied" {
+                            "middleware_denied"
+                        } else {
+                            "middleware_failed"
+                        }
+                    );
+                }
                 let primary: Vec<_> = events
                     .iter()
                     .filter(|event| event["class_uid"] == 4002)
@@ -8815,6 +8912,81 @@ mod tests {
                 capture.shutdown();
             }
         }
+    }
+
+    #[tokio::test]
+    async fn canonical_middleware_failure_can_be_fully_delivered() {
+        use crate::test_support::request_tracing::RequestTracing;
+        use opentelemetry_sdk::trace::Sampler;
+        use tracing::instrument::WithSubscriber as _;
+
+        let capture = RequestTracing::new(Some(Sampler::AlwaysOn));
+        async {
+            let request = request_from_buffered_http(
+                "GET",
+                "/data",
+                "/data",
+                b"GET /data HTTP/1.1\r\nHost: example.test\r\n\r\n".to_vec(),
+            )
+            .unwrap();
+            let context = crate::l7::relay::L7EvalContext {
+                host: "example.test".into(),
+                port: 443,
+                ..Default::default()
+            };
+            let correlation = RequestCorrelation::new(&request, &context);
+            let (runner, chain) = hook_echo_fixture(HookEchoStage::default());
+            let middleware = response_middleware_context(&runner, &chain, "GET");
+            let mut upstream =
+                b"HTTP/1.1 200 OK\r\nX-Legacy: \xff\r\nContent-Length: 5\r\n\r\nhello".as_slice();
+            let mut delivered = Vec::new();
+            relay_response(
+                "GET",
+                &mut upstream,
+                &mut correlation.observe_response(&mut delivered),
+                RelayResponseOptions {
+                    correlation: Some(&correlation),
+                    ..Default::default()
+                },
+                Some(middleware),
+            )
+            .await
+            .unwrap();
+            assert!(delivered.starts_with(b"HTTP/1.1 502 Bad Gateway\r\n"));
+        }
+        .with_subscriber(capture.subscriber())
+        .await;
+        let spans = capture.spans();
+        let response = spans
+            .iter()
+            .find(|span| span.name == "openshell.http.response")
+            .unwrap();
+        for (key, value) in [
+            ("openshell.response.delivery_outcome", "complete"),
+            ("openshell.response.selection_cause", "middleware_failed"),
+        ] {
+            assert!(
+                response
+                    .attributes
+                    .iter()
+                    .any(|field| field.key.as_str() == key && field.value.as_str() == value),
+                "{response:?}"
+            );
+        }
+        let events = capture.events.json_events();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event["class_uid"] == 4002)
+                .count(),
+            1
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| event["firewall_rule"]["type"] == "response-correlation")
+        );
+        capture.shutdown();
     }
 
     #[tokio::test]

@@ -149,6 +149,23 @@ impl RequestTrace {
                 openshell.mcp.tools_call_observed = tracing::field::Empty,
             );
         }
+        if matches!(stage, RequestStage::Response) {
+            return tracing::info_span!(
+                parent: &self.span,
+                "openshell.http.stage",
+                otel.name = stage.name(),
+                otel.status_code = tracing::field::Empty,
+                http.response.status_code = tracing::field::Empty,
+                openshell.upstream.http.response.status_code = tracing::field::Empty,
+                openshell.response.selection_cause = tracing::field::Empty,
+                openshell.response.delivery_outcome = "incomplete",
+                openshell.response.delivery_started = false,
+                openshell.response.partial_delivery = false,
+                openshell.response.interim_delivery_started = false,
+                openshell.response.interim_bytes_forwarded = tracing::field::Empty,
+                openshell.error.stage = tracing::field::Empty,
+            );
+        }
         tracing::info_span!(
             parent: &self.span,
             "openshell.http.stage",
@@ -202,10 +219,12 @@ impl RequestTrace {
 
 impl Drop for RequestTrace {
     fn drop(&mut self) {
-        self.span.record("openshell.request.outcome", self.outcome);
-        if matches!(self.outcome, "failed" | "incomplete") {
-            self.span.record("otel.status_code", "ERROR");
-        }
+        self.span.in_scope(|| {
+            self.span.record("openshell.request.outcome", self.outcome);
+            if matches!(self.outcome, "failed" | "incomplete") {
+                self.span.record("otel.status_code", "ERROR");
+            }
+        });
     }
 }
 

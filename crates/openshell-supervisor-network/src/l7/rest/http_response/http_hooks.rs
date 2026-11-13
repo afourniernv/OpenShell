@@ -67,8 +67,16 @@ enum BodyRelayError {
 }
 
 impl BodyRelayError {
-    const fn end_reason(&self) -> MiddlewareSessionEndReason {
+    fn end_reason(&self) -> MiddlewareSessionEndReason {
         match self {
+            Self::Upstream(error)
+                if matches!(
+                    error.downcast_ref::<RelayError>(),
+                    Some(RelayError::PolicyReloaded(_))
+                ) =>
+            {
+                MiddlewareSessionEndReason::PolicyReload
+            }
             Self::Upstream(_) => MiddlewareSessionEndReason::UpstreamDisconnect,
             Self::Downstream(_) => MiddlewareSessionEndReason::DownstreamDisconnect,
             Self::PolicyReload(_) => MiddlewareSessionEndReason::PolicyReload,
@@ -76,8 +84,16 @@ impl BodyRelayError {
         }
     }
 
-    const fn correlation_failure(&self) -> (HttpOutcome, &'static str) {
+    fn correlation_failure(&self) -> (HttpOutcome, &'static str) {
         match self {
+            Self::Upstream(error)
+                if matches!(
+                    error.downcast_ref::<RelayError>(),
+                    Some(RelayError::PolicyReloaded(_))
+                ) =>
+            {
+                (HttpOutcome::PlatformError, "policy_generation_changed")
+            }
             Self::Upstream(_) => (HttpOutcome::UpstreamError, "upstream_response_body"),
             Self::Downstream(_) => (HttpOutcome::PlatformError, "downstream_write"),
             Self::PolicyReload(_) => (HttpOutcome::PlatformError, "policy_generation_changed"),
@@ -267,6 +283,7 @@ where
             server_wants_close,
             event_stream,
             response_correlation,
+            middleware.generation_guard,
         )
         .await?;
         complete_response_middleware(response_correlation, MiddlewareOutcome::Allowed);
@@ -311,7 +328,8 @@ where
             Err(_) => std::future::pending().await,
         }
     });
-    let mut reader = BufferedResponseReader::new(upstream, &buffered[header_end..]);
+    let mut reader = BufferedResponseReader::new(upstream, &buffered[header_end..])
+        .with_generation_guard(middleware.generation_guard);
     let mut writer = ResponseWriter {
         client,
         status_line: &status_line,
@@ -335,6 +353,7 @@ where
             middleware.generation_guard,
             &parsed.connection_nominated,
             input,
+            response_correlation,
         );
         let write = async {
             while let Some(event) = outputs.recv().await {
@@ -466,6 +485,20 @@ where
         }
         Ok(failure) if committed => {
             if let Some(correlation) = response_correlation {
+                correlation.response_failure(ResponseFailure {
+                    cause: Some(if failure.denial.is_some() {
+                        ResponseCause::MiddlewareDenied
+                    } else {
+                        ResponseCause::MiddlewareFailed
+                    }),
+                    delivery: DeliveryOutcome::CancelledOrIncomplete,
+                    outcome: if failure.denial.is_some() {
+                        HttpOutcome::Denied
+                    } else {
+                        HttpOutcome::PlatformError
+                    },
+                    stage: "middleware_response_finalize",
+                });
                 correlation.record_enforcement_block();
                 correlation.record_failure(
                     if failure.denial.is_some() {
@@ -528,6 +561,20 @@ where
 }
 
 fn record_relay_error(correlation: Option<&RequestCorrelation>, error: &BodyRelayError) {
+    if let Some(correlation) = correlation {
+        let cause = match error {
+            BodyRelayError::Upstream(error) => match error.downcast_ref::<RelayError>() {
+                Some(RelayError::Truncated(_)) => ResponseCause::UpstreamTruncated,
+                Some(RelayError::Read(_)) => ResponseCause::UpstreamIoError,
+                Some(RelayError::PolicyReloaded(_)) => ResponseCause::PolicyReloaded,
+                _ => ResponseCause::UpstreamProtocolError,
+            },
+            BodyRelayError::PolicyReload(_) => ResponseCause::PolicyReloaded,
+            BodyRelayError::Output(_) => ResponseCause::MiddlewareFailed,
+            BodyRelayError::Downstream(_) => ResponseCause::UpstreamResponse,
+        };
+        correlation.response_cause(cause);
+    }
     let (outcome, reason) = error.correlation_failure();
     complete_response_middleware(correlation, MiddlewareOutcome::PlatformError);
     record_committed_response_error(correlation, outcome, reason);
@@ -545,6 +592,7 @@ async fn feed_response_body<R: AsyncRead + Unpin>(
     generation_guard: Option<&PolicyGenerationGuard>,
     connection_nominated: &[String],
     input: mpsc::Sender<HttpBodyInput>,
+    correlation: Option<&RequestCorrelation>,
 ) -> std::result::Result<(), BodyRelayError> {
     let current = || {
         generation_guard
@@ -564,9 +612,10 @@ async fn feed_response_body<R: AsyncRead + Unpin>(
                         .await
                         .map_err(BodyRelayError::Upstream)?
                         .ok_or_else(|| {
-                            BodyRelayError::Upstream(miette!(
-                                "HTTP response body ended unexpectedly"
-                            ))
+                            BodyRelayError::Upstream(
+                                RelayError::Truncated("HTTP response body ended unexpectedly")
+                                    .into(),
+                            )
                         })?;
                     current()?;
                     remaining -= unit.len() as u64;
@@ -628,7 +677,10 @@ async fn feed_response_body<R: AsyncRead + Unpin>(
                     } else {
                         tokio::time::timeout(RELAY_EOF_IDLE_TIMEOUT, read)
                             .await
-                            .unwrap_or(Ok(None))
+                            .unwrap_or_else(|_| {
+                                record_response_idle(correlation);
+                                Ok(None)
+                            })
                     }
                     .map_err(BodyRelayError::Upstream)?;
                     let Some(unit) = unit else {

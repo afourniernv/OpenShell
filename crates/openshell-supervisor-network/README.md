@@ -104,3 +104,12 @@ including transport-selected schemas and middleware-transformed bodies. They
 record bounded classifications, counts and revisions, never arguments, tool
 names or raw errors. Dedicated body inspection starts after the request UUID and
 configuration identities are assigned.
+
+The owned `openshell.http.response` stage covers response delivery through final
+flush and required shutdown. Its bounded fields distinguish response selection
+from completion, including interim bytes, truncation, cancellation and downstream
+failures. The primary record remains fixed at accepted final headers; a late
+delivery failure adds one observational `response-correlation` record. Delivery
+accounting and receipts work without a request span or trace exporter. Middleware
+observations remain separate, and streaming hooks retain their final-byte and
+policy-generation protections.
