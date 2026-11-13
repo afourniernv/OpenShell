@@ -101,6 +101,24 @@ fn explicit_request_root_does_not_adopt_ambient_otel_context() {
 }
 
 #[test]
+fn request_completion_encloses_stages_after_an_early_root_exit() {
+    let spans = capture(Sampler::AlwaysOn, || {
+        let mut trace = RequestTrace::new("local", "GET", "example.test", 443, &request("01"));
+        trace.span().in_scope(|| trace.record_status(200));
+        trace.stage(RequestStage::Response).in_scope(|| {});
+        trace.record_outcome(HttpOutcome::Allowed);
+    });
+    let root = root(&spans);
+    let response = spans
+        .iter()
+        .find(|span| span.name == RequestStage::Response.name())
+        .unwrap();
+    assert_eq!(response.parent_span_id, root.span_context.span_id());
+    assert!(response.start_time >= root.start_time);
+    assert!(response.end_time <= root.end_time);
+}
+
+#[test]
 fn remote_sampled_flag_cannot_override_local_always_off() {
     for flags in ["00", "01"] {
         let spans = capture(Sampler::ParentBased(Box::new(Sampler::AlwaysOff)), || {
