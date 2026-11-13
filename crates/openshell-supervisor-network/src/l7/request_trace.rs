@@ -219,6 +219,7 @@ impl RequestTrace {
 
 impl Drop for RequestTrace {
     fn drop(&mut self) {
+        // Finalize exported timing after the request's child stages.
         self.span.in_scope(|| {
             self.span.record("openshell.request.outcome", self.outcome);
             if matches!(self.outcome, "failed" | "incomplete") {
