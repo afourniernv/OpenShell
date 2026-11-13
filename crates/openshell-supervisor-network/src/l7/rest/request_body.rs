@@ -693,9 +693,6 @@ where
         correlation,
     ));
     let mut response = Box::pin(async {
-        let span = correlation.map_or_else(tracing::Span::none, |correlation| {
-            correlation.stage(RequestStage::Response)
-        });
         relay_response(
             &req.action,
             &mut upstream_reader,
@@ -703,7 +700,6 @@ where
             response_options,
             response_middleware,
         )
-        .instrument(span)
         .await
     });
 

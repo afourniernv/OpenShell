@@ -24,6 +24,7 @@ use crate::l7::request_trace::RequestTrace;
 mod resources;
 use resources::RequestResources;
 mod jsonrpc;
+pub mod response;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HttpOutcome {
@@ -69,6 +70,7 @@ struct RequestState {
     credential: CredentialState,
     resources: RequestResources,
     jsonrpc: jsonrpc::JsonRpcObservations,
+    response: response::ResponseState,
 }
 
 pub struct CredentialPreparation<'a> {
@@ -606,10 +608,12 @@ impl RequestCorrelation {
     }
 
     pub(crate) fn record_upstream_status(&self, status: u16) {
-        self.state
+        let mut state = self
+            .state
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .upstream_status = Some(status);
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.upstream_status = Some(status);
+        state.response.upstream_response();
     }
 
     pub(crate) fn record_rejection(
@@ -911,6 +915,7 @@ impl RequestCorrelation {
             let Some(mut primary) = state.primary.take() else {
                 return;
             };
+            state.response.enrich_primary(&mut primary);
             if let Some(outcome) = state.credential.effective_outcome()
                 && outcome != CredentialOutcome::Prepared
                 && let OcsfEvent::HttpActivity(http) = &mut primary

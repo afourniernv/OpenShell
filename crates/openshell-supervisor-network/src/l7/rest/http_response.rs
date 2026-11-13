@@ -4,8 +4,13 @@
 //! HTTP response relay and pre-return middleware integration.
 
 mod http_hooks;
+#[cfg(test)]
+mod terminal_tests;
 
 use super::*;
+use crate::l7::correlation::response::{
+    DeliveryOutcome, ResponseCause, ResponseDelivery, ResponseFailure, ResponseTransport,
+};
 use crate::l7::correlation::{
     HttpOutcome, MiddlewareObservation, MiddlewareOutcome, MiddlewarePhase, RequestCorrelation,
     RequestStage, emit_ocsf, emit_phase_events,
@@ -83,7 +88,39 @@ where
     U: AsyncRead + Unpin,
     C: AsyncWrite + Unpin,
 {
+    let mut delivery = ResponseDelivery::new(options.correlation);
+    let generation = response_middleware
+        .as_ref()
+        .and_then(|middleware| middleware.generation_guard);
+    let mut transport = ResponseTransport::new(client, options.correlation, generation);
+    let result = relay_response_inner(
+        request_method,
+        upstream,
+        &mut transport,
+        options,
+        response_middleware,
+    )
+    .instrument(delivery.span().clone())
+    .await;
+    delivery.finish(result.as_ref().err().map(classify_response_failure));
+    result
+}
+
+async fn relay_response_inner<U, C>(
+    request_method: &str,
+    upstream: &mut U,
+    client: &mut C,
+    options: RelayResponseOptions<'_>,
+    response_middleware: Option<HttpResponseMiddlewareRelay<'_>>,
+) -> Result<RelayOutcome>
+where
+    U: AsyncRead + Unpin,
+    C: AsyncWrite + Unpin,
+{
     let started_at = std::time::Instant::now();
+    let response_generation_guard = response_middleware
+        .as_ref()
+        .and_then(|middleware| middleware.generation_guard);
     let mut buf = Vec::with_capacity(4096);
     let mut tmp = [0u8; 1024];
 
@@ -102,7 +139,7 @@ where
             if let Some(observer) = options.observer.as_ref() {
                 observer.observe(EndpointResult::TransportFailed);
             }
-            return Err(miette!("HTTP response headers exceed limit"));
+            return Err(RelayError::Protocol("HTTP response headers exceed limit".into()).into());
         }
 
         if let Some(header_end) = header_end {
@@ -113,7 +150,7 @@ where
                     observer.observe(EndpointResult::TransportFailed);
                 }
                 record_upstream_response_error(options.correlation, "upstream_response_headers");
-                return Err(error);
+                return Err(RelayError::Protocol(error.to_string()).into());
             }
             let header_str = String::from_utf8_lossy(&buf[..header_end]);
             if matches!(
@@ -126,20 +163,41 @@ where
                 } else {
                     Cow::Borrowed(&buf[..header_end])
                 };
+                if let Some(correlation) = options.correlation {
+                    correlation.interim_response(true);
+                }
                 client.write_all(&sanitized).await.into_diagnostic()?;
                 client.flush().await.into_diagnostic()?;
+                if let Some(correlation) = options.correlation {
+                    correlation.interim_response(false);
+                }
                 buf.drain(..header_end);
                 continue;
             }
             break header_end;
         }
 
-        let n = upstream.read(&mut tmp).await.into_diagnostic()?;
+        let n = guarded_relay_read(response_generation_guard, async {
+            upstream
+                .read(&mut tmp)
+                .await
+                .map_err(RelayError::Read)
+                .map_err(miette::Report::new)
+        })
+        .await?;
         if n == 0 {
             if let Some(observer) = options.observer.as_ref() {
                 observer.observe(EndpointResult::TransportFailed);
             }
             record_upstream_response_error(options.correlation, "upstream_response_incomplete");
+            if let Some(correlation) = options.correlation {
+                correlation.response_failure(ResponseFailure {
+                    cause: Some(ResponseCause::UpstreamTruncated),
+                    delivery: DeliveryOutcome::CancelledOrIncomplete,
+                    outcome: HttpOutcome::UpstreamError,
+                    stage: "upstream_response_headers",
+                });
+            }
             if !buf.is_empty() {
                 client.write_all(&buf).await.into_diagnostic()?;
             }
@@ -177,7 +235,16 @@ where
     let http_10_closes_by_default =
         response_is_http_10(&header_str) && !parse_connection_keep_alive(&header_str);
     let event_stream = response_is_event_stream(&header_str);
-    let body_length = parse_body_length(&header_str)?;
+    let body_length =
+        parse_body_length(&header_str).map_err(|error| RelayError::Protocol(error.to_string()))?;
+    if let BodyLength::ContentLength(length) = body_length
+        && !is_bodiless_response(request_method, status_code)
+        && u64::try_from(buf.len() - header_end).unwrap_or(u64::MAX) > length
+    {
+        return Err(
+            RelayError::Protocol("HTTP response body exceeds Content-Length".into()).into(),
+        );
+    }
 
     debug!(
         status_code,
@@ -195,6 +262,14 @@ where
     // upgraded protocol and must be forwarded before switching.
     if status_code == 101 {
         if !options.client_requested_upgrade {
+            if let Some(correlation) = options.correlation {
+                correlation.response_failure(ResponseFailure {
+                    cause: Some(ResponseCause::UpstreamProtocolError),
+                    delivery: DeliveryOutcome::CancelledOrIncomplete,
+                    outcome: HttpOutcome::UpstreamError,
+                    stage: "unsolicited_upgrade",
+                });
+            }
             return Ok(RelayOutcome::Consumed);
         }
         let (websocket_permessage_deflate, websocket_subprotocol) = validate_websocket_response(
@@ -275,9 +350,12 @@ where
                 client.flush().await.into_diagnostic()?;
             }
             if event_stream {
-                relay_until_eof_without_idle_timeout(upstream, client).await?;
-            } else {
-                relay_until_eof(upstream, client).await?;
+                relay_until_eof_without_idle_timeout(upstream, client, response_generation_guard)
+                    .await?;
+            } else if relay_until_eof(upstream, client, response_generation_guard).await?
+                == RelayUntilEofOutcome::IdleTimeout
+            {
+                record_response_idle(options.correlation);
             }
             client.flush().await.into_diagnostic()?;
             client.shutdown().await.into_diagnostic()?;
@@ -307,7 +385,7 @@ where
             }
             let remaining = len.saturating_sub(overflow_len);
             if remaining > 0 {
-                relay_fixed(upstream, client, remaining, None).await?;
+                relay_fixed(upstream, client, remaining, response_generation_guard).await?;
             }
         }
         BodyLength::Chunked => {
@@ -315,7 +393,7 @@ where
                 upstream,
                 client,
                 overflow,
-                None,
+                response_generation_guard,
                 options.correlation.is_some(),
             )
             .await?;
@@ -340,14 +418,27 @@ fn record_allowed_response(correlation: Option<&RequestCorrelation>) {
     }
 }
 
+fn record_response_idle(correlation: Option<&RequestCorrelation>) {
+    if let Some(correlation) = correlation {
+        correlation.response_failure(ResponseFailure {
+            cause: Some(ResponseCause::UpstreamIdleTimeout),
+            delivery: DeliveryOutcome::CancelledOrIncomplete,
+            outcome: HttpOutcome::UpstreamError,
+            stage: "upstream_response_idle_timeout",
+        });
+    }
+}
+
 fn record_denied_response(correlation: Option<&RequestCorrelation>, stage: &'static str) {
     if let Some(correlation) = correlation {
+        correlation.response_cause(ResponseCause::MiddlewareDenied);
         correlation.record_rejection(403, HttpOutcome::Denied, Some(stage));
     }
 }
 
 fn record_upstream_response_error(correlation: Option<&RequestCorrelation>, stage: &'static str) {
     if let Some(correlation) = correlation {
+        correlation.response_cause(ResponseCause::UpstreamTruncated);
         correlation.record_failure(HttpOutcome::UpstreamError, stage);
     }
 }
@@ -358,7 +449,77 @@ fn record_committed_response_error(
     stage: &'static str,
 ) {
     if let Some(correlation) = correlation {
+        if !matches!(stage, "downstream_write" | "upstream_response_body") {
+            correlation.response_cause(match stage {
+                "policy_generation_changed" | "response_policy_reload" => {
+                    ResponseCause::PolicyReloaded
+                }
+                _ if outcome == HttpOutcome::Denied => ResponseCause::MiddlewareDenied,
+                _ => ResponseCause::MiddlewareFailed,
+            });
+        }
         correlation.record_failure(outcome, stage);
+    }
+}
+
+fn classify_response_failure(error: &miette::Report) -> ResponseFailure {
+    let (cause, outcome, stage) = match (
+        error.downcast_ref::<RelayError>(),
+        error.downcast_ref::<ResponseMiddlewareStop>(),
+    ) {
+        (Some(error), _) => match error {
+            RelayError::Read(_) => (
+                ResponseCause::UpstreamIoError,
+                HttpOutcome::UpstreamError,
+                "upstream_response_read",
+            ),
+            RelayError::Truncated(_) => (
+                ResponseCause::UpstreamTruncated,
+                HttpOutcome::UpstreamError,
+                "upstream_response_truncated",
+            ),
+            RelayError::Protocol(_) => (
+                ResponseCause::UpstreamProtocolError,
+                HttpOutcome::UpstreamError,
+                "upstream_response_protocol",
+            ),
+            RelayError::PolicyReloaded => (
+                ResponseCause::PolicyReloaded,
+                HttpOutcome::PlatformError,
+                "response_policy_reload",
+            ),
+        },
+        (None, Some(stop)) => {
+            if stop.failure.denial.is_some()
+                || response_invocations_blocked(&stop.failure.diagnostics.invocations)
+            {
+                (
+                    ResponseCause::MiddlewareDenied,
+                    HttpOutcome::Denied,
+                    "response_middleware_denied",
+                )
+            } else {
+                (
+                    ResponseCause::MiddlewareFailed,
+                    HttpOutcome::PlatformError,
+                    "response_middleware_failed",
+                )
+            }
+        }
+        (None, None) => {
+            return ResponseFailure {
+                cause: None,
+                delivery: DeliveryOutcome::CancelledOrIncomplete,
+                outcome: HttpOutcome::PlatformError,
+                stage: "response_unknown",
+            };
+        }
+    };
+    ResponseFailure {
+        cause: Some(cause),
+        delivery: DeliveryOutcome::CancelledOrIncomplete,
+        outcome,
+        stage,
     }
 }
 
@@ -894,6 +1055,7 @@ where
             server_wants_close,
             event_stream,
             response_correlation,
+            middleware.generation_guard,
         )
         .await?;
         record_allowed_response(response_correlation);
@@ -1031,7 +1193,8 @@ where
         }
     }
 
-    let mut reader = BufferedResponseReader::new(upstream, &buffered[header_end..]);
+    let mut reader = BufferedResponseReader::new(upstream, &buffered[header_end..])
+        .with_generation_guard(middleware.generation_guard);
     let body_result = relay_normalized_response_body(
         &mut reader,
         &mut session,
@@ -1353,6 +1516,7 @@ async fn relay_headers_only_response<U, C>(
     server_wants_close: bool,
     event_stream: bool,
     response_correlation: Option<&RequestCorrelation>,
+    generation_guard: Option<&PolicyGenerationGuard>,
 ) -> Result<RelayOutcome>
 where
     U: AsyncRead + Unpin,
@@ -1385,7 +1549,7 @@ where
             }
             let remaining = length.saturating_sub(overflow.len() as u64);
             if remaining > 0 {
-                relay_fixed(upstream, client, remaining, None).await?;
+                relay_fixed(upstream, client, remaining, generation_guard).await?;
             }
         }
         BodyLength::Chunked => {
@@ -1393,7 +1557,7 @@ where
                 upstream,
                 client,
                 overflow,
-                None,
+                generation_guard,
                 response_correlation.is_some(),
             )
             .await?;
@@ -1403,9 +1567,11 @@ where
                 client.write_all(overflow).await.into_diagnostic()?;
             }
             if event_stream {
-                relay_until_eof_without_idle_timeout(upstream, client).await?;
-            } else {
-                relay_until_eof(upstream, client).await?;
+                relay_until_eof_without_idle_timeout(upstream, client, generation_guard).await?;
+            } else if relay_until_eof(upstream, client, generation_guard).await?
+                == RelayUntilEofOutcome::IdleTimeout
+            {
+                record_response_idle(response_correlation);
             }
             client.flush().await.into_diagnostic()?;
             return Ok(RelayOutcome::Consumed);
@@ -2103,6 +2269,7 @@ struct BufferedResponseReader<'a, R> {
     exact_buffer: Vec<u8>,
     exact_target: Option<usize>,
     line_buffer: Vec<u8>,
+    generation_guard: Option<&'a PolicyGenerationGuard>,
 }
 
 impl<'a, R: AsyncRead + Unpin> BufferedResponseReader<'a, R> {
@@ -2114,7 +2281,13 @@ impl<'a, R: AsyncRead + Unpin> BufferedResponseReader<'a, R> {
             exact_buffer: Vec::new(),
             exact_target: None,
             line_buffer: Vec::new(),
+            generation_guard: None,
         }
+    }
+
+    fn with_generation_guard(mut self, guard: Option<&'a PolicyGenerationGuard>) -> Self {
+        self.generation_guard = guard;
+        self
     }
 
     async fn read_some(&mut self, limit: usize) -> Result<Option<Vec<u8>>> {
@@ -2125,7 +2298,14 @@ impl<'a, R: AsyncRead + Unpin> BufferedResponseReader<'a, R> {
             return Ok(Some(data));
         }
         let mut data = vec![0u8; limit.max(1)];
-        let count = self.upstream.read(&mut data).await.into_diagnostic()?;
+        let count = guarded_relay_read(self.generation_guard, async {
+            self.upstream
+                .read(&mut data)
+                .await
+                .map_err(RelayError::Read)
+                .map_err(miette::Report::new)
+        })
+        .await?;
         if count == 0 {
             return Ok(None);
         }
@@ -2147,7 +2327,7 @@ impl<'a, R: AsyncRead + Unpin> BufferedResponseReader<'a, R> {
         while self.exact_buffer.len() < length {
             let remaining = length - self.exact_buffer.len();
             let Some(data) = self.read_some(remaining).await? else {
-                return Err(miette!("HTTP response body ended unexpectedly"));
+                return Err(RelayError::Truncated("HTTP response body ended unexpectedly").into());
             };
             self.exact_buffer.extend_from_slice(&data);
         }
@@ -2158,7 +2338,9 @@ impl<'a, R: AsyncRead + Unpin> BufferedResponseReader<'a, R> {
     async fn read_line(&mut self) -> Result<Vec<u8>> {
         loop {
             let Some(byte) = self.read_some(1).await? else {
-                return Err(miette!("HTTP response ended before line terminator"));
+                return Err(
+                    RelayError::Truncated("HTTP response ended before line terminator").into(),
+                );
             };
             self.line_buffer.push(byte[0]);
             if self.line_buffer.len() > MAX_HEADER_BYTES {
@@ -2812,6 +2994,11 @@ async fn send_response_delivery_failure<C: AsyncWrite + Unpin>(
     correlation: Option<&RequestCorrelation>,
 ) -> Result<()> {
     if let Some(correlation) = correlation {
+        correlation.response_failure_cause(match outcome {
+            HttpOutcome::Denied => ResponseCause::MiddlewareDenied,
+            HttpOutcome::UpstreamError => ResponseCause::UpstreamIoError,
+            _ => ResponseCause::MiddlewareFailed,
+        });
         if outcome == HttpOutcome::UpstreamError {
             correlation.record_response_status(502);
             correlation.record_failure(outcome, stage);
@@ -4135,7 +4322,7 @@ mod tests {
         let error = relay_response(
             "GET",
             &mut upstream,
-            &mut client,
+            &mut correlation.observe_response(&mut client),
             RelayResponseOptions {
                 correlation: Some(&correlation),
                 ..Default::default()
@@ -4148,6 +4335,17 @@ mod tests {
         assert!(client.starts_with(b"HTTP/1.1 200 OK\r\n"));
         drop(correlation);
         provider.force_flush().expect("flush spans");
+        let terminal: Vec<_> = ocsf
+            .json_events()
+            .into_iter()
+            .filter(|event| event["firewall_rule"]["type"] == "response-correlation")
+            .collect();
+        assert_eq!(terminal.len(), 1);
+        assert_eq!(terminal[0]["http_response"]["code"], 200);
+        assert_eq!(
+            terminal[0]["unmapped"]["response_selection_cause"],
+            "middleware_denied"
+        );
 
         let span = exporter
             .get_finished_spans()

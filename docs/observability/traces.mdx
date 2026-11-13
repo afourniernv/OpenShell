@@ -107,6 +107,14 @@ Correlation attributes exclude credentials, query values, bodies and MCP
 arguments. Truncated legacy diagnostics describe retained evidence; a false
 mutation flag does not guarantee that no later mutation occurred.
 
+The `openshell.http.response` stage records delivery completion separately from
+response selection. Its fields identify truncation, cancellation, downstream
+write/flush/shutdown failures and informational-response bytes. A failure after
+the primary record adds an observational HTTP Activity record with
+`response_event_kind=delivery_terminal` and the same request ID. It does not
+replace the original status or turn an allowed request into a policy denial.
+These records remain available when trace export is disabled.
+
 ## Next Steps
 
 - Configure [OTLP export](/how-it-works/gateways/configuration#otlp-export), including sampling and the `OTEL_*` variables the gateway honors.
