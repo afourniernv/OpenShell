@@ -970,6 +970,8 @@ fn http_response_stage_event(
         .http_response(openshell_ocsf::HttpResponse { code: status_code })
         .dst_endpoint(openshell_ocsf::Endpoint::from_domain(&target.host, port))
         .firewall_rule(policy_name, "supervisor-middleware")
+        .unmapped("http_event_kind", "middleware_invocation")
+        .unmapped("middleware_phase", "response")
         .unmapped("middleware_config", invocation.config_name.as_str())
         .unmapped(
             "middleware_implementation",

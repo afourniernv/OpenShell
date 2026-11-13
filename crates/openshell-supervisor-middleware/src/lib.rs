@@ -2,6 +2,15 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Supervisor middleware registration and chain execution.
+//!
+//! # Rust API compatibility
+//!
+//! Typed outcome diagnostics add fields to [`ChainOutcome`], [`HttpResponseInvocation`],
+//! [`HttpResponseMiddlewareFailure`], [`HttpResponseFinish`] and [`HttpResponseDiagnostics`].
+//! Direct Rust consumers must update struct literals and exhaustive destructuring.
+//! `HttpResponseMiddlewareFailure` now has private classification state; obtain it from
+//! runner or session operations. SDK/protobuf contracts and middleware implementation
+//! trait signatures are unchanged.
 
 mod binding_policy;
 mod diagnostics;

@@ -513,6 +513,7 @@ async fn inspected_allow_creates_only_the_stages_that_run() {
             .filter(|event| event["class_uid"] == 4002)
             .collect();
         assert_eq!(records.len(), 1, "{:?}", evidence.events);
+        assert_eq!(records[0]["unmapped"]["http_event_kind"], "request");
         assert_eq!(
             records[0]["metadata"]["correlation_uid"],
             request_id(&evidence.output.response)
@@ -562,7 +563,20 @@ async fn request_middleware_block_never_creates_a_denial_only_span() {
             .iter()
             .filter(|event| event["class_uid"] == 4002)
             .collect();
-        assert_eq!(records.len(), 1, "{:?}", evidence.events);
+        assert_eq!(records.len(), 2, "{:?}", evidence.events);
+        let companions: Vec<_> = records
+            .iter()
+            .filter(|event| event["unmapped"]["http_event_kind"] == "middleware_invocation")
+            .collect();
+        assert_eq!(companions.len(), 1);
+        assert_eq!(companions[0]["unmapped"]["middleware_phase"], "request");
+        assert_eq!(companions[0]["action"], "Denied");
+        assert!(companions[0].get("http_response").is_none());
+        let records: Vec<_> = records
+            .into_iter()
+            .filter(|event| event["unmapped"]["http_event_kind"] == "request")
+            .collect();
+        assert_eq!(records.len(), 1);
         assert_eq!(
             records[0]["metadata"]["correlation_uid"],
             request_id(&evidence.output.response)
