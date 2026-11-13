@@ -313,7 +313,7 @@ OTLP log export links every OCSF record, whatever its class, to the active sampl
 
 With OTLP trace export enabled on a dedicated supervisor, each inspected HTTP request has an INFO `openshell.http.request` span for its allowed, denied or failed outcome. Children measure the policy, middleware, credential, upstream and response stages that actually run. HTTP upgrade tracing ends before the upgraded WebSocket session.
 
-`openshell.upstream.send` measures request writes and flush, not the full upstream round trip. Response handling has a separate span.
+The request span ends after its owned stages, not when response headers are logged. `openshell.upstream.send` measures request writes and flush, not the full upstream round trip. Response handling has a separate span.
 
 The supervisor owns the request trace. A valid workload `traceparent`, sampled or unsampled, becomes an explicitly untrusted link, never its parent. Invalid or duplicate context is ignored; workload `tracestate` is not adopted. Your backend may show the agent and supervisor as separate linked traces rather than one nested tree.
 
