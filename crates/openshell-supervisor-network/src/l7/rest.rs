@@ -8974,12 +8974,38 @@ mod tests {
             );
         }
         let events = capture.events.json_events();
+        let http: Vec<_> = events
+            .iter()
+            .filter(|event| event["class_uid"] == 4002)
+            .collect();
+        let primary: Vec<_> = http
+            .iter()
+            .filter(|event| event["unmapped"]["http_event_kind"] == "request")
+            .collect();
+        let companions: Vec<_> = http
+            .iter()
+            .filter(|event| event["unmapped"]["http_event_kind"] == "middleware_invocation")
+            .collect();
+        assert_eq!(primary.len(), 1);
+        assert_eq!(companions.len(), 1);
+        assert_eq!(http.len(), primary.len() + companions.len());
+        assert_eq!(primary[0]["http_response"]["code"], 502);
+        assert_eq!(companions[0]["http_response"]["code"], 200);
+        assert_eq!(companions[0]["unmapped"]["middleware_phase"], "response");
+        assert_eq!(companions[0]["unmapped"]["http_hook_version"], "2");
+        assert_eq!(companions[0]["unmapped"]["middleware_config"], "response");
         assert_eq!(
-            events
-                .iter()
-                .filter(|event| event["class_uid"] == 4002)
-                .count(),
-            1
+            companions[0]["unmapped"]["middleware_implementation"],
+            "test/session-echo"
+        );
+        assert_eq!(
+            companions[0]["unmapped"]["response_middleware_outcome"],
+            "failclosed"
+        );
+        assert_eq!(companions[0]["unmapped"]["failed"], true);
+        assert_eq!(
+            companions[0]["metadata"]["correlation_uid"],
+            primary[0]["metadata"]["correlation_uid"]
         );
         assert!(
             !events
@@ -9821,9 +9847,14 @@ mod tests {
                 reason_code: Some("stable_reason".into()),
                 failure_category: Some("timeout".into()),
             }],
-            true,
         );
-        let json = events[0].to_json().unwrap().to_string();
+        let event = events[0].to_json().unwrap();
+        assert_eq!(
+            event["unmapped"]["http_event_kind"],
+            "middleware_invocation"
+        );
+        assert_eq!(event["unmapped"]["middleware_phase"], "response");
+        let json = event.to_string();
         for forbidden in [
             "secret-response-body",
             "authorization",
@@ -9876,7 +9907,6 @@ mod tests {
                     &target,
                     200,
                     std::slice::from_ref(&invocation),
-                    true,
                 )
                 .len(),
                 1

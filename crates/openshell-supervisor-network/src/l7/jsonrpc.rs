@@ -8,7 +8,7 @@ use std::{collections::HashMap, fmt};
 use miette::Result;
 use openshell_core::mcp::{MAX_MCP_LEGACY_BATCH_MESSAGES, McpProtocolVersion};
 use serde::de::{DeserializeSeed, MapAccess, SeqAccess, Visitor};
-use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::io::AsyncRead;
 use tower_mcp_types::{
     inspection::{
         JsonRpcEnvelope, JsonRpcPayload, McpCallKind, McpDirection, McpInspection,
@@ -114,7 +114,7 @@ pub struct JsonRpcHttpRequest {
     pub info: JsonRpcRequestInfo,
 }
 
-pub(crate) async fn inspect_jsonrpc_http_request<C: AsyncRead + AsyncWrite + Unpin + Send>(
+pub(crate) async fn inspect_jsonrpc_http_request<C: AsyncRead + Unpin>(
     client: &mut C,
     request: &mut L7Request,
     max_body_bytes: usize,

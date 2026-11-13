@@ -66,10 +66,12 @@ L4 and passthrough traffic do not provide this header guarantee.
 
 The audit state commits one primary HTTP Activity record when the final response
 head is written, with an early-termination fallback. It retains the original
-request and process context while consolidating middleware and credential
-outcomes. Routine outcomes do not add records; existing security findings and
-post-header failure records remain distinct. A process crash or indefinitely
-hung request cannot be finalized by the fallback.
+request and process context. Middleware invocation records remain separate,
+request-correlated observations, including after the primary is committed. They
+retain attribution and transformation details without changing the final
+response status or consuming the late-failure budget. Security findings remain
+separate. A process crash or indefinitely hung request cannot be finalized by
+the fallback.
 
 Request IDs and audit outcomes do not depend on OpenTelemetry, sampling or
 collector availability. Inspected requests have a supervisor-owned request span
