@@ -1684,7 +1684,9 @@ where
         };
         let mut jsonrpc_info = if config.protocol.is_jsonrpc_family() {
             if crate::l7::jsonrpc::jsonrpc_receive_stream_request(&req) {
-                Some(crate::l7::jsonrpc::JsonRpcRequestInfo::receive_stream())
+                Some(crate::l7::correlation::jsonrpc::receive_stream(
+                    crate::l7::jsonrpc::JsonRpcInspectionOptions::for_config(config),
+                ))
             } else {
                 match crate::l7::http::read_body_for_inspection(
                     client,
@@ -3109,17 +3111,33 @@ where
             .endpoint_observation_tx
             .as_ref()
             .and_then(EndpointObservationSender::capture);
-        let parsed = match crate::l7::jsonrpc::parse_jsonrpc_http_request(
-            client,
-            config.json_rpc_max_body_bytes,
-            crate::l7::path::CanonicalizeOptions {
+        let provider =
+            crate::l7::rest::RestProvider::with_options(crate::l7::path::CanonicalizeOptions {
                 allow_encoded_slash: config.allow_encoded_slash,
                 ..Default::default()
-            },
-            crate::l7::jsonrpc::JsonRpcInspectionOptions::for_config(config),
-        )
-        .await
-        {
+            });
+        // Retain the scope while body-parse failures are audited.
+        let mut correlation = None;
+        let parsed: Result<_> = async {
+            let Some(mut request) = provider.parse_request(client).await? else {
+                return Ok(None);
+            };
+            let request_correlation = RequestCorrelation::new(&request, ctx);
+            correlation = Some(request_correlation);
+            let info = crate::l7::jsonrpc::inspect_jsonrpc_http_request_body(
+                client,
+                &mut request,
+                config.json_rpc_max_body_bytes,
+                crate::l7::jsonrpc::JsonRpcInspectionOptions::for_config(config),
+            )
+            .await?;
+            Ok(Some(crate::l7::jsonrpc::JsonRpcHttpRequest {
+                request,
+                info,
+            }))
+        }
+        .await;
+        let parsed = match parsed {
             Ok(Some(parsed)) => parsed,
             Ok(None) => return Ok(()),
             Err(e) => {
@@ -3141,7 +3159,7 @@ where
 
         let req = parsed.request;
         let jsonrpc_info = parsed.info;
-        let correlation = RequestCorrelation::new(&req, ctx);
+        let correlation = correlation.expect("a parsed request has a correlation scope");
         let capture_error = |error| correlation.capture_error(error);
         let observer = EndpointObserver::begin_captured(
             ctx.endpoint_observation_tx.as_ref(),
