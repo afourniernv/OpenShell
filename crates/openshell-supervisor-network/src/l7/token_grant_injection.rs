@@ -26,7 +26,7 @@ use openshell_ocsf::{
 };
 use tracing::{Instrument as _, warn};
 
-use crate::l7::correlation::{RequestCorrelation, RequestStage};
+use crate::l7::correlation::{RequestCorrelation, RequestStage, record_credential_preparation};
 use crate::l7::provider::L7Request;
 use crate::l7::relay::L7EvalContext;
 
@@ -347,12 +347,31 @@ async fn inject_or_report(
     let result = match selected {
         Ok(credentials) => {
             inject_selected(req, ctx, credentials, request_id, correlation)
-                .instrument(span)
+                .instrument(span.clone())
                 .await
         }
         Err(error) => span.in_scope(|| Err(error)),
     };
+    record_credential_preparation(
+        &span,
+        "token_grant",
+        "header",
+        if result.is_ok() {
+            "prepared"
+        } else {
+            "refused"
+        },
+    );
+    span.record(
+        "otel.status_code",
+        if result.is_ok() { "OK" } else { "ERROR" },
+    );
     if let Err(error) = &result {
+        span.record("openshell.credential.failure_code", error.failure().code());
+        span.record(
+            "openshell.credential.failure_stage",
+            error.failure().stage().code(),
+        );
         report_refused_grant(ctx, &method, &request_path, request_id, error, correlation);
     }
     if let Some((sender, context)) = ctx

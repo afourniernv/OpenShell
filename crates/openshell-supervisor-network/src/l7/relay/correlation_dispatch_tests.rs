@@ -514,12 +514,22 @@ network_policies:
 
 #[tokio::test]
 async fn inspected_allow_creates_only_the_stages_that_run() {
-    for sampled in [true, false] {
+    for (sampled, credential) in [(true, false), (false, false), (true, true)] {
+        let mut fixture = rest_fixture("POST", false);
+        let authorization = if credential {
+            let (_, resolver) = openshell_core::secrets::SecretResolver::from_provider_env(
+                std::iter::once(("PRESENT".into(), "SENTINEL-CREDENTIAL".into())).collect(),
+            );
+            fixture.ctx.secret_resolver = resolver.map(Arc::new);
+            "Authorization: Basic dXNlcjpvcGVuc2hlbGw6cmVzb2x2ZTplbnY6UFJFU0VOVA==\r\n"
+        } else {
+            ""
+        };
         let evidence = capture_request_spans(
             sampled,
             Box::pin(run_exchange(
-                rest_fixture("POST", false),
-                request("rest.example.test", "/item", "", "{}"),
+                fixture,
+                request("rest.example.test", "/item", authorization, "{}"),
                 Some(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"),
             )),
         )
@@ -543,9 +553,29 @@ async fn inspected_allow_creates_only_the_stages_that_run() {
                 ("openshell.http.response", true),
                 ("openshell.middleware.request", false),
                 ("openshell.middleware.response", false),
-                ("openshell.credential.prepare", false),
+                ("openshell.credential.prepare", credential),
             ] {
                 assert_eq!(names.contains(&name), expected, "{name}: {names:?}");
+            }
+            if credential {
+                let preparation = evidence
+                    .spans
+                    .iter()
+                    .find(|span| span.name == "openshell.credential.prepare")
+                    .unwrap();
+                assert_eq!(
+                    span_attribute(preparation, "openshell.credential.preparation")
+                        .unwrap()
+                        .as_str(),
+                    "prepared"
+                );
+                assert!(
+                    String::from_utf8_lossy(&evidence.output.forwarded)
+                        .contains("Basic dXNlcjpTRU5USU5FTC1DUkVERU5USUFM")
+                );
+                let metadata = format!("{:?}", evidence.spans);
+                assert!(!metadata.contains("SENTINEL-CREDENTIAL"));
+                assert!(!metadata.contains("dXNlcjpTRU5USU5FTC1DUkVERU5USUFM"));
             }
         }
         let records = assert_control_records(&evidence, &[("l7", "Allowed")], &[], "/item");

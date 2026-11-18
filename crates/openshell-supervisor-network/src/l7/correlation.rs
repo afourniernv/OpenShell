@@ -83,6 +83,17 @@ pub fn record_current_failure(outcome: HttpOutcome, reason: &'static str) {
     }
 }
 
+pub fn record_credential_preparation(
+    span: &tracing::Span,
+    mechanism: &'static str,
+    placement: &'static str,
+    preparation: &'static str,
+) {
+    span.record("openshell.credential.mechanism", mechanism);
+    span.record("openshell.credential.placement", placement);
+    span.record("openshell.credential.preparation", preparation);
+}
+
 fn enrich_request(event: &mut openshell_ocsf::BaseEventData) {
     let Some(scope) = current_request().filter(|scope| scope.inspected) else {
         return;

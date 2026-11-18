@@ -95,6 +95,20 @@ impl RequestTrace {
         if self.span.is_disabled() || !self.span.context().span().span_context().is_valid() {
             return Span::none();
         }
+        if matches!(stage, RequestStage::CredentialPrepare) {
+            return tracing::info_span!(
+                parent: &self.span,
+                "openshell.http.stage",
+                otel.name = stage.name(),
+                otel.status_code = tracing::field::Empty,
+                openshell.request.failure_reason = tracing::field::Empty,
+                openshell.credential.mechanism = tracing::field::Empty,
+                openshell.credential.placement = tracing::field::Empty,
+                openshell.credential.preparation = tracing::field::Empty,
+                openshell.credential.failure_code = tracing::field::Empty,
+                openshell.credential.failure_stage = tracing::field::Empty,
+            );
+        }
         tracing::info_span!(
             parent: &self.span,
             "openshell.http.stage",
