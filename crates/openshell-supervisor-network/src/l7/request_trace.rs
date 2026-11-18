@@ -95,6 +95,20 @@ impl RequestTrace {
         if self.span.is_disabled() || !self.span.context().span().span_context().is_valid() {
             return Span::none();
         }
+        if matches!(stage, RequestStage::Response) {
+            return tracing::info_span!(
+                parent: &self.span,
+                "openshell.http.stage",
+                otel.name = stage.name(),
+                otel.status_code = tracing::field::Empty,
+                openshell.request.failure_reason = tracing::field::Empty,
+                openshell.response.wire_bytes_written = tracing::field::Empty,
+                openshell.response.delivery_outcome = tracing::field::Empty,
+                openshell.response.io_error_operation = tracing::field::Empty,
+                openshell.response.upstream_status_code = tracing::field::Empty,
+                openshell.response.selected_status_code = tracing::field::Empty,
+            );
+        }
         tracing::info_span!(
             parent: &self.span,
             "openshell.http.stage",

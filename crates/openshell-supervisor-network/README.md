@@ -94,3 +94,9 @@ filtering preserves raw HTTP bytes
 and borrows unchanged header blocks. It removes only protected receipt fields
 and their `Connection` or `Trailer` nominations, including folded continuations,
 without adding general response-header validation.
+
+The existing response stage observes accepted wire bytes, downstream I/O
+failures and cancellation without changing relay results or synthesizing audit
+records. `completed` requires observed framing completion or close-delimited EOF;
+ambiguous successful returns, including middleware replacement paths, remain
+`returned`. Accepted writes include headers and framing, not proof of peer receipt.

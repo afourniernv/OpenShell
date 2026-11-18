@@ -3,6 +3,9 @@
 
 //! HTTP response relay and pre-return middleware integration.
 
+mod delivery;
+#[cfg(test)]
+mod delivery_tests;
 mod http_hooks;
 
 use super::*;
@@ -80,6 +83,34 @@ where
     U: AsyncRead + Unpin,
     C: AsyncWrite + Unpin,
 {
+    let span = options
+        .correlation
+        .map_or_else(tracing::Span::none, |_| tracing::Span::current());
+    let mut upstream = delivery::ResponseReader::new(upstream);
+    let mut client = delivery::ResponseWriter::new(client, span);
+    let result = relay_response_inner(
+        request_method,
+        &mut upstream,
+        &mut client,
+        options,
+        response_middleware,
+    )
+    .await;
+    client.finish(result.is_err());
+    result
+}
+
+async fn relay_response_inner<U, C>(
+    request_method: &str,
+    upstream: &mut delivery::ResponseReader<'_, U>,
+    client: &mut delivery::ResponseWriter<'_, C>,
+    options: RelayResponseOptions<'_>,
+    response_middleware: Option<HttpResponseMiddlewareRelay<'_>>,
+) -> Result<RelayOutcome>
+where
+    U: AsyncRead + Unpin,
+    C: AsyncWrite + Unpin,
+{
     let started_at = std::time::Instant::now();
     let mut buf = Vec::with_capacity(4096);
     let mut tmp = [0u8; 1024];
@@ -131,6 +162,7 @@ where
             if !buf.is_empty() {
                 client.write_all(&buf).await.into_diagnostic()?;
             }
+            client.outcome("incomplete");
             return Ok(RelayOutcome::Consumed);
         }
         buf.extend_from_slice(&tmp[..n]);
@@ -149,6 +181,7 @@ where
     // Parse response framing
     let header_str = String::from_utf8_lossy(&buf[..header_end]);
     let observed_status = parse_observed_http_status_code(&header_str);
+    client.upstream_status(observed_status);
     if let Some(observer) = options.observer.as_ref() {
         match observed_status {
             Some(status_code) if status_code < 400 => {
@@ -181,6 +214,7 @@ where
     // upgraded protocol and must be forwarded before switching.
     if status_code == 101 {
         if !options.client_requested_upgrade {
+            client.outcome("incomplete");
             return Ok(RelayOutcome::Consumed);
         }
         let (websocket_permessage_deflate, websocket_subprotocol) = validate_websocket_response(
@@ -189,6 +223,7 @@ where
             options.websocket.as_ref(),
         )?;
         let final_head = final_response_head(&buf[..header_end], options.correlation);
+        client.selected_status(observed_status);
         client.write_all(&final_head).await.into_diagnostic()?;
         client.flush().await.into_diagnostic()?;
         let overflow = buf[header_end..].to_vec();
@@ -198,6 +233,7 @@ where
             "101 Switching Protocols — signaling protocol upgrade"
         );
         record_allowed_response(options.correlation);
+        client.outcome("upgraded");
         return Ok(RelayOutcome::Upgraded {
             overflow,
             websocket_permessage_deflate,
@@ -229,6 +265,7 @@ where
     }
 
     let final_head = final_response_head(&buf[..header_end], options.correlation);
+    client.selected_status(observed_status);
 
     // Bodiless responses (HEAD, 1xx, 204, 304): forward headers only, skip body
     if is_bodiless_response(request_method, status_code) {
@@ -236,6 +273,11 @@ where
         let outcome =
             finish_response(client, server_wants_close || http_10_closes_by_default).await?;
         record_allowed_response(options.correlation);
+        client.outcome(if status_code >= 200 {
+            "completed"
+        } else {
+            "returned"
+        });
         return Ok(outcome);
     }
 
@@ -268,6 +310,11 @@ where
             client.flush().await.into_diagnostic()?;
             client.shutdown().await.into_diagnostic()?;
             record_allowed_response(options.correlation);
+            client.outcome(if upstream.saw_eof() {
+                "completed"
+            } else {
+                "incomplete"
+            });
             return Ok(RelayOutcome::Consumed);
         }
         // No Connection: close — an HTTP/1.1 keep-alive server that omits
@@ -277,6 +324,7 @@ where
         client.write_all(&final_head).await.into_diagnostic()?;
         client.flush().await.into_diagnostic()?;
         record_allowed_response(options.correlation);
+        client.outcome("returned");
         return Ok(RelayOutcome::Reusable);
     }
 
@@ -317,6 +365,7 @@ where
 
     let outcome = finish_response(client, server_wants_close || http_10_closes_by_default).await?;
     record_allowed_response(options.correlation);
+    client.outcome("completed");
     Ok(outcome)
 }
 
@@ -2878,7 +2927,7 @@ mod tests {
         )
     }
 
-    fn test_correlation(request_id: &str) -> crate::l7::correlation::RequestCorrelation {
+    pub(super) fn test_correlation(request_id: &str) -> crate::l7::correlation::RequestCorrelation {
         test_correlation_for_method(request_id, "GET")
     }
 
