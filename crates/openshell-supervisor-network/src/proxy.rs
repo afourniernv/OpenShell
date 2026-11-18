@@ -5989,6 +5989,7 @@ async fn handle_forward_proxy_inner(
     } else {
         crate::l7::correlation::RequestCorrelation::uninspected()
     };
+    correlation.record_policy_generation(forward_generation_guard.captured_generation());
     let request_correlation = inspected.then_some(&correlation);
     let receipt_id =
         request_correlation.map(crate::l7::correlation::RequestCorrelation::request_id);
@@ -6100,6 +6101,7 @@ async fn handle_forward_proxy_inner(
             .await?;
             return Ok(());
         };
+        correlation.record_selected_endpoint(&l7_config.config);
         endpoint_observer = crate::l7::EndpointObserver::begin_captured(
             l7_ctx.endpoint_observation_tx.as_ref(),
             &l7_config.config,

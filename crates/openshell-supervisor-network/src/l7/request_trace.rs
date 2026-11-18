@@ -68,6 +68,11 @@ impl RequestTrace {
             openshell.request.outcome = tracing::field::Empty,
             openshell.request.failure_reason = tracing::field::Empty,
             http.response.status_code = tracing::field::Empty,
+            openshell.policy.runtime_generation = tracing::field::Empty,
+            openshell.policy.hash = tracing::field::Empty,
+            openshell.endpoint.id = tracing::field::Empty,
+            openshell.provider.environment_revision = tracing::field::Empty,
+            openshell.provider.credential_installation_id = tracing::field::Empty,
             otel.kind = "server",
             otel.status_code = tracing::field::Empty,
         );

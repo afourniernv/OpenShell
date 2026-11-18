@@ -85,6 +85,164 @@ fn unused_request_scope_does_not_create_an_audit_record() {
     assert!(capture.json_events().is_empty());
 }
 
+fn resource_endpoint(policy_hash: &str, endpoint_id: &str) -> crate::l7::L7EndpointConfig {
+    crate::l7::parse_l7_config(
+        &regorus::Value::from_json_str(
+            &serde_json::json!({
+                "protocol": "rest", "policy_hash": policy_hash, "endpoint_id": endpoint_id,
+            })
+            .to_string(),
+        )
+        .unwrap(),
+    )
+    .unwrap()
+}
+
+#[tokio::test]
+async fn resource_snapshots_enrich_only_subsequent_records_without_trace_dependency() {
+    use openshell_core::provider_credentials::ProviderCredentialState;
+    use opentelemetry_sdk::trace::Sampler;
+
+    let _lock = openshell_otel_test_support::tracing_test_lock().await;
+    for sampler in [None, Some(Sampler::AlwaysOn)] {
+        let sampled = sampler.is_some();
+        let capture = RequestTracing::new(sampler);
+        let state = ProviderCredentialState::from_child_env_snapshot(
+            u64::MAX,
+            [("SECRET".into(), "RESOURCE-SECRET-SENTINEL".into())].into(),
+        );
+        let before = state.snapshot();
+        let after = scope_connection(async {
+            let mut ctx = L7EvalContext {
+                provider_credentials: Some(state.clone()),
+                ..context()
+            };
+            let correlation = RequestCorrelation::new(&request(), &ctx);
+            correlation.record_policy_generation(u64::MAX);
+            correlation.record_selected_endpoint(&resource_endpoint("hash-a", "endpoint-a"));
+            correlation.emit(allowed());
+            crate::l7::token_grant_injection::pin_live_credentials(&mut ctx).unwrap();
+            correlation.emit(deny());
+            state.install_child_env_snapshot(u64::MAX - 1, std::collections::HashMap::new());
+            let after = state.snapshot();
+            crate::l7::token_grant_injection::pin_live_credentials(&mut ctx).unwrap();
+            correlation.record_policy_generation(2);
+            correlation.record_selected_endpoint(&resource_endpoint("hash-b", "endpoint-b"));
+            correlation.emit(allowed());
+            correlation.record_outcome(HttpOutcome::Allowed);
+            drop(correlation);
+
+            let next = RequestCorrelation::new(&request(), &ctx);
+            next.record_policy_generation(2);
+            next.record_selected_endpoint(&resource_endpoint("hash-b", "endpoint-b"));
+            crate::l7::token_grant_injection::pin_live_credentials(&mut ctx).unwrap();
+            next.emit(allowed());
+            next.record_outcome(HttpOutcome::Allowed);
+            after
+        })
+        .with_subscriber(capture.subscriber())
+        .await;
+        let events = capture.events.json_events();
+        assert_eq!(events.len(), 4);
+        assert!(events[0]["unmapped"]["provider_environment_revision"].is_null());
+        assert!(events[0]["unmapped"]["provider_credential_installation_id"].is_null());
+        for (index, event) in events[..3].iter().enumerate() {
+            assert_eq!(
+                event["unmapped"]["policy_runtime_generation"],
+                u64::MAX.to_string()
+            );
+            assert_eq!(event["unmapped"]["policy_hash"], "hash-a");
+            assert_eq!(event["unmapped"]["endpoint_id"], "endpoint-a");
+            assert_eq!(event["unmapped"]["request_sequence"], index + 1);
+            assert_eq!(
+                event["metadata"]["correlation_uid"],
+                events[0]["metadata"]["correlation_uid"]
+            );
+        }
+        for event in &events[1..3] {
+            assert_eq!(
+                event["unmapped"]["provider_environment_revision"],
+                u64::MAX.to_string()
+            );
+            assert_eq!(
+                event["unmapped"]["provider_credential_installation_id"],
+                before.installation_id
+            );
+        }
+        assert_eq!(events[1]["action"], "Denied");
+        assert_eq!(events[1]["unmapped"]["middleware_phase"], "response");
+        assert_eq!(events[1]["unmapped"]["transformed"], true);
+        assert_eq!(events[3]["unmapped"]["policy_runtime_generation"], "2");
+        assert_eq!(events[3]["unmapped"]["policy_hash"], "hash-b");
+        assert_eq!(events[3]["unmapped"]["endpoint_id"], "endpoint-b");
+        assert_eq!(
+            events[3]["unmapped"]["provider_environment_revision"],
+            (u64::MAX - 1).to_string()
+        );
+        assert_eq!(
+            events[3]["unmapped"]["provider_credential_installation_id"],
+            after.installation_id
+        );
+        assert_eq!(events[3]["unmapped"]["request_sequence"], 1);
+        assert_ne!(
+            events[0]["metadata"]["correlation_uid"],
+            events[3]["metadata"]["correlation_uid"]
+        );
+        let spans = capture.spans();
+        assert_eq!(spans.len(), usize::from(sampled) * 2);
+        if sampled {
+            let root = spans
+                .iter()
+                .find(|span| {
+                    span_attribute(span, "openshell.request.id")
+                        .unwrap()
+                        .as_str()
+                        == events[0]["metadata"]["correlation_uid"].as_str().unwrap()
+                })
+                .unwrap();
+            for (key, expected) in [
+                ("openshell.policy.runtime_generation", u64::MAX.to_string()),
+                ("openshell.policy.hash", "hash-a".into()),
+                ("openshell.endpoint.id", "endpoint-a".into()),
+                (
+                    "openshell.provider.environment_revision",
+                    u64::MAX.to_string(),
+                ),
+                (
+                    "openshell.provider.credential_installation_id",
+                    before.installation_id.clone(),
+                ),
+            ] {
+                assert_eq!(
+                    span_attribute(root, key).unwrap().as_str(),
+                    expected,
+                    "{key}"
+                );
+            }
+        }
+        assert!(!format!("{events:?}{spans:?}").contains("RESOURCE-SECRET-SENTINEL"));
+        capture.shutdown();
+    }
+}
+
+#[tokio::test]
+async fn uninspected_traffic_does_not_claim_resource_selections() {
+    let capture = OcsfCapture::default();
+    let _subscriber = capture.install();
+    scope_connection(async {
+        let correlation = RequestCorrelation::uninspected();
+        correlation.record_policy_generation(4);
+        correlation.record_selected_endpoint(&resource_endpoint("hash", "endpoint"));
+        record_current_provider_snapshot(5, "installation");
+        correlation.emit(allowed());
+    })
+    .await;
+    let events = capture.json_events();
+    assert_eq!(events.len(), 1);
+    assert!(events[0]["metadata"]["correlation_uid"].is_null());
+    assert!(events[0]["unmapped"].is_null());
+}
+
 #[test]
 fn request_join_does_not_depend_on_export_and_never_creates_denial_spans() {
     use opentelemetry_sdk::trace::Sampler;

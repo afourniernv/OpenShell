@@ -94,3 +94,10 @@ filtering preserves raw HTTP bytes
 and borrows unchanged header blocks. It removes only protected receipt fields
 and their `Connection` or `Trailer` nominations, including folded continuations,
 without adding general response-header validation.
+
+The request scope pins the captured policy generation, selected endpoint and
+first credential snapshot. Existing audit records gain only the selections
+known at their emission; earlier records are not rewritten after a later lookup.
+The provider revision fingerprints the complete credential environment, while
+the installation ID distinguishes repairs at the same revision. Neither proves
+that a credential was injected.

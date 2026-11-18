@@ -177,6 +177,10 @@ pub fn pin_live_credentials(ctx: &mut L7EvalContext) -> Option<Arc<ProviderCrede
         .map(ProviderCredentialState::snapshot)?;
     ctx.provider_credential_revision = Some(snapshot.revision);
     ctx.provider_credential_installation_id = Some(snapshot.installation_id.clone());
+    crate::l7::correlation::record_current_provider_snapshot(
+        snapshot.revision,
+        &snapshot.installation_id,
+    );
     Some(snapshot)
 }
 

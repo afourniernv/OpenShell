@@ -375,6 +375,23 @@ collection. To count policy outcomes, group by `metadata.correlation_uid` and
 select the actual policy or firewall control record. Do not count every HTTP
 Activity or `decision` record as another request.
 
+Request-scoped records also carry the selections known when they were emitted:
+
+| `unmapped` field | Meaning |
+|---|---|
+| `policy_runtime_generation` | Policy generation captured for the request. |
+| `policy_hash` | Canonical hash of the selected policy. |
+| `endpoint_id` | Selected endpoint identity. |
+| `provider_environment_revision` | Fingerprint of the complete pinned credential environment, not an individual provider revision. |
+| `provider_credential_installation_id` | Identifies the pinned credential installation, including repairs at the same revision. |
+
+Generation and revision values are decimal strings to preserve their full
+precision. Fields remain absent until selection occurs, so an early policy
+record can lack provider metadata present on a later credential record. These
+fields do not prove that a credential was injected or a request was delivered.
+The request span records the same selections under `openshell.policy.*`,
+`openshell.endpoint.id` and `openshell.provider.*`.
+
 Errors that end an inspected request retain that request's ID. A policy reload
 records the active request before closing it; an idle connection has no request
 ID. The `101` upgrade handoff record shares the HTTP handshake ID. Later

@@ -3,6 +3,8 @@
 
 //! Request receipts and emission-time correlation without changing audit records.
 
+mod resources;
+
 use std::fmt;
 use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -15,6 +17,7 @@ use crate::l7::provider::L7Request;
 use crate::l7::relay::L7EvalContext;
 pub use crate::l7::request_trace::RequestStage;
 use crate::l7::request_trace::RequestTrace;
+use resources::RequestResources;
 
 tokio::task_local! {
     static CURRENT_REQUEST: Arc<Mutex<Option<Arc<RequestScope>>>>;
@@ -83,6 +86,14 @@ pub fn record_current_failure(outcome: HttpOutcome, reason: &'static str) {
     }
 }
 
+pub fn record_current_provider_snapshot(revision: u64, installation_id: &str) {
+    if let Some(scope) = current_request().filter(|scope| scope.inspected) {
+        scope
+            .resources
+            .record_provider(revision, installation_id, &scope.span());
+    }
+}
+
 fn enrich_request(event: &mut openshell_ocsf::BaseEventData) {
     let Some(scope) = current_request().filter(|scope| scope.inspected) else {
         return;
@@ -97,6 +108,7 @@ fn enrich_request(event: &mut openshell_ocsf::BaseEventData) {
             .or_insert_with(|| event_kind.into());
         fields.insert("request_sequence".into(), sequence.into());
     }
+    scope.resources.enrich(event);
 }
 
 fn default_event_kind(class_uid: u32) -> &'static str {
@@ -125,6 +137,7 @@ struct RequestScope {
     request_id: String,
     inspected: bool,
     sequence: AtomicU64,
+    resources: RequestResources,
     trace: Mutex<Option<RequestTrace>>,
 }
 
@@ -242,6 +255,7 @@ impl RequestCorrelation {
             request_id: uuid::Uuid::new_v4().to_string(),
             inspected: false,
             sequence: AtomicU64::new(1),
+            resources: RequestResources::default(),
             trace: Mutex::new(None),
         })
     }
@@ -262,6 +276,7 @@ impl RequestCorrelation {
             request_id,
             inspected: true,
             sequence: AtomicU64::new(1),
+            resources: RequestResources::default(),
             trace: Mutex::new(Some(trace)),
         })
     }
@@ -282,6 +297,22 @@ impl RequestCorrelation {
 
     pub(crate) fn request_id(&self) -> &str {
         &self.scope.request_id
+    }
+
+    pub(crate) fn record_policy_generation(&self, generation: u64) {
+        if self.scope.inspected {
+            self.scope
+                .resources
+                .record_generation(generation, &self.scope.span());
+        }
+    }
+
+    pub(crate) fn record_selected_endpoint(&self, config: &crate::l7::L7EndpointConfig) {
+        if self.scope.inspected {
+            self.scope
+                .resources
+                .record_endpoint(config, &self.scope.span());
+        }
     }
 
     pub(crate) fn capture_error(&self, error: miette::Report) -> miette::Report {

@@ -12,7 +12,6 @@
 
 use miette::Result;
 use openshell_core::host_pattern::HostSelector;
-use openshell_core::mcp::is_mcp_protocol;
 use openshell_core::policy::{
     FilesystemPolicy, LandlockCompatibility, LandlockPolicy, ProcessPolicy,
 };
@@ -2455,7 +2454,16 @@ fn proto_to_opa_data_json(proto: &ProtoSandboxPolicy, entrypoint_pid: u32) -> St
                     // Every inspected protocol must bind grant reporting to the
                     // policy selected before credential acquisition.
                     ep["policy_hash"] = policy_hash.clone().into();
-                    if is_mcp_protocol(&e.protocol) {
+                    if matches!(
+                        PolicyL7Protocol::parse(&e.protocol),
+                        Some(
+                            PolicyL7Protocol::Rest
+                                | PolicyL7Protocol::Graphql
+                                | PolicyL7Protocol::JsonRpc
+                                | PolicyL7Protocol::Mcp
+                                | PolicyL7Protocol::Websocket
+                        )
+                    ) {
                         // Derive endpoint identity from the policy endpoint while
                         // it is still available. Request handling carries this
                         // opaque value through exact path selection and never
@@ -3493,7 +3501,10 @@ mod tests {
         // this metadata independently and compare all remaining configuration.
         expected["policy_hash"] = deterministic_policy_hash(canonical_policy).into();
         assert_eq!(proto_config["policy_hash"], expected["policy_hash"]);
-        if is_mcp_protocol(&endpoint.protocol) {
+        if matches!(
+            endpoint.protocol.as_str(),
+            "rest" | "graphql" | "json-rpc" | "mcp" | "websocket"
+        ) {
             expected["endpoint_id"] = openshell_core::endpoint_status::endpoint_id(endpoint).into();
             assert_eq!(proto_config["endpoint_id"], expected["endpoint_id"]);
         } else {
@@ -8138,6 +8149,32 @@ network_policies:
             "OPA must carry the ID derived from the exact proto endpoint"
         );
         assert_eq!(l7.policy_hash, expected_hash);
+    }
+
+    #[test]
+    fn request_endpoint_identity_is_projected_for_http_inspected_protocols_only() {
+        for (protocol, inspected) in [
+            ("rest", true),
+            ("graphql", true),
+            ("json-rpc", true),
+            ("MCP", true),
+            ("websocket", true),
+            ("sql", false),
+            ("tcp", false),
+        ] {
+            let mut policy = defaultable_mcp_proto(None);
+            let endpoint = &mut policy.network_policies.get_mut("mcp").unwrap().endpoints[0];
+            endpoint.protocol = protocol.into();
+            let expected = openshell_core::endpoint_status::endpoint_id(endpoint);
+            let projected: serde_json::Value =
+                serde_json::from_str(&proto_to_opa_data_json(&policy, 0)).unwrap();
+            let endpoint = &projected["network_policies"]["mcp"]["endpoints"][0];
+            if inspected {
+                assert_eq!(endpoint["endpoint_id"], expected, "{protocol}");
+            } else {
+                assert!(endpoint.get("endpoint_id").is_none(), "{protocol}");
+            }
+        }
     }
 
     #[tokio::test]

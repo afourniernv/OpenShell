@@ -15,7 +15,7 @@ use crate::token_grant::test_support::{CacheAcquisition, CachedTokenGrantResolve
 use openshell_core::proto::{
     ProviderCredentialTokenGrant, ProviderCredentialTokenGrantType, ProviderProfileCredential,
 };
-use openshell_core::provider_credentials::ProviderCredentialState;
+use openshell_core::provider_credentials::{ProviderCredentialSnapshot, ProviderCredentialState};
 use openshell_core::token_grant_failure::{
     TokenGrantFailure, TokenGrantFailureKind, TokenGrantStage,
 };
@@ -1116,8 +1116,18 @@ async fn route_selected_keepalive_uses_live_grant_state_after_refresh() {
     keepalive_refresh(true).await;
 }
 
-async fn refresh_during_grant(same_revision_repair: bool, route_selection: bool) {
+struct RefreshVersions {
+    before: Arc<ProviderCredentialSnapshot>,
+    after: Arc<ProviderCredentialSnapshot>,
+    policy_generation: u64,
+}
+
+async fn refresh_during_grant(
+    same_revision_repair: bool,
+    route_selection: bool,
+) -> RefreshVersions {
     let fixture = refresh_fixture(route_selection);
+    let before = fixture.state.snapshot();
     let old_key = fixture.grant_key("/a/**", "a");
     fixture.resolver.hold_once.store(true, Ordering::SeqCst);
     let mut first = fixture.connect();
@@ -1136,6 +1146,7 @@ async fn refresh_during_grant(same_revision_repair: bool, route_selection: bool)
     } else {
         fixture.install(2, &[("/a/**", "a", "aud-new")]);
     }
+    let after = fixture.state.snapshot();
     let new_key = fixture.grant_key("/a/**", "a");
     assert_ne!(new_key, old_key, "replacement changes cache authority");
     fixture.resolver.release.notify_one();
@@ -1154,6 +1165,81 @@ async fn refresh_during_grant(same_revision_repair: bool, route_selection: bool)
     fixture
         .resolver
         .assert_calls(&[(&old_key, "aud-old"), (&new_key, "aud-new")]);
+    RefreshVersions {
+        before,
+        after,
+        policy_generation: fixture.generation,
+    }
+}
+
+#[tokio::test]
+async fn request_resources_keep_the_provider_installation_selected_before_refresh() {
+    use super::correlation_dispatch_tests::capture_request_spans;
+    use crate::test_support::request_tracing::span_attribute;
+
+    for same_revision_repair in [false, true] {
+        let evidence =
+            capture_request_spans(true, refresh_during_grant(same_revision_repair, true)).await;
+        let roots = evidence
+            .spans
+            .iter()
+            .filter(|span| span.name == "openshell.http.request")
+            .collect::<Vec<_>>();
+        assert_eq!(roots.len(), 2);
+        for snapshot in [&evidence.output.before, &evidence.output.after] {
+            let root = roots
+                .iter()
+                .find(|span| {
+                    span_attribute(span, "openshell.provider.credential_installation_id")
+                        .is_some_and(|value| value.as_str() == snapshot.installation_id)
+                })
+                .expect("root retains its actual selected installation");
+            assert_eq!(
+                span_attribute(root, "openshell.provider.environment_revision")
+                    .unwrap()
+                    .as_str(),
+                snapshot.revision.to_string(),
+            );
+            assert_eq!(
+                span_attribute(root, "openshell.policy.runtime_generation")
+                    .unwrap()
+                    .as_str(),
+                evidence.output.policy_generation.to_string(),
+            );
+            let receipt = span_attribute(root, "openshell.request.id")
+                .unwrap()
+                .as_str();
+            let records = evidence
+                .events
+                .iter()
+                .filter(|event| {
+                    event["metadata"]["correlation_uid"].as_str() == Some(receipt.as_ref())
+                })
+                .collect::<Vec<_>>();
+            assert!(!records.is_empty());
+            assert!(records[0]["unmapped"]["provider_credential_installation_id"].is_null());
+            let grant = records
+                .iter()
+                .find(|event| event["unmapped"]["http_event_kind"] == "token_grant")
+                .unwrap();
+            assert_eq!(
+                grant["unmapped"]["provider_environment_revision"],
+                snapshot.revision.to_string()
+            );
+            assert_eq!(
+                grant["unmapped"]["provider_credential_installation_id"],
+                snapshot.installation_id
+            );
+        }
+        assert_ne!(
+            evidence.output.before.installation_id,
+            evidence.output.after.installation_id
+        );
+        assert_eq!(
+            evidence.output.before.revision == evidence.output.after.revision,
+            same_revision_repair
+        );
+    }
 }
 
 #[tokio::test]
@@ -1212,6 +1298,64 @@ async fn policy_reload_during_grant_closes_old_tunnel_and_reconnects() {
 #[tokio::test]
 async fn route_selected_policy_reload_during_grant_closes_old_tunnel_and_reconnects() {
     policy_reload_during_grant(true).await;
+}
+
+#[tokio::test]
+async fn completed_request_resources_survive_policy_reload_and_reconnect() {
+    use super::correlation_dispatch_tests::capture_request_spans;
+    use crate::test_support::request_tracing::span_attribute;
+    use crate::test_support::response_request_id;
+
+    let evidence = capture_request_spans(true, async {
+        let mut fixture = refresh_fixture(true);
+        let old_generation = fixture.generation;
+        let mut first = fixture.connect();
+        let response = first.exchange("GET", "/a/before", true).await;
+        assert!(response.starts_with("HTTP/1.1 204"));
+        let first_id = response_request_id(response.as_bytes()).to_owned();
+
+        fixture.reload_policy();
+        assert!(first.observes_eof().await, "reload closes the idle tunnel");
+        assert_eq!(first.finish().await.requests.len(), 1);
+
+        let mut second = fixture.connect();
+        let response = second.exchange("GET", "/a/after", true).await;
+        assert!(response.starts_with("HTTP/1.1 204"));
+        let second_id = response_request_id(response.as_bytes()).to_owned();
+        assert_eq!(second.finish().await.requests.len(), 1);
+        assert_ne!(first_id, second_id);
+        [(first_id, old_generation), (second_id, fixture.generation)]
+    })
+    .await;
+    for (receipt, generation) in evidence.output {
+        let generation = generation.to_string();
+        let root = evidence
+            .spans
+            .iter()
+            .find(|span| {
+                span.name == "openshell.http.request"
+                    && span_attribute(span, "openshell.request.id")
+                        .is_some_and(|value| value.as_str() == receipt)
+            })
+            .expect("each completed request has its own trace");
+        assert_eq!(
+            span_attribute(root, "openshell.policy.runtime_generation")
+                .unwrap()
+                .as_str(),
+            generation
+        );
+        let records = evidence
+            .events
+            .iter()
+            .filter(|event| event["metadata"]["correlation_uid"] == receipt)
+            .collect::<Vec<_>>();
+        assert!(!records.is_empty());
+        assert!(
+            records
+                .iter()
+                .all(|event| { event["unmapped"]["policy_runtime_generation"] == generation })
+        );
+    }
 }
 
 fn assert_cache_acquisitions(resolver: &CachedTokenGrantResolver, expected: &[(&str, &str)]) {
