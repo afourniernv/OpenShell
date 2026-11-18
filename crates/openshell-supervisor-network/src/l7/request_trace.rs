@@ -104,6 +104,27 @@ impl RequestTrace {
         )
     }
 
+    pub(super) fn mcp_inspection_span(&self) -> Span {
+        if self.span.is_disabled() || !self.span.context().span().span_context().is_valid() {
+            return Span::none();
+        }
+        tracing::info_span!(
+            parent: &self.span,
+            "openshell.mcp.inspect",
+            otel.status_code = tracing::field::Empty,
+            openshell.request.failure_reason = tracing::field::Empty,
+            openshell.mcp.protocol = tracing::field::Empty,
+            openshell.mcp.revision = tracing::field::Empty,
+            openshell.mcp.inspection.shape = tracing::field::Empty,
+            openshell.mcp.inspection.outcome = tracing::field::Empty,
+            openshell.mcp.inspection.failure_kind = tracing::field::Empty,
+            openshell.mcp.request_count = tracing::field::Empty,
+            openshell.mcp.notification_count = tracing::field::Empty,
+            openshell.mcp.has_response = tracing::field::Empty,
+            openshell.mcp.counts_truncated = tracing::field::Empty,
+        )
+    }
+
     pub(super) fn record_status(&self, status: u16) {
         self.span
             .record("http.response.status_code", i64::from(status));

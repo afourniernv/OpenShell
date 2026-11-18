@@ -1238,6 +1238,92 @@ async fn production_single_mcp_policy_deny_correlates_record_and_receipt() {
 }
 
 #[tokio::test]
+async fn mcp_inspection_passes_join_real_policy_outcomes_without_recording_payloads() {
+    let initialize = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"DO-NOT-RECORD-CLIENT","version":"1"}}}"#;
+    let denied = r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#;
+    for (sampled, body, allowed, status) in [
+        (true, initialize, true, 200),
+        (true, denied, false, 403),
+        (true, "{DO-NOT-RECORD-BODY", false, 400),
+        (false, denied, false, 403),
+    ] {
+        let evidence = capture_request_spans(
+            sampled,
+            Box::pin(run_exchange(
+                mcp_fixture(),
+                request(
+                    "mcp.example.test",
+                    "/mcp",
+                    "MCP-Protocol-Version: 2025-11-25\r\n",
+                    body,
+                ),
+                allowed.then_some(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}"
+                        .as_slice(),
+                ),
+            )),
+        )
+        .await;
+        evidence.assert_no_deny_span(sampled);
+        assert_eq!(!evidence.output.forwarded.is_empty(), allowed);
+        assert!(
+            evidence
+                .output
+                .response
+                .starts_with(format!("HTTP/1.1 {status} ").as_bytes()),
+            "{body}: {}",
+            String::from_utf8_lossy(&evidence.output.response),
+        );
+        let receipt = request_id(&evidence.output.response);
+        assert!(!evidence.events.is_empty());
+        for event in &evidence.events {
+            assert_eq!(event["metadata"]["correlation_uid"], receipt);
+        }
+        if sampled {
+            let root = evidence
+                .spans
+                .iter()
+                .find(|span| span.name == "openshell.http.request")
+                .unwrap();
+            assert_eq!(
+                span_attribute(root, "openshell.request.outcome")
+                    .unwrap()
+                    .as_str(),
+                if allowed { "allowed" } else { "denied" }
+            );
+            let inspections = evidence
+                .spans
+                .iter()
+                .filter(|span| span.name == "openshell.mcp.inspect")
+                .collect::<Vec<_>>();
+            assert!(!inspections.is_empty());
+            for inspection in &inspections {
+                assert_eq!(inspection.parent_span_id, root.span_context.span_id());
+                assert!(inspection.start_time >= root.start_time);
+                assert!(inspection.end_time <= root.end_time);
+                assert_eq!(
+                    span_attribute(inspection, "openshell.mcp.protocol")
+                        .unwrap()
+                        .as_str(),
+                    "mcp"
+                );
+            }
+            // A valid request can be rejected by policy after inspection accepted it.
+            let expected = if body.starts_with("{DO-NOT") {
+                "rejected"
+            } else {
+                "accepted"
+            };
+            assert!(inspections.iter().any(|span| {
+                span_attribute(span, "openshell.mcp.inspection.outcome")
+                    .is_some_and(|value| value.as_str() == expected)
+            }));
+            assert!(!format!("{:?}", evidence.spans).contains("DO-NOT-RECORD"));
+        }
+    }
+}
+
+#[tokio::test]
 async fn production_single_graphql_allow_correlates_record_and_response_receipt() {
     let graphql = fixture(
         r"

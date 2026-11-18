@@ -3,6 +3,8 @@
 
 //! Request receipts and emission-time correlation without changing audit records.
 
+pub mod jsonrpc;
+
 use std::fmt;
 use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering};

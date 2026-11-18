@@ -94,3 +94,9 @@ filtering preserves raw HTTP bytes
 and borrows unchanged header blocks. It removes only protected receipt fields
 and their `Connection` or `Trailer` nominations, including folded continuations,
 without adding general response-header validation.
+
+Actual JSON-RPC/MCP body inspections have `openshell.mcp.inspect` child spans.
+Each pass reports only its mode, selected revision, message shape and bounded
+request/notification counts. Inspection acceptance does not imply policy
+approval or remote tool execution. Method/tool names, arguments and payloads
+are not added to these spans, and inspection adds no audit records.

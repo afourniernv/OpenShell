@@ -6279,7 +6279,9 @@ async fn handle_forward_proxy_inner(
                 body_length,
             };
             let info = if crate::l7::jsonrpc::jsonrpc_receive_stream_request(&jsonrpc_request) {
-                crate::l7::jsonrpc::JsonRpcRequestInfo::receive_stream()
+                crate::l7::correlation::jsonrpc::receive_stream(
+                    crate::l7::jsonrpc::JsonRpcInspectionOptions::for_config(&l7_config.config),
+                )
             } else {
                 let body = match crate::l7::http::read_body_for_inspection(
                     client,

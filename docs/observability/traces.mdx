@@ -47,6 +47,14 @@ Each component names its spans after the operation it performs:
 
 The gateway's client span and the driver's server span for a compute-driver call share the same name, which also appears in `rpc.method`. Their service names and span kinds tell them apart. A driver watch stream records a terminal status when it observes one. If the gateway stops consuming the stream first, the span status stays unset.
 
+For inspected JSON-RPC and MCP requests, `openshell.mcp.inspect` measures each
+actual body-inspection pass. It records the protocol, selected revision, message
+shape, inspection outcome and counts from at most 64 calls or notifications.
+`counts_truncated` indicates a larger batch. Names, arguments and payloads are
+not added to these spans. An accepted inspection can still be denied by policy;
+`revision_required` means the transport must select a revision before inspection
+can finish. These spans do not establish that an upstream tool executed.
+
 ## Resource Attributes
 
 Resource attributes identify which process produced a span:
