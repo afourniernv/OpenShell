@@ -1560,6 +1560,7 @@ where
             }
         };
         let correlation = RequestCorrelation::new(&req, ctx);
+        correlation.record_policy_generation(engine.generation_guard().captured_generation());
         let capture_error = |error| correlation.capture_error(error);
         if !request_authority_matches_endpoint(&req, ctx) {
             reject_request_authority_mismatch(client, ctx, &req.action, Some(&correlation))
@@ -1597,6 +1598,7 @@ where
                 .map_err(&capture_error)?;
             return Ok(());
         };
+        correlation.record_selected_endpoint(config);
         let observer = EndpointObserver::begin_captured(
             ctx.endpoint_observation_tx.as_ref(),
             config,
@@ -2586,6 +2588,8 @@ where
             }
         };
         let correlation = RequestCorrelation::new(&req, ctx);
+        correlation.record_policy_generation(engine.generation_guard().captured_generation());
+        correlation.record_selected_endpoint(config);
         let capture_error = |error| correlation.capture_error(error);
         if !request_authority_matches_endpoint(&req, ctx) {
             reject_request_authority_mismatch(client, ctx, &req.action, Some(&correlation))
@@ -3142,6 +3146,8 @@ where
         let req = parsed.request;
         let jsonrpc_info = parsed.info;
         let correlation = RequestCorrelation::new(&req, ctx);
+        correlation.record_policy_generation(engine.generation_guard().captured_generation());
+        correlation.record_selected_endpoint(config);
         let capture_error = |error| correlation.capture_error(error);
         let observer = EndpointObserver::begin_captured(
             ctx.endpoint_observation_tx.as_ref(),
@@ -3514,6 +3520,8 @@ where
             }
         };
         let correlation = RequestCorrelation::new(&req, ctx);
+        correlation.record_policy_generation(engine.generation_guard().captured_generation());
+        correlation.record_selected_endpoint(config);
         let capture_error = |error| correlation.capture_error(error);
 
         if !request_authority_matches_endpoint(&req, ctx) {
@@ -4438,6 +4446,7 @@ where
         } else {
             RequestCorrelation::uninspected()
         };
+        correlation.record_policy_generation(generation_guard.captured_generation());
         let capture_error = |error| correlation.capture_error(error);
         let receipt = inspected.then_some(&correlation);
         if !request_authority_matches_endpoint(&req, ctx) {

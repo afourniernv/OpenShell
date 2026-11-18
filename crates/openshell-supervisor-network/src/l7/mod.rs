@@ -2259,7 +2259,9 @@ mod tests {
 
     #[tokio::test]
     async fn non_mcp_endpoint_never_begins_an_observation() {
-        use openshell_core::endpoint_status::{EndpointConfigVersion, endpoint_status_channel};
+        use openshell_core::endpoint_status::{
+            EndpointConfigVersion, EndpointInventoryEntry, endpoint_status_channel,
+        };
 
         let (sender, _receiver) = endpoint_status_channel();
         sender
@@ -2268,12 +2270,15 @@ mod tests {
                     policy_hash: "policy".to_string(),
                     provider_env_revision: 1,
                 },
-                Vec::new(),
+                vec![EndpointInventoryEntry {
+                    endpoint_id: "endpoint:v1:not-mcp".to_string(),
+                    uses_provider_credentials: false,
+                }],
             )
             .await
             .expect("install MCP test configuration");
         let value = regorus::Value::from_json_str(
-            r#"{"protocol":"rest","endpoint_id":"endpoint:v1:not-mcp"}"#,
+            r#"{"protocol":"rest","endpoint_id":"endpoint:v1:not-mcp","policy_hash":"policy"}"#,
         )
         .expect("parse REST config JSON");
         let config = parse_l7_config(&value).expect("parse REST config");
