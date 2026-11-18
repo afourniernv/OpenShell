@@ -94,3 +94,8 @@ filtering preserves raw HTTP bytes
 and borrows unchanged header blocks. It removes only protected receipt fields
 and their `Connection` or `Trailer` nominations, including folded continuations,
 without adding general response-header validation.
+
+Credential preparation stages record bounded mechanism, placement and preparation
+outcomes, never credential values. A configured resolver without placeholders is
+`not_needed`; `prepared` means resolution or signing succeeded, not that the
+upstream received the request. Transport failures belong to their own stages.

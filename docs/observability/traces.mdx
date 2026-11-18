@@ -75,6 +75,8 @@ The CLI forwards `TRACEPARENT` and `TRACESTATE` from its environment on gateway 
 
 The gateway also passes its trace context to compute drivers, so driver spans appear in the same trace as the gateway request that caused them. Built-in drivers export their spans through the gateway's process. Managed external drivers receive the trace endpoint, gateway name, and compute driver from the gateway. Drivers that you run yourself own their telemetry configuration.
 
+Credential stages record `openshell.credential.mechanism`, `openshell.credential.placement` and `openshell.credential.preparation`, without credential values. Preparation can be `prepared`, `not_needed`, `refused`, `failed` or `stale`. `prepared` means resolution or signing succeeded, not that the upstream received the request. Token-grant failures also carry bounded failure codes and stages.
+
 ## Next Steps
 
 - Configure [OTLP export](/how-it-works/gateways/configuration#otlp-export), including sampling and the `OTEL_*` variables the gateway honors.

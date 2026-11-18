@@ -335,14 +335,17 @@ async fn forward_case(ip: Ipv4Addr, outcome: Outcome, sampler: Option<Sampler>) 
         Outcome::PolicyDenied | Outcome::MalformedQueryPolicyDenied
     );
     let credential_failure = matches!(outcome, Outcome::UnresolvedCredential);
-    let secret_resolver = credential_failure.then(|| {
-        let (_, resolver) = SecretResolver::from_provider_env(
-            [("OTHER_KEY".into(), "inert-test-value".into())]
-                .into_iter()
-                .collect(),
-        );
-        Arc::new(resolver.expect("test credential resolver"))
-    });
+    let credential_prepared = matches!(outcome, Outcome::Allowed | Outcome::UpstreamClosed);
+    let secret_resolver =
+        (credential_failure || credential_prepared || matches!(outcome, Outcome::AuditDenied))
+            .then(|| {
+                let (_, resolver) = SecretResolver::from_provider_env(
+                    [("PRESENT".into(), "SENTINEL-CREDENTIAL".into())]
+                        .into_iter()
+                        .collect(),
+                );
+                Arc::new(resolver.expect("test credential resolver"))
+            });
     let mode = if matches!(outcome, Outcome::AuditDenied) {
         "audit"
     } else {
@@ -399,6 +402,12 @@ network_policies:
     let target = format!("http://{ip}:{port}{path}?{query}");
     let credential_header = if credential_failure {
         "Authorization: Bearer openshell:resolve:env:MISSING\r\n"
+    } else if matches!(outcome, Outcome::Allowed) {
+        "Authorization: Basic dXNlcjpvcGVuc2hlbGw6cmVzb2x2ZTplbnY6UFJFU0VOVA==\r\n"
+    } else if credential_prepared {
+        "Authorization: Bearer openshell:resolve:env:PRESENT\r\n"
+    } else if matches!(outcome, Outcome::AuditDenied) {
+        "Proxy-Authorization: Bearer openshell:resolve:env:PRESENT\r\nX-Removed: openshell:resolve:env:PRESENT\r\nConnection: x-removed\r\n"
     } else {
         ""
     };
@@ -458,6 +467,16 @@ network_policies:
                             .starts_with(&format!("GET {path}?token=SENTINEL-QUERY HTTP/1.1\r\n"))
                     );
                     assert!(!String::from_utf8_lossy(&bytes).contains("forged-receipt"));
+                    assert_eq!(
+                        String::from_utf8_lossy(&bytes).contains(
+                            if matches!(outcome, Outcome::Allowed) {
+                                "Basic dXNlcjpTRU5USU5FTC1DUkVERU5USUFM"
+                            } else {
+                                "Bearer SENTINEL-CREDENTIAL"
+                            }
+                        ),
+                        credential_prepared,
+                    );
                     if !matches!(outcome, Outcome::UpstreamClosed) {
                         upstream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok").await.unwrap();
                     }
@@ -672,12 +691,38 @@ network_policies:
                 "credential_resolution_refused",
             );
         }
+        if !policy_denied {
+            let preparation = stages
+                .iter()
+                .find(|span| span.name == "openshell.credential.prepare")
+                .expect("selected resolver has a preparation stage");
+            for (field, expected) in [
+                ("openshell.credential.mechanism", "static"),
+                ("openshell.credential.placement", "request_head"),
+                (
+                    "openshell.credential.preparation",
+                    if credential_failure {
+                        "refused"
+                    } else if credential_prepared {
+                        "prepared"
+                    } else {
+                        "not_needed"
+                    },
+                ),
+            ] {
+                assert_eq!(
+                    span_attribute(preparation, field).unwrap().as_str(),
+                    expected
+                );
+            }
+        }
         assert!(
             stages
                 .iter()
                 .all(|span| span.span_context.trace_id() == root.span_context.trace_id())
         );
         assert!(!format!("{spans:?}").contains("SENTINEL"));
+        assert!(!format!("{spans:?}").contains("dXNlcjpTRU5USU5FTC1DUkVERU5USUFM"));
     }
     capture.shutdown();
 }

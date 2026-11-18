@@ -866,9 +866,8 @@ where
                         head = require_identity_response_coding(&head)
                             .map_err(LiveWriteError::Failed)?;
                     }
-                    let credential_span = if options.resolver.is_some()
-                        || contains_reserved_credential_marker_bytes(&head)
-                    {
+                    let has_credential_marker = contains_reserved_credential_marker_bytes(&head);
+                    let credential_span = if options.resolver.is_some() || has_credential_marker {
                         correlation.map_or_else(tracing::Span::none, |correlation| {
                             correlation.stage(RequestStage::CredentialPrepare)
                         })
@@ -877,6 +876,20 @@ where
                     };
                     let rewritten = credential_span
                         .in_scope(|| rewrite_http_header_block(&head, options.resolver));
+                    record_credential_preparation(
+                        &credential_span,
+                        "static",
+                        "request_head",
+                        match &rewritten {
+                            Ok(result) if result.rewritten != head => "prepared",
+                            Ok(_) => "not_needed",
+                            Err(_) => "refused",
+                        },
+                    );
+                    credential_span.record(
+                        "otel.status_code",
+                        if rewritten.is_ok() { "OK" } else { "ERROR" },
+                    );
                     drop(credential_span);
                     let head = rewritten
                         .map_err(|error| LiveWriteError::Failed(miette::Report::new(error)))?

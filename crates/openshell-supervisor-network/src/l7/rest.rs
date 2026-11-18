@@ -27,7 +27,9 @@ pub(crate) use request_body::{
 };
 
 use crate::l7::EndpointObserver;
-use crate::l7::correlation::{HttpOutcome, RequestCorrelation, RequestStage};
+use crate::l7::correlation::{
+    HttpOutcome, RequestCorrelation, RequestStage, record_credential_preparation,
+};
 use crate::l7::http::{parse_chunk_size_line, validate_chunk_trailer_line};
 use crate::l7::provider::{BodyLength, L7Provider, L7Request, RelayOutcome};
 use crate::opa::PolicyGenerationGuard;
@@ -1079,16 +1081,26 @@ where
                 offered_subprotocols: request.subprotocols.clone(),
             });
 
-    let rewrite_span =
-        if options.resolver.is_some() || contains_reserved_credential_marker_bytes(&header_bytes) {
-            correlation.map_or_else(tracing::Span::none, |correlation| {
-                correlation.stage(RequestStage::CredentialPrepare)
-            })
-        } else {
-            tracing::Span::none()
-        };
+    let has_credential_marker = contains_reserved_credential_marker_bytes(&header_bytes);
+    let rewrite_span = if options.resolver.is_some() || has_credential_marker {
+        correlation.map_or_else(tracing::Span::none, |correlation| {
+            correlation.stage(RequestStage::CredentialPrepare)
+        })
+    } else {
+        tracing::Span::none()
+    };
     let rewrite_result =
         rewrite_span.in_scope(|| rewrite_http_header_block(&header_bytes, options.resolver));
+    record_credential_preparation(
+        &rewrite_span,
+        "static",
+        "request_head",
+        match &rewrite_result {
+            Ok(result) if result.rewritten != header_bytes => "prepared",
+            Ok(_) => "not_needed",
+            Err(_) => "refused",
+        },
+    );
     rewrite_span.record(
         "otel.status_code",
         if rewrite_result.is_ok() {
@@ -1260,7 +1272,7 @@ where
                         }
 
                         let sign = || {
-                            crate::sigv4::apply_sigv4_to_request(
+                            let result = crate::sigv4::apply_sigv4_to_request(
                                 &full_request,
                                 options.host,
                                 &region,
@@ -1268,7 +1280,14 @@ where
                                 access_key,
                                 secret_key,
                                 session_token,
-                            )
+                            );
+                            record_credential_preparation(
+                                &tracing::Span::current(),
+                                "sigv4",
+                                "header",
+                                if result.is_ok() { "prepared" } else { "failed" },
+                            );
+                            result
                         };
                         let signed = correlation.map_or_else(sign, |correlation| {
                             correlation.run_stage_sync(
@@ -1289,7 +1308,7 @@ where
                                 }
                                 _ => SignableBody::UnsignedPayload,
                             };
-                            crate::sigv4::apply_sigv4_headers_only_with_body(
+                            let result = crate::sigv4::apply_sigv4_headers_only_with_body(
                                 &rewrite_result.rewritten,
                                 options.host,
                                 &region,
@@ -1298,7 +1317,14 @@ where
                                 secret_key,
                                 session_token,
                                 signable_body,
-                            )
+                            );
+                            record_credential_preparation(
+                                &tracing::Span::current(),
+                                "sigv4",
+                                "header",
+                                if result.is_ok() { "prepared" } else { "failed" },
+                            );
+                            result
                         };
                         let signed_headers = correlation.map_or_else(sign, |correlation| {
                             correlation.run_stage_sync(
@@ -1383,16 +1409,39 @@ where
             )));
         }
     } else if options.request_body_credential_rewrite {
-        let body = collect_and_rewrite_request_body(
-            req,
-            client,
-            &rewrite_result.rewritten,
-            header_str,
-            &req.raw_header[header_end..],
-            options.resolver,
-            options.generation_guard,
-        )
-        .await?;
+        let prepare = async {
+            let result = collect_and_rewrite_request_body(
+                req,
+                client,
+                &rewrite_result.rewritten,
+                header_str,
+                &req.raw_header[header_end..],
+                options.resolver,
+                options.generation_guard,
+            )
+            .await;
+            if result.is_err() {
+                record_credential_preparation(
+                    &tracing::Span::current(),
+                    "static",
+                    "body",
+                    "failed",
+                );
+            }
+            result
+        };
+        let body = if let Some(correlation) = correlation {
+            correlation
+                .run_stage(
+                    RequestStage::CredentialPrepare,
+                    HttpOutcome::PlatformError,
+                    "credential_preparation_failed",
+                    Box::pin(prepare),
+                )
+                .await
+        } else {
+            prepare.await
+        }?;
         ensure_credential_generation_current(options)?;
         upstream.write_all(&body.headers).await.into_diagnostic()?;
         if !body.body.is_empty() {
@@ -2030,6 +2079,12 @@ async fn collect_and_rewrite_request_body<C: AsyncRead + Unpin>(
                     "request body credential rewrite cannot resolve placeholders without explicit body framing"
                 ));
             }
+            record_credential_preparation(
+                &tracing::Span::current(),
+                "static",
+                "body",
+                "not_needed",
+            );
             Ok(PreparedRequestBody {
                 headers: rewritten_headers.to_vec(),
                 body: already_read.to_vec(),
@@ -2092,6 +2147,7 @@ fn rewrite_buffered_body(
     resolver: Option<&SecretResolver>,
 ) -> Result<(Vec<u8>, Vec<u8>)> {
     if body.is_empty() {
+        record_credential_preparation(&tracing::Span::current(), "static", "body", "not_needed");
         return Ok((headers.to_vec(), body));
     }
 
@@ -2102,12 +2158,14 @@ fn rewrite_buffered_body(
                 "request body credential rewrite found placeholders in an unsupported content type"
             ));
         }
+        record_credential_preparation(&tracing::Span::current(), "static", "body", "not_needed");
         return Ok((headers.to_vec(), body));
     }
 
     let mut text = String::from_utf8(body)
         .map_err(|_| miette!("request body credential rewrite requires UTF-8 text bodies"))?;
     if !contains_reserved_credential_marker(&text) {
+        record_credential_preparation(&tracing::Span::current(), "static", "body", "not_needed");
         return Ok((headers.to_vec(), text.into_bytes()));
     }
 
@@ -2134,6 +2192,7 @@ fn rewrite_buffered_body(
 
     let body = text.into_bytes();
     let headers = set_content_length(headers, body.len())?;
+    record_credential_preparation(&tracing::Span::current(), "static", "body", "prepared");
     Ok((headers, body))
 }
 
@@ -11919,8 +11978,13 @@ mod tests {
             crate::l7::CredentialSigning::SigV4Body,
             crate::l7::CredentialSigning::SigV4NoBody,
         ] {
-            for host in ["s3.us-east-1.amazonaws.com", "invalid host"] {
-                let succeeds = host != "invalid host";
+            for (host, upstream_open) in [
+                ("s3.us-east-1.amazonaws.com", true),
+                ("invalid host", true),
+                ("s3.us-east-1.amazonaws.com", false),
+            ] {
+                let signing_succeeds = host != "invalid host";
+                let succeeds = signing_succeeds && upstream_open;
                 let capture = RequestTracing::new(Some(Sampler::AlwaysOn));
                 let (mut proxy_to_upstream, mut upstream_side) = tokio::io::duplex(8192);
                 let (mut _app_side, mut proxy_to_client) = tokio::io::duplex(8192);
@@ -11928,6 +11992,10 @@ mod tests {
                     .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
                     .await
                     .unwrap();
+                let mut upstream_side = Some(upstream_side);
+                if !upstream_open {
+                    drop(upstream_side.take());
+                }
                 let result = tokio::time::timeout(std::time::Duration::from_secs(5), async {
                     let ctx = crate::l7::relay::L7EvalContext {
                         host: host.into(),
@@ -11960,7 +12028,9 @@ mod tests {
                 assert_eq!(result.is_ok(), succeeds, "{result:?}");
                 drop(proxy_to_upstream);
                 let mut forwarded = String::new();
-                upstream_side.read_to_string(&mut forwarded).await.unwrap();
+                if let Some(mut upstream_side) = upstream_side {
+                    upstream_side.read_to_string(&mut forwarded).await.unwrap();
+                }
                 if succeeds {
                     assert!(forwarded.contains("authorization:"), "{forwarded}");
                 } else {
@@ -11976,19 +12046,43 @@ mod tests {
                     .collect::<Vec<_>>();
                 assert_eq!(stages.len(), 2, "header resolution and signing");
                 assert_eq!(stages[0].status, opentelemetry::trace::Status::Ok);
+                assert_eq!(
+                    span_attribute(stages[0], "openshell.credential.preparation")
+                        .unwrap()
+                        .as_str(),
+                    "not_needed",
+                    "a configured resolver without placeholders does not prepare a credential",
+                );
                 let signing = stages[1];
+                for (field, expected) in [
+                    ("openshell.credential.mechanism", "sigv4"),
+                    ("openshell.credential.placement", "header"),
+                    (
+                        "openshell.credential.preparation",
+                        if signing_succeeds {
+                            "prepared"
+                        } else {
+                            "failed"
+                        },
+                    ),
+                ] {
+                    assert_eq!(span_attribute(signing, field).unwrap().as_str(), expected);
+                }
                 assert_eq!(
                     matches!(signing.status, opentelemetry::trace::Status::Error { .. }),
-                    !succeeds,
+                    !signing_succeeds,
                 );
                 assert_eq!(
                     span_attribute(signing, "openshell.request.failure_reason")
                         .map(|value| value.as_str()),
-                    (!succeeds).then_some(Cow::Borrowed("credential_signing_failed")),
+                    (!signing_succeeds).then_some(Cow::Borrowed("credential_signing_failed")),
                 );
-                if succeeds {
+                if signing_succeeds {
                     assert_eq!(signing.status, opentelemetry::trace::Status::Ok);
                 }
+                let metadata = format!("{spans:?}");
+                assert!(!metadata.contains("AKIATESTKEY"));
+                assert!(!metadata.contains("test-secret-key"));
                 capture.shutdown();
             }
         }

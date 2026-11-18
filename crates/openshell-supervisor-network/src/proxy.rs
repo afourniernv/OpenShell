@@ -15,7 +15,7 @@ mod trace_tests;
 use openshell_sandbox_backend::test_support as rpc_test;
 
 use crate::identity::{BinaryIdentityCache, SuppliedIdentityError};
-use crate::l7::correlation::{HttpOutcome, RequestStage};
+use crate::l7::correlation::{HttpOutcome, RequestStage, record_credential_preparation};
 use crate::l7::tls::ProxyTlsState;
 use crate::opa::{NetworkAction, OpaEngine, PolicyGenerationGuard};
 use crate::policy_dns::{
@@ -5230,6 +5230,7 @@ fn rewrite_forward_request(
         Some(resolver) => secrets::rewrite_target_for_eval(path, resolver)?.resolved,
         None => path.to_string(),
     };
+    let mut credential_prepared = upstream_path != path;
 
     let header_str = String::from_utf8_lossy(&raw[..header_end]);
     let lines = header_str.split("\r\n").collect::<Vec<_>>();
@@ -5300,6 +5301,7 @@ fn rewrite_forward_request(
             Some(resolver) => rewrite_header_line_checked(line, resolver)?,
             None => line.to_string(),
         };
+        credential_prepared |= rewritten_line != *line;
 
         output.extend_from_slice(rewritten_line.as_bytes());
         output.extend_from_slice(b"\r\n");
@@ -5348,6 +5350,16 @@ fn rewrite_forward_request(
         return Err(secrets::UnresolvedPlaceholderError::unavailable("header"));
     }
 
+    record_credential_preparation(
+        &tracing::Span::current(),
+        "static",
+        "request_head",
+        if credential_prepared {
+            "prepared"
+        } else {
+            "not_needed"
+        },
+    );
     Ok(output)
 }
 
@@ -6913,6 +6925,7 @@ async fn handle_forward_proxy_inner(
     };
     if let Some(guard) = credential_generation {
         guard.ensure_current().inspect_err(|_| {
+            record_credential_preparation(&credential_stage, "static", "request_head", "stale");
             egress::mark_error(&credential_stage);
             credential_stage.record(
                 "openshell.request.failure_reason",
@@ -6933,6 +6946,7 @@ async fn handle_forward_proxy_inner(
         )
     });
     if rewrite.is_err() {
+        record_credential_preparation(&credential_stage, "static", "request_head", "refused");
         egress::mark_error(&credential_stage);
         credential_stage.record(
             "openshell.request.failure_reason",

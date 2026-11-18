@@ -998,23 +998,35 @@ async fn failure_then_reconnect(route_selection: bool) {
 }
 
 #[tokio::test]
-async fn token_grant_refusal_never_creates_a_denial_only_span() {
+async fn token_grant_preparation_reports_success_and_refusal_without_denial_only_spans() {
     use super::correlation_dispatch_tests::capture_request_spans;
+    use crate::test_support::request_tracing::span_attribute;
 
-    for sampled in [true, false] {
+    for (sampled, refuses) in [(true, true), (false, true), (true, false)] {
         let evidence = capture_request_spans(sampled, async {
             let fixture = Fixture::new(&[route("a", "/a/**")], &[("/a/**", "a", "aud-a")], 1);
-            fixture.resolver.fail_once.store(true, Ordering::SeqCst);
+            fixture.resolver.fail_once.store(refuses, Ordering::SeqCst);
             let mut connection = fixture.connect();
             let response = connection.exchange("GET", "/a/item", true).await;
-            assert!(connection.observes_eof().await);
+            if refuses {
+                assert!(connection.observes_eof().await);
+            }
             let capture = connection.finish().await;
-            assert_eq!(capture.bytes_seen, 0);
+            if refuses {
+                assert_eq!(capture.bytes_seen, 0);
+            } else {
+                assert_eq!(capture.requests.len(), 1);
+                assert_authorization(&capture.requests[0], "aud-a");
+            }
             response
         })
         .await;
         evidence.assert_no_deny_span(sampled);
-        assert!(evidence.output.starts_with("HTTP/1.1 502"));
+        assert!(evidence.output.starts_with(if refuses {
+            "HTTP/1.1 502"
+        } else {
+            "HTTP/1.1 204"
+        }));
         if sampled {
             assert_eq!(
                 evidence
@@ -1024,12 +1036,42 @@ async fn token_grant_refusal_never_creates_a_denial_only_span() {
                     .count(),
                 1
             );
-            assert!(
+            let preparation = evidence
+                .spans
+                .iter()
+                .find(|span| span.name == "openshell.credential.prepare")
+                .unwrap();
+            for (field, expected) in [
+                ("openshell.credential.mechanism", "token_grant"),
+                ("openshell.credential.placement", "header"),
+                (
+                    "openshell.credential.preparation",
+                    if refuses { "refused" } else { "prepared" },
+                ),
+            ] {
+                assert_eq!(
+                    span_attribute(preparation, field).unwrap().as_str(),
+                    expected
+                );
+            }
+            assert_eq!(
+                span_attribute(preparation, "openshell.credential.failure_code")
+                    .map(|value| value.as_str()),
+                refuses.then_some(std::borrow::Cow::Borrowed("unavailable")),
+            );
+            assert_eq!(
+                span_attribute(preparation, "openshell.credential.failure_stage")
+                    .map(|value| value.as_str()),
+                refuses.then_some(std::borrow::Cow::Borrowed("token_endpoint")),
+            );
+            assert_eq!(
                 evidence
                     .spans
                     .iter()
-                    .all(|span| span.name != "openshell.upstream.send")
+                    .any(|span| span.name == "openshell.upstream.send"),
+                !refuses,
             );
+            assert!(!format!("{:?}", evidence.spans).contains("inert-aud-a"));
         }
         let records: Vec<_> = evidence
             .events
@@ -1044,12 +1086,19 @@ async fn token_grant_refusal_never_creates_a_denial_only_span() {
                 .unwrap()
                 .starts_with("L7_REQUEST allow ")
         );
-        assert_eq!(records[1]["action"], "Denied");
+        assert_eq!(
+            records[1]["action"],
+            if refuses { "Denied" } else { "Allowed" }
+        );
         assert!(
             records[1]["message"]
                 .as_str()
                 .unwrap()
-                .starts_with("Token grant failed ")
+                .starts_with(if refuses {
+                    "Token grant failed "
+                } else {
+                    "Token grant successful "
+                })
         );
         for record in records {
             assert!(record.get("http_response").is_none());
