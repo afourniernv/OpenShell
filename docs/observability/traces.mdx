@@ -75,6 +75,8 @@ The CLI forwards `TRACEPARENT` and `TRACESTATE` from its environment on gateway 
 
 The gateway also passes its trace context to compute drivers, so driver spans appear in the same trace as the gateway request that caused them. Built-in drivers export their spans through the gateway's process. Managed external drivers receive the trace endpoint, gateway name, and compute driver from the gateway. Drivers that you run yourself own their telemetry configuration.
 
+Remote HTTP middleware calls carry the supervisor's active trace context, not headers supplied by the workload. Their gRPC client spans sit under the request or response middleware stage and stay open while the response stream is consumed. A middleware policy refusal is a successful RPC; transport failures record a bounded gRPC status without the error message or payload. Dropping a stream before its terminal status does not report success. WebSocket sessions and middleware configuration calls are outside this HTTP tracing path.
+
 ## Next Steps
 
 - Configure [OTLP export](/how-it-works/gateways/configuration#otlp-export), including sampling and the `OTEL_*` variables the gateway honors.
